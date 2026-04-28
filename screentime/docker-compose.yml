@@ -1,0 +1,68 @@
+services:
+
+  qdrant:
+    image: qdrant/qdrant:v1.11.3
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    # 不对外暴露，只供 gateway 内网访问
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       memory_db
+      POSTGRES_USER:     memory_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # 不对外暴露
+
+  gateway:
+    build: ./gateway
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"   # 只绑本地，由 nginx 反代
+      - "0.0.0.0:8088:8000"     # MCP clients direct access
+    env_file:
+      - .env                    # 自动透传所有 PROVIDER_API_KEY / AGENT_* / API_CHAIN_* 变量
+    environment:
+      POSTGRES_DSN: postgresql://memory_user:${POSTGRES_PASSWORD}@postgres:5432/memory_db
+      QDRANT_URL:   http://qdrant:6333
+    volumes:
+      - ./backups:/app/backups
+      - ./gateway/static:/app/static
+    depends_on:
+      - qdrant
+      - postgres
+
+  sillytavern:
+    image: ghcr.io/sillytavern/sillytavern:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7860:8000"   # 只绑本地，由 nginx 反代
+    volumes:
+      - st_data:/home/node/app/data
+      - st_config:/home/node/app/config
+    environment:
+      - LISTEN=0.0.0.0          # 允许容器内所有来源
+
+  screentime:
+    build: ./screentime
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8091:3000"   # nginx 反代 (HTTPS toggle for Shortcuts)
+      - "0.0.0.0:8093:3000"     # MCP clients direct access
+    environment:
+      SCREENTIME_API_KEY: ${SCREENTIME_API_KEY}
+      DB_PATH: /app/data/screentime.db
+      MCP_MSG_PATH: /screentime/mcp/message   # nginx 路径重写补偿
+    volumes:
+      - screentime_data:/app/data
+
+volumes:
+  qdrant_data:
+  postgres_data:
+  st_data:
+  st_config:
+  screentime_data:

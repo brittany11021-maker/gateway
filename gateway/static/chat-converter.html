@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Chat Converter → Memory Gateway</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,sans-serif;font-size:13px;background:#f5f4f0;color:#1a1810;min-height:100vh}
+.topbar{background:#1a1810;color:#fafaf6;padding:14px 24px;display:flex;align-items:center;gap:16px}
+.topbar h1{font-size:15px;font-weight:700;letter-spacing:.06em}
+.topbar .sub{font-size:11px;opacity:.5;margin-left:auto}
+.wrap{max-width:920px;margin:0 auto;padding:28px 20px;display:flex;flex-direction:column;gap:18px}
+.card{background:#fff;border:1px solid #e0ddd6;border-radius:12px;padding:20px}
+.card-title{font-size:10px;font-weight:700;letter-spacing:.13em;text-transform:uppercase;color:#7a7258;margin-bottom:14px}
+.drop-zone{border:2px dashed #d0cdc4;border-radius:10px;padding:32px;text-align:center;cursor:pointer;transition:border-color .2s,background .2s}
+.drop-zone:hover,.drop-zone.drag{border-color:#1a1810;background:#faf9f5}
+.drop-zone input{display:none}
+.drop-ico{font-size:26px;margin-bottom:8px;opacity:.4}
+.drop-hint{font-size:11px;color:#7a7258;line-height:1.6}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.form-row{display:flex;flex-direction:column;gap:4px}
+.form-row label{font-size:10px;font-weight:600;color:#7a7258;text-transform:uppercase;letter-spacing:.06em}
+.form-row input,.form-row select{border:1px solid #d0cdc4;border-radius:7px;padding:7px 10px;font-family:inherit;font-size:12px;background:#fafaf6;color:#1a1810;outline:none}
+.form-row input:focus,.form-row select:focus{border-color:#1a1810}
+.btn{font-family:inherit;font-size:12px;font-weight:600;padding:7px 16px;border-radius:7px;border:none;cursor:pointer;transition:opacity .15s}
+.btn:hover:not(:disabled){opacity:.75}
+.btn:disabled{opacity:.35;cursor:default}
+.btn-p{background:#1a1810;color:#fafaf6}
+.btn-g{background:#e8e4da;color:#1a1810}
+.btn-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;padding:7px 10px;border-bottom:2px solid #e0ddd6;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#7a7258;font-weight:700}
+td{padding:7px 10px;border-bottom:1px solid #f0ede6;vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#faf9f5}
+.map-row{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #f0ede6}
+.map-row:last-child{border-bottom:none}
+.map-from{font-size:12px;font-weight:600;min-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.map-count{font-size:10px;color:#7a7258;min-width:40px}
+.map-arrow{opacity:.35;font-size:11px}
+.map-to{border:1px solid #d0cdc4;border-radius:6px;padding:5px 8px;font-family:inherit;font-size:12px;background:#fafaf6;flex:1;max-width:180px}
+.badge{display:inline-block;font-size:10px;font-weight:700;padding:2px 7px;border-radius:4px}
+.badge-ok{background:#d1fae5;color:#065f46}
+.badge-skip{background:#f3f3f0;color:#7a7258}
+.badge-warn{background:#fef3c7;color:#92400e}
+.log{font-family:'Cascadia Code','Consolas',monospace;font-size:11px;background:#f0ede6;border-radius:8px;padding:12px;max-height:180px;overflow-y:auto;white-space:pre-wrap;color:#3a3620;line-height:1.5}
+.alert{padding:12px 16px;border-radius:8px;font-size:12px;line-height:1.6}
+.alert-warn{background:#fef3c7;border:1px solid #f0d080;color:#7a4f00}
+.hidden{display:none}
+.tbl-wrap{overflow-x:auto}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <h1>CHAT CONVERTER</h1>
+  <span style="opacity:.3;font-size:16px">→</span>
+  <span style="font-size:12px;opacity:.6">Memory Gateway</span>
+  <span class="sub">本地运行 · 无需服务器</span>
+</div>
+<div class="wrap">
+
+  <!-- Gateway config -->
+  <div class="card">
+    <div class="card-title">① Gateway 连接</div>
+    <div class="form-grid">
+      <div class="form-row">
+        <label>Gateway URL</label>
+        <input id="gwUrl" placeholder="https://memory.513129.xyz">
+      </div>
+      <div class="form-row">
+        <label>API Key</label>
+        <input id="gwKey" type="password" placeholder="mgw-...">
+      </div>
+    </div>
+    <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+      <button class="btn btn-g" onclick="saveConfig()">保存</button>
+      <span id="configSaved" class="hidden" style="font-size:11px;color:#7a7258">✓ 已保存</span>
+    </div>
+  </div>
+
+  <!-- File drop -->
+  <div class="card">
+    <div class="card-title">② 上传导出文件</div>
+    <div class="drop-zone" id="dropZone"
+      ondragover="event.preventDefault();this.classList.add('drag')"
+      ondragleave="this.classList.remove('drag')"
+      ondrop="onDrop(event)"
+      onclick="document.getElementById('fileIn').click()">
+      <input type="file" id="fileIn" accept=".json,.html" multiple onchange="onFileChange(this)">
+      <div class="drop-ico">📂</div>
+      <div class="drop-hint">
+        点击或拖入文件（支持多选）<br>
+        <span style="opacity:.65">TypingMind JSON · ChatGPT / SuperOpenAI JSON · Claude.ai JSON</span><br>
+        <span style="opacity:.65">Kelivo chats.json（对话导出）</span>
+      </div>
+    </div>
+    <div id="fileInfo" style="margin-top:8px;font-size:11px;color:#7a7258"></div>
+  </div>
+
+  <!-- Agent mapping -->
+  <div class="card hidden" id="secMapping">
+    <div class="card-title">③ Agent 映射</div>
+    <div style="font-size:11px;color:#7a7258;margin-bottom:12px">留空 = 跳过该对话</div>
+    <div id="mappingRows"></div>
+  </div>
+
+  <!-- ChatGPT single-file agent picker -->
+  <div class="card hidden" id="secGptAgent">
+    <div class="card-title">③ 指定 Agent</div>
+    <div style="font-size:11px;color:#7a7258;margin-bottom:10px">ChatGPT 导出文件不含 agent 信息，请手动指定</div>
+    <div class="form-row" style="max-width:240px">
+      <label>导入为 Agent</label>
+      <input id="gptAgent" placeholder="luna / iris / Chiaki …">
+    </div>
+  </div>
+
+  <!-- Preview -->
+  <div class="card hidden" id="secPreview">
+    <div class="card-title">④ 预览 <span id="previewCount" style="font-weight:400;color:#7a7258;text-transform:none;letter-spacing:0"></span></div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>Agent</th><th>标题 / Session</th><th>消息</th><th>时间</th><th></th></tr></thead>
+        <tbody id="previewBody"></tbody>
+      </table>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-p" id="btnDownload" onclick="doDownload()">⬇ 下载 JSON</button>
+      <button class="btn btn-g" id="btnImport"  onclick="doImport()">↑ 导入到 Gateway</button>
+    </div>
+  </div>
+
+  <!-- Log -->
+  <div class="card hidden" id="secLog">
+    <div class="card-title">日志</div>
+    <div class="log" id="log"></div>
+  </div>
+
+</div>
+<script>
+// ── Config ────────────────────────────────────────────────────────────────────
+function loadConfig(){
+  document.getElementById('gwUrl').value = localStorage.getItem('gw_url')||'';
+  document.getElementById('gwKey').value = localStorage.getItem('gw_key')||'';
+}
+function saveConfig(){
+  localStorage.setItem('gw_url', document.getElementById('gwUrl').value.trim());
+  localStorage.setItem('gw_key', document.getElementById('gwKey').value.trim());
+  const s = document.getElementById('configSaved');
+  s.classList.remove('hidden');
+  setTimeout(()=>s.classList.add('hidden'), 2000);
+}
+loadConfig();
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let _parsed  = [];   // [{_rawTitle, id, session_id, messages, created_at}]
+let _mode    = '';   // 'multi' | 'gpt'
+
+// ── Log ───────────────────────────────────────────────────────────────────────
+function log(msg){
+  show('secLog');
+  const el = document.getElementById('log');
+  el.textContent += msg+'\n';
+  el.scrollTop = el.scrollHeight;
+}
+function show(id){ document.getElementById(id).classList.remove('hidden'); }
+function hide(id){ document.getElementById(id).classList.add('hidden'); }
+
+// ── File handling ─────────────────────────────────────────────────────────────
+function onDrop(e){
+  e.preventDefault();
+  document.getElementById('dropZone').classList.remove('drag');
+  const files = [...(e.dataTransfer?.files||[])];
+  if(files.length) handleFiles(files);
+}
+function onFileChange(input){ handleFiles([...input.files]); }
+
+function handleFiles(files){
+  document.getElementById('fileInfo').textContent =
+    files.map(f=>`${f.name} (${(f.size/1024).toFixed(1)} KB)`).join(' · ');
+  _parsed = []; _mode = '';
+  hide('secMapping'); hide('secGptAgent'); hide('secPreview');
+  log(`── 读取 ${files.length} 个文件 ──`);
+  let pending = files.length;
+  const allParsed = [];
+  files.forEach(file=>{
+    const reader = new FileReader();
+    reader.onload = e=>{
+      try{
+        const data = JSON.parse(e.target.result);
+        const result = detectAndParse(file.name, data);
+        allParsed.push(...result);
+      }catch(err){ log(`✗ ${file.name}: ${err.message}`); }
+      if(--pending === 0) finalize(allParsed);
+    };
+    reader.readAsText(file,'utf-8');
+  });
+}
+
+function finalize(convs){
+  _parsed = convs;
+  if(!convs.length){ log('没有找到可转换的对话'); return; }
+  if(_mode === 'gpt'){
+    // ChatGPT single: show agent picker
+    show('secGptAgent');
+    document.getElementById('gptAgent').oninput = renderPreview;
+  } else {
+    showMapping(convs);
+  }
+  renderPreview();
+}
+
+// ── Format detection ──────────────────────────────────────────────────────────
+function detectAndParse(filename, data){
+  // Kelivo settings dump
+  if(data?.assistants_v1 && data?.providers_order_v1){
+    log(`⚠ ${filename}: 识别为 Kelivo 设置导出——不含对话历史，已跳过`);
+    log('  请在 Kelivo 应用内使用"导出对话/chats"功能单独导出对话记录');
+    return [];
+  }
+  // Kelivo chats export: {version:1, conversations:[...], messages:[...]}
+  if(data?.version===1 && Array.isArray(data?.conversations) && Array.isArray(data?.messages) && !data?.assistants_v1){
+    log(`✓ ${filename}: Kelivo 对话导出 (${data.conversations.length} 条对话)`);
+    _mode = 'multi';
+    return parseKelivo(data);
+  }
+  // ChatGPT / SuperOpenAI tree format: {title, mapping: {id:{message:{author:{role}}}}}
+  if(data?.mapping && typeof data.mapping === 'object'){
+    const vals = Object.values(data.mapping);
+    if(vals.some(v=>v?.message?.author?.role)){
+      log(`✓ ${filename}: ChatGPT / SuperOpenAI 格式`);
+      _mode = _mode||'gpt';
+      return parseGPT(data, filename);
+    }
+  }
+  // TypingMind: {data:{chats:[...]}}
+  if(data?.data?.chats){
+    log(`✓ ${filename}: TypingMind 格式 (${data.data.chats.length} 条对话)`);
+    _mode = 'multi';
+    return parseTypingMind(data.data.chats);
+  }
+  // Claude.ai: [{chat_messages:[]}]
+  if(Array.isArray(data) && data[0]?.chat_messages){
+    log(`✓ ${filename}: Claude.ai 格式 (${data.length} 条对话)`);
+    _mode = 'multi';
+    return parseClaudeAI(data);
+  }
+  // Gateway export: {agents:{name:{conversations:[]}}}
+  if(data?.agents && typeof data.agents==='object'){
+    log(`✓ ${filename}: Gateway export 格式`);
+    _mode = 'multi';
+    return parseGatewayExport(data);
+  }
+  log(`✗ ${filename}: 无法识别格式`);
+  return [];
+}
+
+// ── TypingMind ────────────────────────────────────────────────────────────────
+function parseTypingMind(chats){
+  return chats.flatMap(chat=>{
+    const title   = chat.title||chat.chatTitle||'unknown';
+    const chatId  = chat.chatID||chat.id||uid();
+    const messages = [];
+    let earliest  = null;
+    for(const m of chat.messages||[]){
+      if(m.role==='system') continue;
+      let content = typeof m.content==='string'
+        ? m.content
+        : (m.content||[]).map(c=>c.text||'').join('\n');
+      // Strip TypingMind timestamp prefix
+      content = content.replace(/^\d{4}-\d{2}-\d{2}\d{2}:\d{2}\s*\n/,'').trim();
+      if(!content) continue;
+      messages.push({role:m.role,content});
+      if(!earliest && m.createdAt) earliest = m.createdAt;
+    }
+    if(messages.length < 2) return [];
+    return [{_rawTitle:title, id:`tm_${chatId}`, session_id:chatId, messages, created_at:earliest||now()}];
+  });
+}
+
+// ── ChatGPT / SuperOpenAI tree format ─────────────────────────────────────────
+function parseGPT(data, filename){
+  const title    = data.title || filename.replace(/\.json$/i,'');
+  const ctime    = data.create_time ? new Date(data.create_time*1000).toISOString() : now();
+  const mapping  = data.mapping||{};
+  const messages = [];
+
+  // Find root (node whose parent is null or not in mapping)
+  const allIds   = new Set(Object.keys(mapping));
+  let rootId     = null;
+  for(const [id, node] of Object.entries(mapping)){
+    if(!node.parent || !allIds.has(node.parent)){ rootId = id; break; }
+  }
+  if(!rootId){ log('  ✗ 找不到根节点'); return []; }
+
+  // Traverse the main branch (always take last child = most recent)
+  function traverse(nodeId){
+    const node = mapping[nodeId];
+    if(!node) return;
+    const msg = node.message;
+    if(msg){
+      const role = msg.author?.role;
+      const ct   = msg.content?.content_type;
+      if((role==='user'||role==='assistant') && ct!=='user_editable_context'){
+        const parts = msg.content?.parts||[];
+        const text  = parts.filter(p=>typeof p==='string').join('').trim();
+        if(text) messages.push({role,content:text});
+      }
+    }
+    const children = node.children||[];
+    if(children.length) traverse(children[children.length-1]);
+  }
+  traverse(rootId);
+
+  if(messages.length < 2){ log(`  ✗ 对话消息不足 (${messages.length} 条)`); return []; }
+  log(`  ${title}: ${messages.length} 条消息`);
+
+  // Use a sentinel title so the agent picker can match it
+  return [{_rawTitle:'__gpt__', id:`gpt_${uid()}`, session_id:uid(), messages, created_at:ctime,
+           _displayTitle:title}];
+}
+
+// ── Claude.ai ─────────────────────────────────────────────────────────────────
+function parseClaudeAI(data){
+  return data.flatMap(conv=>{
+    const msgs=[];let earliest=null;
+    for(const m of conv.chat_messages||[]){
+      const role = m.sender==='human'?'user':'assistant';
+      const text = (m.text||'').trim();
+      if(!text) continue;
+      msgs.push({role,content:text});
+      if(!earliest) earliest=m.created_at;
+    }
+    if(msgs.length<2) return [];
+    return [{_rawTitle:conv.name||'Claude', id:`ca_${conv.uuid||uid()}`,
+             session_id:conv.uuid||uid(), messages:msgs,
+             created_at:earliest||conv.created_at||now()}];
+  });
+}
+
+// ── Gateway export ────────────────────────────────────────────────────────────
+function parseGatewayExport(data){
+  return Object.entries(data.agents||{}).flatMap(([agent,ad])=>
+    (ad.conversations||[]).map(c=>({
+      _rawTitle:agent, id:c.id||`gw_${uid()}`,
+      session_id:c.session_id||uid(), messages:c.messages||[],
+      created_at:c.created_at||now()
+    }))
+  );
+}
+
+// ── Kelivo chats ──────────────────────────────────────────────────────────────
+function parseKelivo(data){
+  // Build message index by id
+  const msgById={};
+  for(const m of data.messages||[]) msgById[m.id]=m;
+
+  // Collect model hints per assistantId
+  const modelHints={};
+  for(const conv of data.conversations||[]){
+    if(modelHints[conv.assistantId]) continue;
+    for(const mid of conv.messageIds||[]){
+      const m=msgById[mid];
+      if(m?.role==='assistant' && m.modelId){
+        modelHints[conv.assistantId]=m.modelId; break;
+      }
+    }
+  }
+
+  return (data.conversations||[]).flatMap(conv=>{
+    const messages=(conv.messageIds||[]).flatMap(mid=>{
+      const m=msgById[mid]; if(!m) return [];
+      if(m.role!=='user'&&m.role!=='assistant') return [];
+      const content=(m.content||'').trim(); if(!content) return [];
+      return [{role:m.role, content}];
+    });
+    if(messages.length<2) return [];
+    return [{
+      _rawTitle: conv.assistantId,
+      _modelHint: modelHints[conv.assistantId]||'',
+      _displayTitle: conv.title||'Kelivo对话',
+      id: `kv_${conv.id}`,
+      session_id: conv.id,
+      messages,
+      created_at: conv.createdAt||now()
+    }];
+  });
+}
+
+// ── Agent mapping UI ──────────────────────────────────────────────────────────
+function showMapping(convs){
+  // Collect unique rawTitles with count + model hint
+  const info=new Map(); // rawTitle → {count, hint}
+  for(const c of convs){
+    if(c._rawTitle==='__gpt__') continue;
+    if(!info.has(c._rawTitle)) info.set(c._rawTitle,{count:0,hint:c._modelHint||''});
+    info.get(c._rawTitle).count++;
+  }
+  const container = document.getElementById('mappingRows');
+  container.innerHTML='';
+  for(const [t,{count,hint}] of info){
+    let suggested = t.replace(/^OpenAI:\s*/i,'').replace(/\s*\(.*\)/,'').trim().toLowerCase();
+    if(/luna/i.test(t))   suggested='luna';
+    if(/iris/i.test(t))   suggested='iris';
+    if(/chiaki/i.test(t)) suggested='Chiaki';
+    // For Kelivo UUID keys, don't auto-suggest
+    if(/^[0-9a-f-]{36}$/i.test(t)) suggested='';
+    // Display label: use short model name if hint available, else truncated id
+    const label = hint ? hint.split('/').pop() : (t.length>20 ? t.slice(0,8)+'…' : t);
+    const hintHtml = hint ? `<span style="font-size:10px;color:#7a7258;margin-left:4px">${esc(hint)}</span>` : '';
+    const row=document.createElement('div');
+    row.className='map-row';
+    row.innerHTML=`<span class="map-from" title="${esc(t)}">${esc(label)}${hintHtml}</span>
+      <span class="map-count">${count}条</span>
+      <span class="map-arrow">→</span>
+      <input class="map-to" data-from="${esc(t)}" value="${esc(suggested)}" placeholder="留空则跳过">`;
+    container.appendChild(row);
+  }
+  show('secMapping');
+}
+
+document.addEventListener('input',e=>{
+  if(e.target.classList.contains('map-to')||e.target.id==='gptAgent') renderPreview();
+});
+
+// ── Preview ───────────────────────────────────────────────────────────────────
+function getMapping(){
+  const map={};
+  document.querySelectorAll('.map-to').forEach(i=>{ map[i.dataset.from]=i.value.trim(); });
+  // ChatGPT single mode
+  const gptA = document.getElementById('gptAgent')?.value.trim();
+  if(gptA) map['__gpt__']=gptA;
+  return map;
+}
+
+function renderPreview(){
+  const mapping = getMapping();
+  const tbody   = document.getElementById('previewBody');
+  tbody.innerHTML='';
+  let importCount=0;
+  for(const c of _parsed){
+    const agentOut = mapping[c._rawTitle]||'';
+    const skip     = !agentOut;
+    if(!skip) importCount++;
+    const label = c._displayTitle||(c._rawTitle==='__gpt__'?'ChatGPT':c._rawTitle);
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${skip?`<span style="opacity:.35">${esc(agentOut||'—')}</span>`:`<strong>${esc(agentOut)}</strong>`}</td>
+      <td style="color:#7a7258;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(label)}">${esc(label)}</td>
+      <td>${c.messages.length}</td>
+      <td style="color:#7a7258;white-space:nowrap">${(c.created_at||'').slice(0,10)||'—'}</td>
+      <td>${skip?'<span class="badge badge-skip">跳过</span>':'<span class="badge badge-ok">导入</span>'}`;
+    tbody.appendChild(tr);
+  }
+  document.getElementById('previewCount').textContent=
+    `共 ${_parsed.length} 条，将导入 ${importCount} 条`;
+  show('secPreview');
+}
+
+// ── Build records ─────────────────────────────────────────────────────────────
+function buildRecords(){
+  const mapping=getMapping();
+  return _parsed.flatMap(c=>{
+    const agentId=mapping[c._rawTitle];
+    if(!agentId) return [];
+    return [{id:c.id, agent_id:agentId, session_id:c.session_id,
+             messages:c.messages, created_at:c.created_at}];
+  });
+}
+
+// ── Download ──────────────────────────────────────────────────────────────────
+function doDownload(){
+  const recs=buildRecords();
+  if(!recs.length){log('✗ 没有可导出的对话');return;}
+  const blob=new Blob([JSON.stringify({conversations:recs},null,2)],{type:'application/json'});
+  const url=URL.createObjectURL(blob);
+  Object.assign(document.createElement('a'),{href:url,
+    download:`gateway_import_${new Date().toISOString().slice(0,10)}.json`}).click();
+  URL.revokeObjectURL(url);
+  log(`✓ 已下载 ${recs.length} 条对话`);
+}
+
+// ── Import to gateway ─────────────────────────────────────────────────────────
+async function doImport(){
+  const gwUrl=(document.getElementById('gwUrl').value.trim()).replace(/\/$/,'');
+  const gwKey=document.getElementById('gwKey').value.trim();
+  if(!gwUrl||!gwKey){log('✗ 请先填写 Gateway URL 和 API Key');return;}
+  const recs=buildRecords();
+  if(!recs.length){log('✗ 没有可导入的对话');return;}
+
+  // Chunk by 50 to be gentle on the server
+  const CHUNK=50;
+  let imported=0, skipped=0;
+  document.getElementById('btnImport').disabled=true;
+  log(`开始导入 ${recs.length} 条对话，分批 ${CHUNK} 条…`);
+  for(let i=0;i<recs.length;i+=CHUNK){
+    const chunk=recs.slice(i,i+CHUNK);
+    try{
+      const resp=await fetch(`${gwUrl}/api/conversations/bulk`,{
+        method:'POST',
+        headers:{'Content-Type':'application/json','Authorization':`Bearer ${gwKey}`},
+        body:JSON.stringify({conversations:chunk})
+      });
+      if(!resp.ok){const t=await resp.text();log(`✗ 批次 ${Math.floor(i/CHUNK)+1} 失败 (${resp.status}): ${t.slice(0,120)}`);break;}
+      const d=await resp.json();
+      imported+=d.imported; skipped+=d.skipped;
+      log(`  批次 ${Math.floor(i/CHUNK)+1}: +${d.imported} ✓  跳过 ${d.skipped}`);
+    }catch(e){log(`✗ 网络错误: ${e.message}`);break;}
+  }
+  log(`── 完成: 导入 ${imported} 条，跳过 ${skipped} 条 ──`);
+  document.getElementById('btnImport').disabled=false;
+}
+
+// ── Util ──────────────────────────────────────────────────────────────────────
+function uid(){ return crypto.randomUUID(); }
+function now(){ return new Date().toISOString(); }
+function esc(s){ return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+</script>
+</body>
+</html>

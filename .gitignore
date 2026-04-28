@@ -1,0 +1,9 @@
+.env
+backups/
+__pycache__/
+*.pyc
+*.pyo
+*.pem
+node_modules/
+*.db
+*.sqlite

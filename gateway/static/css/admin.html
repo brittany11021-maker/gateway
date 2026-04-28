@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Memory</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Anta&family=Quicksand:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&family=Noto+Sans+TC:wght@400;500;700&family=Noto+Sans+JP:wght@400;500&family=Noto+Sans:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<!-- ── Topbar ─────────────────────────────────────────────────────────────── -->
+<div class="topbar">
+  <div class="logo">MEMORY <span>MGR</span> <span class="logo-inf">∞</span></div>
+  <div class="topbar-gap"></div>
+  <div class="toggle-wrap" onclick="toggleTheme()">
+    <span id="themeL">DAY</span>
+    <div class="pill"></div>
+  </div>
+  <button class="key-chip" onclick="openBackupModal()">BACKUP</button>
+  <button class="key-chip" onclick="openProvidersModal()">⚡ API</button>
+  <button class="key-chip" id="keyChip" onclick="openKeyModal()">SET KEY</button>
+</div>
+
+<!-- ── Stat tabs ────────────────────────────────────────────────────────────── -->
+<div class="stat-bar">
+  <div class="s-tab active" id="tab-profile" onclick="switchTab('profile')">
+    <div class="s-num" id="n-profile">—</div><div class="s-lbl">Profile</div>
+  </div>
+  <div class="s-tab" id="tab-project" onclick="switchTab('project')">
+    <div class="s-num" id="n-project">—</div><div class="s-lbl">Project</div>
+  </div>
+  <div class="s-tab" id="tab-recent" onclick="switchTab('recent')">
+    <div class="s-num" id="n-recent">—</div><div class="s-lbl">Recent</div>
+  </div>
+  <div class="s-tab" id="tab-conversations" onclick="switchTab('conversations')">
+    <div class="s-num" id="n-conversations">—</div><div class="s-lbl">History</div>
+  </div>
+  <div class="s-tab" id="tab-books" onclick="switchTab('books')">
+    <div class="s-num" id="n-books">—</div><div class="s-lbl">Books</div>
+  </div>
+</div>
+
+<!-- ── Toolbar ───────────────────────────────────────────────────────────────── -->
+<div class="toolbar">
+  <div class="search-wrap" id="searchWrap">
+    <i class="search-icon">⌕</i>
+    <input class="search-in" id="searchIn" type="text"
+      placeholder="Search memories…" oninput="onSearch(this.value)">
+  </div>
+  <button class="btn btn-g" onclick="openNewAgentModal()">+ Agent</button>
+  <button class="btn btn-p" id="addBtn" onclick="openAddModal()">+ Add</button>
+</div>
+
+<!-- ── Main content ──────────────────────────────────────────────────────────── -->
+<div class="content" id="area">
+  <div class="page-loading">Loading…</div>
+</div>
+
+<!-- ── Modal: add / edit memory ─────────────────────────────────────────────── -->
+<div class="ov" id="memOv" onclick="if(event.target===this)closeMemOv()">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-title" id="memTitle">Add Memory</div>
+    <div class="form-g" id="memUserG">
+      <label class="form-lbl">User</label>
+      <select class="form-sel" id="memUser"></select>
+    </div>
+    <div class="form-g">
+      <label class="form-lbl">Collection</label>
+      <select class="form-sel" id="memCol">
+        <option value="memory_profile">Profile — long-term</option>
+        <option value="memory_project">Project — mid-term</option>
+        <option value="memory_recent">Recent — 30 days / max 100</option>
+      </select>
+    </div>
+    <div class="form-g">
+      <label class="form-lbl">Content</label>
+      <textarea class="form-ta" id="memTxt" placeholder="Memory content…"></textarea>
+    </div>
+    <div class="modal-acts">
+      <button class="btn btn-g" onclick="closeMemOv()">Cancel</button>
+      <button class="btn btn-p" onclick="saveMemory()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Modal: agent settings ─────────────────────────────────────────────────── -->
+<div class="ov" id="settingsOv" onclick="if(event.target===this)closeSettingsOv()">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-title">Settings — <span id="settingsLbl" style="color:var(--muted)"></span></div>
+
+    <div class="form-g">
+      <label class="form-lbl">Avatar</label>
+      <div class="avatar-row">
+        <div class="avatar-preview" id="avPreview"></div>
+        <div class="avatar-inputs">
+          <input class="form-in" id="sAvatar" placeholder="Image URL…" oninput="previewAvatar(this.value)">
+          <div style="display:flex;gap:8px;margin-top:2px">
+            <input type="file" id="avatarFile" accept="image/*" style="display:none" onchange="loadAvatarFile(this)">
+            <button class="btn btn-g" style="font-size:9px;padding:5px 11px" onclick="document.getElementById('avatarFile').click()">Upload</button>
+            <button class="btn btn-g" style="font-size:9px;padding:5px 11px" onclick="clearAvatar()">Clear</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="form-g">
+      <label class="form-lbl">Model Override <span style="opacity:.45;font-weight:400">(leave blank to use .env)</span></label>
+      <input class="form-in" id="sModel" placeholder="e.g. deepseek-ai/deepseek-r1">
+    </div>
+    <div class="form-g">
+      <label class="form-lbl">Effective Config <span style="opacity:.45;font-weight:400">(from .env)</span></label>
+      <div id="sEnvChain" style="font-size:10px;color:var(--muted);background:var(--ghost-bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;line-height:1.7">—</div>
+    </div>
+    <div class="form-g">
+      <label class="form-lbl">Notes</label>
+      <textarea class="form-ta" id="sNotes" style="min-height:72px" placeholder="Description, persona notes…"></textarea>
+    </div>
+    <div class="modal-acts spread">
+      <button class="btn btn-d" onclick="deleteAgentSettings()">Delete settings</button>
+      <div style="display:flex;gap:10px">
+        <button class="btn btn-g" onclick="closeSettingsOv()">Cancel</button>
+        <button class="btn btn-p" onclick="saveSettings()">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Modal: new agent ──────────────────────────────────────────────────────── -->
+<div class="ov" id="newAgentOv" onclick="if(event.target===this)closeNewAgentOv()">
+  <div class="modal" onclick="event.stopPropagation()" style="width:380px">
+    <div class="modal-title">New Agent</div>
+    <div class="form-g">
+      <label class="form-lbl">Agent ID</label>
+      <input class="form-in" id="newAid" placeholder="e.g. aria"
+        onkeydown="if(event.key==='Enter')createAgent()">
+    </div>
+    <div class="form-g">
+      <label class="form-lbl">Notes (optional)</label>
+      <textarea class="form-ta" id="newNotes" style="min-height:60px" placeholder="Persona, description…"></textarea>
+    </div>
+    <div class="modal-acts">
+      <button class="btn btn-g" onclick="closeNewAgentOv()">Cancel</button>
+      <button class="btn btn-p" onclick="createAgent()">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Modal: Backup & Restore ───────────────────────────────────────────────── -->
+<div class="ov" id="backupOv" onclick="if(event.target===this)closeBackupOv()">
+  <div class="modal" onclick="event.stopPropagation()" style="width:540px">
+    <div class="modal-title">Backup &amp; Restore</div>
+
+    <div class="bk-section">
+      <div class="bk-head">Export</div>
+      <div class="bk-desc">Download a full snapshot of all users, memories and conversations.</div>
+      <button class="btn btn-g" onclick="doExport()">⬇ Download backup JSON</button>
+    </div>
+
+    <div class="bk-section">
+      <div class="bk-head">Import</div>
+      <div class="form-g" style="margin-bottom:10px">
+        <label class="form-lbl">Mode</label>
+        <select class="form-sel" id="importMode">
+          <option value="merge">Merge — keep existing, add new (ID conflict → skip)</option>
+          <option value="overwrite">Overwrite — clear all data, replace completely</option>
+        </select>
+      </div>
+      <div class="bk-row">
+        <input type="file" id="importFile" accept=".json" style="display:none" onchange="previewImport(this)">
+        <button class="btn btn-g" onclick="document.getElementById('importFile').click()">Choose file</button>
+        <span class="bk-file-label" id="importFileName">No file selected</span>
+      </div>
+      <div id="importPreview" style="display:none">
+        <div class="bk-stats">
+          <div class="bk-stat"><div class="bk-stat-n" id="pvUsers">0</div><div class="bk-stat-l">Users</div></div>
+          <div class="bk-stat"><div class="bk-stat-n" id="pvMems">0</div><div class="bk-stat-l">Memories</div></div>
+          <div class="bk-stat"><div class="bk-stat-n" id="pvConvs">0</div><div class="bk-stat-l">Conversations</div></div>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center">
+          <button class="btn btn-p" id="importBtn" onclick="confirmImport()">Import now</button>
+          <span style="font-size:10px;color:var(--muted)" id="importWarn"></span>
+        </div>
+      </div>
+      <div class="bk-result" id="importResult"></div>
+    </div>
+
+    <div class="bk-section">
+      <div class="bk-head">Import Conversations <span style="font-size:9px;opacity:.55;font-weight:400">AI extraction</span></div>
+      <div class="bk-desc">Import Claude.ai or gateway export JSON — LLM will extract memories from each conversation.</div>
+      <div class="form-g" style="margin-bottom:10px">
+        <label class="form-lbl">Target Agent</label>
+        <select class="form-sel" id="histAgentSel"></select>
+      </div>
+      <div class="bk-row">
+        <input type="file" id="histFile" accept=".json" style="display:none" onchange="previewHistImport(this)">
+        <button class="btn btn-g" onclick="document.getElementById('histFile').click()">Choose file</button>
+        <span class="bk-file-label" id="histFileName">No file selected</span>
+      </div>
+      <div id="histPreview" style="display:none;margin-top:8px">
+        <div class="bk-stats">
+          <div class="bk-stat"><div class="bk-stat-n" id="histConvCount">0</div><div class="bk-stat-l">Conversations</div></div>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;margin-top:8px">
+          <button class="btn btn-p" id="histImportBtn" onclick="confirmHistImport()">Import &amp; Extract</button>
+          <span style="font-size:10px;color:var(--muted)">Each conversation analysed by LLM — may take a while</span>
+        </div>
+      </div>
+      <div class="bk-result" id="histResult"></div>
+    </div>
+
+    <div class="bk-section">
+      <div class="bk-head">Auto Backup</div>
+      <div class="auto-row">
+        <div class="toggle-pill" id="autoPill" onclick="toggleAutoPill()"></div>
+        <span style="font-size:11px">Enable automatic backups every</span>
+        <input class="interval-in" id="autoInterval" type="number" min="1" max="365" value="7">
+        <span style="font-size:11px">days</span>
+      </div>
+      <div class="bk-desc" style="margin-bottom:10px">
+        Saves to <code style="font-size:10px;background:var(--ghost-bg);padding:1px 5px;border-radius:4px">~/memory-gateway/backups/</code> on the server. Keeps the last 7 files.
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn btn-g" onclick="saveAutoBackup()">Save settings</button>
+        <button class="btn btn-g" onclick="triggerBackup()">Backup now</button>
+      </div>
+      <div class="bk-meta" id="autoMeta"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Modal: API key ────────────────────────────────────────────────────────── -->
+<div class="ov" id="keyOv" onclick="if(event.target===this)document.getElementById('keyOv').classList.remove('open')">
+  <div class="modal" onclick="event.stopPropagation()" style="width:340px">
+    <div class="modal-title">API Key</div>
+    <div class="form-g">
+      <label class="form-lbl">GATEWAY_API_KEY</label>
+      <input class="form-in" id="keyIn" type="password" placeholder="Bearer key…"
+        onkeydown="if(event.key==='Enter')saveKey()">
+    </div>
+    <div class="modal-acts">
+      <button class="btn btn-p" onclick="saveKey()">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Modal: Providers ──────────────────────────────────────────────────────── -->
+<div class="ov" id="providersOv" onclick="if(event.target===this)closeProvidersModal()">
+  <div class="modal" onclick="event.stopPropagation()" style="width:480px">
+    <div class="modal-title">API Providers</div>
+    <div id="providersList">
+      <div class="u-loading">Loading…</div>
+    </div>
+    <div class="modal-acts" style="margin-top:16px">
+      <button type="button" class="btn btn-g" onclick="closeProvidersModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Modal: Upload book ────────────────────────────────────────────────────── -->
+<div class="ov" id="bookUploadOv" onclick="if(event.target===this)closeUploadModal()">
+  <div class="modal" onclick="event.stopPropagation()" style="width:460px">
+    <div class="modal-title">Upload Book</div>
+
+    <div class="form-g">
+      <label class="form-lbl">File <span style="color:var(--muted);font-weight:400">(PDF, EPUB, TXT)</span></label>
+      <div class="drop-zone" id="uploadDropZone"
+        ondragover="event.preventDefault();this.classList.add('drag-over')"
+        ondragleave="this.classList.remove('drag-over')"
+        ondrop="onUploadDrop(event)"
+        onclick="document.getElementById('uploadFile').click()">
+        <input type="file" id="uploadFile" accept=".pdf,.epub,.txt" style="display:none" onchange="onUploadFileChange(this)">
+        <span style="font-size:22px;opacity:.4">📂</span>
+        <span id="uploadFileName" style="font-size:11px;color:var(--muted);margin-top:6px">Drop file here or click to browse</span>
+      </div>
+    </div>
+
+    <div class="form-g">
+      <label class="form-lbl">Title</label>
+      <input class="form-in" id="uploadTitle" placeholder="Book title…">
+    </div>
+    <div class="form-g">
+      <label class="form-lbl">Author</label>
+      <input class="form-in" id="uploadAuthor" placeholder="Author name…">
+    </div>
+    <div class="form-g">
+      <label class="form-lbl">Status</label>
+      <select class="form-sel" id="uploadStatus">
+        <option value="want">Want to Read</option>
+        <option value="reading">Reading</option>
+        <option value="finished">Finished</option>
+      </select>
+    </div>
+
+    <div id="uploadProgress" style="display:none;font-size:11px;color:var(--muted);margin-top:6px;padding:8px 0"></div>
+
+    <div class="modal-acts">
+      <button type="button" class="btn btn-g" onclick="closeUploadModal()">Cancel</button>
+      <button type="button" class="btn btn-p" onclick="doUpload()">Upload</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Toasts ─────────────────────────────────────────────────────────────────── -->
+<div class="toasts" id="toastWrap"></div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/memory.js"></script>
+<script src="/static/js/backup.js"></script>
+<script src="/static/js/books.js"></script>
+<script src="/static/js/providers.js"></script>
+</body>
+</html>

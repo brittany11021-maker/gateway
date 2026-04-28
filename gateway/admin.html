@@ -1,0 +1,1430 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Memory</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Anta&family=Quicksand:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&family=Noto+Sans+TC:wght@400;500;700&family=Noto+Sans+JP:wght@400;500&family=Noto+Sans:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* ── Variables: Day ──────────────────────────────────────────────────────── */
+:root {
+  --bg:           linear-gradient(150deg, #E4D4B4 0%, #EDE0CA 30%, #F4EDE0 65%, #FAFAF6 100%);
+  --text:         #1A1810;
+  --muted:        #7A7258;
+  --surface:      rgba(255,255,255,0.68);
+  --surface-hard: #FDFAF4;
+  --border:       rgba(26,24,16,0.09);
+  --border-hi:    rgba(26,24,16,0.22);
+  --topbar:       rgba(255,255,255,0.82);
+  --input-bg:     rgba(26,24,16,0.05);
+  --btn-bg:       #1A1810;
+  --btn-fg:       #FAFAF6;
+  --ghost-bg:     rgba(26,24,16,0.07);
+  --danger:       #B83030;
+  --overlay-bg:   rgba(0,0,0,0.35);
+  /* card colors – day */
+  --card-profile: #D2D5FF;
+  --card-project: #BEF0D5;
+  --card-recent:  #FFD4C8;
+}
+/* ── Variables: Night ───────────────────────────────────────────────────── */
+body.night {
+  --bg:           radial-gradient(ellipse 80% 65% at 68% 20%, #6b6391 0%, #524d72 22%, #403b52 45%, #211e30 72%, #13131c 100%);
+  --text:         #E8E4F4;
+  --muted:        #8177b1;
+  --surface:      rgba(129,119,177,0.08);
+  --surface-hard: #1c1a28;
+  --border:       rgba(129,119,177,0.15);
+  --border-hi:    rgba(129,119,177,0.32);
+  --topbar:       rgba(19,19,28,0.90);
+  --input-bg:     rgba(129,119,177,0.09);
+  --btn-bg:       #E8E4F4;
+  --btn-fg:       #13131c;
+  --ghost-bg:     rgba(129,119,177,0.10);
+  --danger:       #d07878;
+  --overlay-bg:   rgba(0,0,0,0.60);
+  /* card colors – night */
+  --card-profile: rgba(90,100,220,0.30);
+  --card-project: rgba(40,148,90,0.28);
+  --card-recent:  rgba(210,80,70,0.28);
+}
+
+/* ── Reset ──────────────────────────────────────────────────────────────── */
+*,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+html,body { height:100%; }
+body {
+  font-family: 'Anta','Noto Sans SC','Noto Sans TC','Noto Sans JP','Noto Sans',sans-serif;
+  font-size: 13px; line-height: 1.6;
+  min-height: 100vh;
+  background: var(--bg); background-attachment: fixed;
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Topbar ─────────────────────────────────────────────────────────────── */
+.topbar {
+  position: sticky; top: 0; z-index: 100;
+  height: 52px; display: flex; align-items: center; gap: 12px;
+  padding: 0 24px;
+  background: var(--topbar);
+  backdrop-filter: blur(28px); -webkit-backdrop-filter: blur(28px);
+  border-bottom: 1px solid var(--border);
+}
+.logo { font-size: 11px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
+.logo span { color: var(--muted); font-weight: 400; }
+.logo-inf { color: var(--muted); font-weight: 400; font-size: 14px; letter-spacing: 0; vertical-align: middle; line-height: 1; }
+.topbar-gap { flex: 1; }
+.toggle-wrap {
+  display: flex; align-items: center; gap: 7px; cursor: pointer; user-select: none;
+  font-size: 10px; letter-spacing: .08em; color: var(--muted);
+}
+.pill {
+  width: 30px; height: 17px; border-radius: 9px;
+  border: 1px solid var(--border-hi); background: var(--input-bg); position: relative;
+}
+.pill::after {
+  content:''; position:absolute; top:2px; left:2px;
+  width:11px; height:11px; border-radius:50%;
+  background: var(--muted); transition: transform .2s, background .2s;
+}
+body.night .pill::after { transform: translateX(13px); background: var(--text); }
+.key-chip {
+  font-family: inherit; font-size: 10px; letter-spacing: .06em;
+  background: var(--input-bg); border: 1px solid var(--border);
+  border-radius: 7px; color: var(--muted); padding: 5px 10px; cursor: pointer;
+  max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.key-chip:hover { border-color: var(--border-hi); color: var(--text); }
+
+/* ── Stat tabs ──────────────────────────────────────────────────────────── */
+.stat-bar {
+  display: flex; border-bottom: 1px solid var(--border);
+  overflow-x: auto; scrollbar-width: none;
+}
+.stat-bar::-webkit-scrollbar { display: none; }
+.s-tab {
+  flex: 1; min-width: 90px; padding: 13px 18px 11px;
+  text-align: center; cursor: pointer;
+  border-bottom: 2px solid transparent; transition: border-color .2s;
+}
+.s-tab.active { border-bottom-color: var(--text); }
+.s-num { font-size: 20px; font-weight: 700; line-height: 1; margin-bottom: 3px; }
+.s-lbl { font-size: 8px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+
+/* ── Toolbar ────────────────────────────────────────────────────────────── */
+.toolbar {
+  display: flex; align-items: center; gap: 10px; padding: 14px 24px;
+}
+.search-wrap { flex: 1; position: relative; }
+.search-icon {
+  position: absolute; left: 11px; top: 50%; transform: translateY(-50%);
+  color: var(--muted); font-size: 14px; pointer-events: none; font-style: normal;
+}
+.search-in {
+  width: 100%; font-family: inherit; font-size: 12px;
+  padding: 8px 12px 8px 34px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; color: var(--text); outline: none;
+  backdrop-filter: blur(8px); transition: border-color .2s;
+}
+.search-in::placeholder { color: var(--muted); }
+.search-in:focus { border-color: var(--border-hi); }
+.btn {
+  font-family: inherit; font-size: 10px; font-weight: 700;
+  letter-spacing: .1em; text-transform: uppercase;
+  padding: 8px 14px; border-radius: 8px;
+  border: 1px solid transparent; cursor: pointer;
+  white-space: nowrap; transition: opacity .15s;
+}
+.btn:hover { opacity: .78; }
+.btn-p { background: var(--btn-bg); color: var(--btn-fg); }
+.btn-g { background: var(--ghost-bg); color: var(--text); border-color: var(--border); }
+.btn-d { background: transparent; color: var(--danger); border-color: var(--danger); }
+
+/* ── Content area ───────────────────────────────────────────────────────── */
+.content { padding: 0 24px 40px; }
+
+/* ── User sections ──────────────────────────────────────────────────────── */
+.users-list { display: flex; flex-direction: column; gap: 8px; }
+.user-section {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 18px;
+  overflow: hidden; backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  transition: border-color .15s;
+}
+.user-section:hover { border-color: var(--border-hi); }
+.user-hd {
+  display: flex; align-items: center; gap: 11px;
+  padding: 13px 16px; cursor: pointer; user-select: none;
+  transition: background .15s;
+}
+.user-hd:hover { background: var(--ghost-bg); }
+.u-arrow {
+  font-size: 9px; color: var(--muted); flex-shrink: 0; width: 10px;
+  transition: transform .22s; display: inline-block;
+}
+.user-section.open .u-arrow { transform: rotate(90deg); }
+.u-avatar {
+  width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700; overflow: hidden;
+  border: 1.5px solid var(--border);
+}
+.u-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.u-name { font-size: 13px; font-weight: 700; letter-spacing: .02em; }
+.u-badge {
+  font-size: 9px; color: var(--muted); letter-spacing: .06em;
+  background: var(--ghost-bg); border: 1px solid var(--border);
+  border-radius: 5px; padding: 1px 7px; flex-shrink: 0;
+}
+.u-count { margin-left: auto; font-size: 9px; color: var(--muted); white-space: nowrap; }
+.settings-btn {
+  font-size: 12px; color: var(--muted); cursor: pointer; flex-shrink: 0;
+  padding: 5px 8px; border-radius: 7px; background: none; border: none;
+  font-family: inherit; line-height: 1; transition: color .15s, background .15s;
+}
+.settings-btn:hover { color: var(--text); background: var(--ghost-bg); }
+.user-body {
+  border-top: 1px solid var(--border); padding: 16px;
+  display: none;
+}
+.user-section.open .user-body { display: block; }
+.u-loading, .u-empty {
+  font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--muted); text-align: center; padding: 24px 0;
+}
+
+/* ── Square memory cards ────────────────────────────────────────────────── */
+.mem-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
+  gap: 10px;
+}
+.mem-card {
+  aspect-ratio: 1; border-radius: 18px; padding: 14px;
+  display: flex; flex-direction: column;
+  position: relative; cursor: pointer; overflow: hidden;
+  transition: transform .15s, box-shadow .15s;
+}
+.mem-card:hover { transform: translateY(-2px); box-shadow: 0 8px 28px rgba(0,0,0,.13); }
+.mem-card.type-profile { background: var(--card-profile); }
+.mem-card.type-project { background: var(--card-project); }
+.mem-card.type-recent  { background: var(--card-recent); }
+.mc-label {
+  font-size: 9px; letter-spacing: .14em; text-transform: uppercase;
+  font-weight: 700; color: var(--text); opacity: 0.65; margin-bottom: 8px; flex-shrink: 0;
+}
+.mc-text {
+  font-size: 11.5px; line-height: 1.5; color: var(--text);
+  flex: 1; overflow: hidden; word-break: break-word;
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical;
+  font-family: 'Quicksand','Noto Sans TC','Noto Sans SC','Noto Sans JP','Noto Sans',sans-serif;
+}
+.mem-card.expanded .mc-text { -webkit-line-clamp: unset; }
+.mc-footer {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  margin-top: 10px; flex-shrink: 0; gap: 4px;
+}
+.mc-icon { font-size: 26px; line-height: 1; opacity: 0.38; color: var(--text); }
+.mc-date { font-size: 9px; color: var(--text); opacity: 0.48; text-align: right; line-height: 1.4; }
+.mc-acts {
+  position: absolute; top: 8px; right: 8px;
+  display: flex; gap: 4px; opacity: 0; transition: opacity .15s;
+}
+.mem-card:hover .mc-acts { opacity: 1; }
+.mc-act {
+  font-size: 11px; cursor: pointer; padding: 3px 7px; border-radius: 6px;
+  background: rgba(0,0,0,0.12); border: none;
+  color: var(--text); font-family: inherit; line-height: 1;
+  transition: background .15s;
+}
+.mc-act:hover { background: rgba(0,0,0,0.22); }
+.mc-act.del:hover { background: rgba(200,0,0,0.2); color: var(--danger); }
+body.night .mc-act { background: rgba(255,255,255,0.12); }
+body.night .mc-act:hover { background: rgba(255,255,255,0.22); }
+body.night .mc-act.del:hover { background: rgba(200,60,60,0.25); }
+
+/* ── Pagination ─────────────────────────────────────────────────────────── */
+.pager {
+  display: flex; align-items: center; justify-content: center;
+  gap: 12px; padding: 14px 0 2px;
+}
+.pager-btn {
+  font-family: inherit; font-size: 12px;
+  background: var(--ghost-bg); border: 1px solid var(--border);
+  color: var(--text); border-radius: 7px; padding: 5px 13px; cursor: pointer;
+  transition: opacity .15s;
+}
+.pager-btn:hover:not(:disabled) { opacity: .75; }
+.pager-btn:disabled { opacity: .32; cursor: default; }
+.pager-info { font-size: 10px; color: var(--muted); letter-spacing: .06em; }
+
+/* ── Conversations ───────────────────────────────────────────────────────── */
+.conv-list { display: flex; flex-direction: column; gap: 8px; }
+.conv-card {
+  background: var(--ghost-bg); border: 1px solid var(--border);
+  border-radius: 12px; overflow: hidden;
+}
+.conv-hd {
+  display: flex; align-items: center; gap: 10px;
+  padding: 11px 14px; cursor: pointer; transition: background .15s;
+}
+.conv-hd:hover { background: var(--border); }
+.conv-idx { font-size: 10px; color: var(--muted); flex-shrink: 0; width: 26px; font-style: italic; }
+.conv-time { font-size: 11px; letter-spacing: .02em; flex: 1; }
+.conv-meta { font-size: 10px; color: var(--muted); white-space: nowrap; }
+.conv-arr { color: var(--muted); font-size: 9px; transition: transform .2s; display: inline-block; flex-shrink: 0; }
+.conv-card.open .conv-arr { transform: rotate(180deg); }
+.conv-bd {
+  border-top: 1px solid var(--border); padding: 12px 14px;
+  display: none; flex-direction: column; gap: 10px;
+}
+.conv-card.open .conv-bd { display: flex; }
+.msg { display: flex; gap: 10px; }
+.msg-role {
+  font-size: 8px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--muted); flex-shrink: 0; width: 58px; padding-top: 2px;
+}
+.msg-role.user      { color: #6b6dcc; }
+.msg-role.assistant { color: #3a9a6e; }
+body.night .msg-role.user      { color: #a0a3ef; }
+body.night .msg-role.assistant { color: #6fcfa5; }
+.msg-body {
+  font-size: 12px; line-height: 1.65; color: var(--text);
+  flex: 1; word-break: break-word; white-space: pre-wrap;
+  font-family: 'Quicksand','Noto Sans TC','Noto Sans SC','Noto Sans JP','Noto Sans',sans-serif;
+}
+
+/* ── Empty / Loading ────────────────────────────────────────────────────── */
+.page-empty {
+  text-align: center; padding: 72px 20px; color: var(--muted);
+}
+.page-empty-ico { font-size: 32px; margin-bottom: 12px; opacity: .35; }
+.page-empty-lbl { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
+.page-loading {
+  text-align: center; padding: 56px; color: var(--muted);
+  font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+}
+
+/* ── Modal overlay ──────────────────────────────────────────────────────── */
+.ov {
+  display: none; position: fixed; inset: 0; z-index: 200;
+  background: var(--overlay-bg);
+  backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  align-items: center; justify-content: center;
+}
+.ov.open { display: flex; }
+.modal {
+  background: var(--surface-hard); border: 1px solid var(--border-hi);
+  border-radius: 20px; padding: 28px;
+  width: 480px; max-width: calc(100vw - 32px);
+  max-height: 90vh; overflow-y: auto;
+}
+.modal-title {
+  font-size: 11px; font-weight: 700; letter-spacing: .14em;
+  text-transform: uppercase; margin-bottom: 22px;
+}
+.form-g { margin-bottom: 14px; }
+.form-lbl {
+  display: block; font-size: 8px; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--muted); margin-bottom: 6px;
+}
+.form-in, .form-sel, .form-ta {
+  width: 100%; font-family: inherit; font-size: 13px; padding: 9px 12px;
+  background: var(--input-bg); border: 1px solid var(--border);
+  border-radius: 8px; color: var(--text); outline: none; transition: border-color .2s;
+}
+.form-in:focus, .form-sel:focus, .form-ta:focus { border-color: var(--border-hi); }
+.form-ta { resize: vertical; min-height: 100px; }
+.modal-acts {
+  display: flex; gap: 10px; justify-content: flex-end; margin-top: 22px;
+}
+.modal-acts.spread { justify-content: space-between; }
+
+/* ── Avatar picker ──────────────────────────────────────────────────────── */
+.avatar-row { display: flex; gap: 14px; align-items: flex-start; }
+.avatar-preview {
+  width: 52px; height: 52px; border-radius: 50%; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px; font-weight: 700; border: 1.5px solid var(--border);
+  overflow: hidden; background: var(--ghost-bg);
+}
+.avatar-preview img { width: 100%; height: 100%; object-fit: cover; }
+.avatar-inputs { flex: 1; display: flex; flex-direction: column; gap: 7px; }
+
+/* ── Toast ──────────────────────────────────────────────────────────────── */
+.toasts {
+  position: fixed; bottom: 22px; right: 22px; z-index: 300;
+  display: flex; flex-direction: column; gap: 7px;
+}
+.toast {
+  background: var(--btn-bg); color: var(--btn-fg);
+  padding: 10px 16px; border-radius: 8px;
+  font-size: 10px; letter-spacing: .08em;
+  animation: upIn .2s ease;
+}
+@keyframes upIn {
+  from { opacity:0; transform:translateY(8px); }
+  to   { opacity:1; transform:translateY(0); }
+}
+
+/* ── Score badge (search results) ───────────────────────────────────────── */
+.mc-score {
+  position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%);
+  font-size: 9px; color: var(--text); opacity: 0.4; pointer-events: none;
+}
+
+/* ── Backup modal sections ───────────────────────────────────────────────── */
+.bk-section {
+  border: 1px solid var(--border); border-radius: 14px;
+  padding: 18px; margin-bottom: 14px;
+}
+.bk-section:last-child { margin-bottom: 0; }
+.bk-head {
+  font-size: 9px; font-weight: 700; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--muted); margin-bottom: 10px;
+}
+.bk-desc { font-size: 11px; color: var(--muted); margin-bottom: 12px; line-height: 1.5; }
+.bk-stats {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+  margin: 14px 0;
+}
+.bk-stat {
+  background: var(--ghost-bg); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 12px; text-align: center;
+}
+.bk-stat-n { font-size: 20px; font-weight: 700; line-height: 1; margin-bottom: 3px; }
+.bk-stat-l { font-size: 8px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+.bk-result {
+  margin-top: 12px; padding: 10px 14px; border-radius: 10px;
+  background: var(--ghost-bg); border: 1px solid var(--border);
+  font-size: 11px; line-height: 1.7; display: none;
+}
+.bk-result.ok  { border-color: #4caf50; }
+.bk-result.err { border-color: var(--danger); }
+.bk-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.bk-file-label {
+  flex: 1; font-size: 11px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.auto-row {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
+}
+.toggle-pill {
+  width: 36px; height: 20px; border-radius: 10px;
+  background: var(--ghost-bg); border: 1px solid var(--border-hi);
+  position: relative; cursor: pointer; flex-shrink: 0;
+  transition: background .2s;
+}
+.toggle-pill.on { background: var(--btn-bg); }
+.toggle-pill::after {
+  content:''; position:absolute; top:3px; left:3px;
+  width:12px; height:12px; border-radius:50%;
+  background: var(--muted); transition: transform .2s, background .2s;
+}
+.toggle-pill.on::after { transform: translateX(16px); background: var(--btn-fg); }
+.interval-in {
+  width: 56px; font-family: inherit; font-size: 13px; text-align: center;
+  padding: 5px 8px; background: var(--input-bg);
+  border: 1px solid var(--border); border-radius: 7px; color: var(--text); outline: none;
+}
+.interval-in:focus { border-color: var(--border-hi); }
+.bk-meta { font-size: 10px; color: var(--muted); margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<!-- ── Topbar ─────────────────────────────────────────────────────────────── -->
+<div class="topbar">
+  <div class="logo">MEMORY <span>MGR</span> <span class="logo-inf">∞</span></div>
+  <div class="topbar-gap"></div>
+  <div class="toggle-wrap" onclick="toggleTheme()">
+    <span id="themeL">DAY</span>
+    <div class="pill"></div>
+  </div>
+  <button class="key-chip" onclick="openBackupModal()">BACKUP</button>
+  <button class="key-chip" id="keyChip" onclick="openKeyModal()">SET KEY</button>
+</div>
+
+<!-- ── Stat tabs ────────────────────────────────────────────────────────────── -->
+<div class="stat-bar">
+  <div class="s-tab active" id="tab-profile"       onclick="switchTab('profile')">
+    <div class="s-num" id="n-profile">—</div><div class="s-lbl">Profile</div>
+  </div>
+  <div class="s-tab" id="tab-project"              onclick="switchTab('project')">
+    <div class="s-num" id="n-project">—</div><div class="s-lbl">Project</div>
+  </div>
+  <div class="s-tab" id="tab-recent"               onclick="switchTab('recent')">
+    <div class="s-num" id="n-recent">—</div><div class="s-lbl">Recent</div>
+  </div>
+  <div class="s-tab" id="tab-conversations"        onclick="switchTab('conversations')">
+    <div class="s-num" id="n-conversations">—</div><div class="s-lbl">History</div>
+  </div>
+</div>
+
+<!-- ── Toolbar ───────────────────────────────────────────────────────────────── -->
+<div class="toolbar">
+  <div class="search-wrap" id="searchWrap">
+    <i class="search-icon">⌕</i>
+    <input class="search-in" id="searchIn" type="text"
+      placeholder="Search memories…" oninput="onSearch(this.value)">
+  </div>
+  <button class="btn btn-g" onclick="openNewAgentModal()">+ Agent</button>
+  <button class="btn btn-p" id="addBtn" onclick="openAddModal()">+ Add</button>
+</div>
+
+<!-- ── Main content ──────────────────────────────────────────────────────────── -->
+<div class="content" id="area">
+  <div class="page-loading">Loading…</div>
+</div>
+
+<!-- ── Modal: add / edit memory ─────────────────────────────────────────────── -->
+<div class="ov" id="memOv" onclick="if(event.target===this)closeMemOv()">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-title" id="memTitle">Add Memory</div>
+    <div class="form-g" id="memUserG">
+      <label class="form-lbl">User</label>
+      <select class="form-sel" id="memUser"></select>
+    </div>
+    <div class="form-g">
+      <label class="form-lbl">Collection</label>
+      <select class="form-sel" id="memCol">
+        <option value="memory_profile">Profile — long-term</option>
+        <option value="memory_project">Project — mid-term</option>
+        <option value="memory_recent">Recent — 30 days / max 100</option>
+      </select>
+    </div>
+    <div class="form-g">
+      <label class="form-lbl">Content</label>
+      <textarea class="form-ta" id="memTxt" placeholder="Memory content…"></textarea>
+    </div>
+    <div class="modal-acts">
+      <button class="btn btn-g" onclick="closeMemOv()">Cancel</button>
+      <button class="btn btn-p" onclick="saveMemory()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Modal: agent settings ─────────────────────────────────────────────────── -->
+<div class="ov" id="settingsOv" onclick="if(event.target===this)closeSettingsOv()">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-title">Settings — <span id="settingsLbl" style="color:var(--muted)"></span></div>
+
+    <div class="form-g">
+      <label class="form-lbl">Avatar</label>
+      <div class="avatar-row">
+        <div class="avatar-preview" id="avPreview"></div>
+        <div class="avatar-inputs">
+          <input class="form-in" id="sAvatar" placeholder="Image URL…" oninput="previewAvatar(this.value)">
+          <div style="display:flex;gap:8px;margin-top:2px">
+            <input type="file" id="avatarFile" accept="image/*" style="display:none" onchange="loadAvatarFile(this)">
+            <button class="btn btn-g" style="font-size:9px;padding:5px 11px" onclick="document.getElementById('avatarFile').click()">Upload</button>
+            <button class="btn btn-g" style="font-size:9px;padding:5px 11px" onclick="clearAvatar()">Clear</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+
+    <div class="form-g">
+      <label class="form-lbl">API Source</label>
+      <select class="form-sel" id="sApiSrc">
+        <option value="nvidia">NVIDIA NIM</option>
+        <option value="openrouter">OpenRouter</option>
+        <option value="custom">Custom</option>
+      </select>
+    </div>
+    <div class="form-g">
+      <label class="form-lbl">LLM Model</label>
+      <input class="form-in" id="sModel" placeholder="e.g. deepseek-ai/deepseek-r1">
+    </div>
+    <div class="form-g">
+      <label class="form-lbl">Notes</label>
+      <textarea class="form-ta" id="sNotes" style="min-height:72px" placeholder="Description, persona notes…"></textarea>
+    </div>
+    <div class="modal-acts spread">
+      <button class="btn btn-d" onclick="deleteAgentSettings()">Delete settings</button>
+      <div style="display:flex;gap:10px">
+        <button class="btn btn-g" onclick="closeSettingsOv()">Cancel</button>
+        <button class="btn btn-p" onclick="saveSettings()">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Modal: new agent ──────────────────────────────────────────────────────── -->
+<div class="ov" id="newAgentOv" onclick="if(event.target===this)closeNewAgentOv()">
+  <div class="modal" onclick="event.stopPropagation()" style="width:380px">
+    <div class="modal-title">New Agent</div>
+    <div class="form-g">
+      <label class="form-lbl">Agent ID</label>
+      <input class="form-in" id="newAid" placeholder="e.g. aria"
+        onkeydown="if(event.key==='Enter')createAgent()">
+    </div>
+    <div class="form-g">
+      <label class="form-lbl">Notes (optional)</label>
+      <textarea class="form-ta" id="newNotes" style="min-height:60px" placeholder="Persona, description…"></textarea>
+    </div>
+    <div class="modal-acts">
+      <button class="btn btn-g" onclick="closeNewAgentOv()">Cancel</button>
+      <button class="btn btn-p" onclick="createAgent()">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Modal: Backup & Restore ───────────────────────────────────────────────── -->
+<div class="ov" id="backupOv" onclick="if(event.target===this)closeBackupOv()">
+  <div class="modal" onclick="event.stopPropagation()" style="width:540px">
+    <div class="modal-title">Backup &amp; Restore</div>
+
+    <!-- Export -->
+    <div class="bk-section">
+      <div class="bk-head">Export</div>
+      <div class="bk-desc">Download a full snapshot of all users, memories and conversations.</div>
+      <button class="btn btn-g" onclick="doExport()">⬇ Download backup JSON</button>
+    </div>
+
+    <!-- Import -->
+    <div class="bk-section">
+      <div class="bk-head">Import</div>
+      <div class="form-g" style="margin-bottom:10px">
+        <label class="form-lbl">Mode</label>
+        <select class="form-sel" id="importMode">
+          <option value="merge">Merge — keep existing, add new (ID conflict → skip)</option>
+          <option value="overwrite">Overwrite — clear all data, replace completely</option>
+        </select>
+      </div>
+      <div class="bk-row">
+        <input type="file" id="importFile" accept=".json" style="display:none" onchange="previewImport(this)">
+        <button class="btn btn-g" onclick="document.getElementById('importFile').click()">Choose file</button>
+        <span class="bk-file-label" id="importFileName">No file selected</span>
+      </div>
+      <!-- Preview -->
+      <div id="importPreview" style="display:none">
+        <div class="bk-stats">
+          <div class="bk-stat"><div class="bk-stat-n" id="pvUsers">0</div><div class="bk-stat-l">Users</div></div>
+          <div class="bk-stat"><div class="bk-stat-n" id="pvMems">0</div><div class="bk-stat-l">Memories</div></div>
+          <div class="bk-stat"><div class="bk-stat-n" id="pvConvs">0</div><div class="bk-stat-l">Conversations</div></div>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center">
+          <button class="btn btn-p" id="importBtn" onclick="confirmImport()">Import now</button>
+          <span style="font-size:10px;color:var(--muted)" id="importWarn"></span>
+        </div>
+      </div>
+      <div class="bk-result" id="importResult"></div>
+    </div>
+
+    <!-- Import Conversations with AI extraction -->
+    <div class="bk-section">
+      <div class="bk-head">Import Conversations <span style="font-size:9px;opacity:.55;font-weight:400">AI extraction</span></div>
+      <div class="bk-desc">Import Claude.ai or gateway export JSON — LLM will extract memories from each conversation.</div>
+      <div class="form-g" style="margin-bottom:10px">
+        <label class="form-lbl">Target Agent</label>
+        <select class="form-sel" id="histAgentSel"></select>
+      </div>
+      <div class="bk-row">
+        <input type="file" id="histFile" accept=".json" style="display:none" onchange="previewHistImport(this)">
+        <button class="btn btn-g" onclick="document.getElementById('histFile').click()">Choose file</button>
+        <span class="bk-file-label" id="histFileName">No file selected</span>
+      </div>
+      <div id="histPreview" style="display:none;margin-top:8px">
+        <div class="bk-stats">
+          <div class="bk-stat"><div class="bk-stat-n" id="histConvCount">0</div><div class="bk-stat-l">Conversations</div></div>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;margin-top:8px">
+          <button class="btn btn-p" id="histImportBtn" onclick="confirmHistImport()">Import &amp; Extract</button>
+          <span style="font-size:10px;color:var(--muted)">Each conversation analysed by LLM — may take a while</span>
+        </div>
+      </div>
+      <div class="bk-result" id="histResult"></div>
+    </div>
+
+    <!-- Auto-backup -->
+    <div class="bk-section">
+      <div class="bk-head">Auto Backup</div>
+      <div class="auto-row">
+        <div class="toggle-pill" id="autoPill" onclick="toggleAutoPill()"></div>
+        <span style="font-size:11px">Enable automatic backups every</span>
+        <input class="interval-in" id="autoInterval" type="number" min="1" max="365" value="7">
+        <span style="font-size:11px">days</span>
+      </div>
+      <div class="bk-desc" style="margin-bottom:10px">
+        Saves to <code style="font-size:10px;background:var(--ghost-bg);padding:1px 5px;border-radius:4px">~/memory-gateway/backups/</code> on the server. Keeps the last 7 files.
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn btn-g" onclick="saveAutoBackup()">Save settings</button>
+        <button class="btn btn-g" onclick="triggerBackup()">Backup now</button>
+      </div>
+      <div class="bk-meta" id="autoMeta"></div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ── Modal: API key ────────────────────────────────────────────────────────── -->
+<div class="ov" id="keyOv" onclick="if(event.target===this)document.getElementById('keyOv').classList.remove('open')">
+  <div class="modal" onclick="event.stopPropagation()" style="width:340px">
+    <div class="modal-title">API Key</div>
+    <div class="form-g">
+      <label class="form-lbl">GATEWAY_API_KEY</label>
+      <input class="form-in" id="keyIn" type="password" placeholder="Bearer key…"
+        onkeydown="if(event.key==='Enter')saveKey()">
+    </div>
+    <div class="modal-acts">
+      <button class="btn btn-p" onclick="saveKey()">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Toasts ─────────────────────────────────────────────────────────────────── -->
+<div class="toasts" id="toastWrap"></div>
+
+<script>
+// ── Constants ─────────────────────────────────────────────────────────────────
+const COL   = { profile:'memory_profile', project:'memory_project', recent:'memory_recent' };
+const LABEL = { memory_profile:'Profile', memory_project:'Project', memory_recent:'Recent' };
+const ICON  = { memory_profile:'◉', memory_project:'◈', memory_recent:'◑' };
+const TYPE  = { memory_profile:'type-profile', memory_project:'type-project', memory_recent:'type-recent' };
+const PAGE_SIZE = 20;
+
+// Avatar palette (consistent per uid)
+const AV_DAY   = ['#D2D5FF','#BEF0D5','#FFD4C8','#FFE5B4','#D5E5FF','#FFD5E8','#C8F0F0','#F5E0C8'];
+const AV_NIGHT = ['rgba(90,100,220,.38)','rgba(40,148,90,.35)','rgba(210,80,70,.35)',
+                  'rgba(180,130,40,.35)','rgba(60,100,200,.35)','rgba(180,60,120,.35)',
+                  'rgba(40,160,160,.35)','rgba(200,120,50,.35)'];
+
+// ── State ─────────────────────────────────────────────────────────────────────
+const S = {
+  key:   localStorage.getItem('mgw_k') || '',
+  tab:   'profile',
+  night: localStorage.getItem('mgw_n') === '1',
+  q:     '',
+  timer: null,
+};
+let allAgents   = [];           // string[]
+let agentItems  = {};           // aid → items[]  (fetched, all pages)
+let agentPages  = {};           // aid → current page index
+let agentLoaded = new Set();    // aids that have been fetched for current tab
+let settingsAid = null;
+let editId = null, editCol = null, editAid = null;
+const CACHE = {};               // id → memory item with _col, _aid
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  applyTheme();
+  if (!S.key) { openKeyModal(); return; }
+  boot();
+});
+async function boot() {
+  updateKeyChip();
+  await Promise.all([loadGlobalStats(), loadAgents()]);
+}
+
+// ── API util ──────────────────────────────────────────────────────────────────
+async function api(path, opts = {}) {
+  const r = await fetch(path, {
+    ...opts,
+    headers: {
+      'Authorization': `Bearer ${S.key}`,
+      'Content-Type':  'application/json',
+      ...(opts.headers || {}),
+    },
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  if (!r.ok) throw new Error(r.status);
+  return r.json();
+}
+
+// ── Global stats ──────────────────────────────────────────────────────────────
+async function loadGlobalStats() {
+  try {
+    const d = await api('/admin/api/stats/global');
+    document.getElementById('n-profile').textContent       = d.memory_profile  ?? 0;
+    document.getElementById('n-project').textContent       = d.memory_project  ?? 0;
+    document.getElementById('n-recent').textContent        = d.memory_recent   ?? 0;
+    document.getElementById('n-conversations').textContent = d.conversations   ?? 0;
+  } catch(e) { console.error(e); }
+}
+
+// ── Agents ────────────────────────────────────────────────────────────────────
+async function loadAgents() {
+  try {
+    const d = await api('/admin/api/agents');
+    allAgents = d.agents.length ? d.agents : ['default'];
+  } catch(e) {
+    allAgents = [];
+  }
+  agentItems = {}; agentPages = {}; agentLoaded.clear();
+  renderPage();
+}
+
+function renderPage() {
+  if (!allAgents.length) {
+    setArea('<div class="page-empty"><div class="page-empty-ico">◌</div><div class="page-empty-lbl">No agents yet — click + Agent to create</div></div>');
+    return;
+  }
+  const rows = allAgents.map((aid, i) => {
+    const avBg = S.night ? AV_NIGHT[i % AV_NIGHT.length] : AV_DAY[i % AV_DAY.length];
+    const initial = [...aid][0]?.toUpperCase() || '?';
+    return `
+    <div class="user-section" data-idx="${i}">
+      <div class="user-hd" onclick="toggleAgent(${i})">
+        <span class="u-arrow">▸</span>
+        <div class="u-avatar u-av-init" id="uav${i}" style="background:${avBg}">${initial}</div>
+        <span class="u-name">${esc(aid)}</span>
+        <span class="u-count" id="uc${i}"></span>
+        <button class="settings-btn" onclick="openSettings(${i},event)" title="Agent settings">⚙</button>
+      </div>
+      <div class="user-body" id="ub${i}">
+        <div class="u-loading">—</div>
+      </div>
+    </div>`;
+  }).join('');
+  setArea(`<div class="users-list">${rows}</div>`);
+  allAgents.forEach((aid, i) => restoreAvatar(aid, i));
+}
+
+async function restoreAvatar(aid, i) {
+  const cacheKey = `av_${aid}`;
+  let avatar = sessionStorage.getItem(cacheKey);
+  if (avatar === null) {
+    try {
+      const d = await api(`/admin/api/agents/${enc(aid)}/settings`);
+      avatar = d.avatar || '';
+      sessionStorage.setItem(cacheKey, avatar);
+    } catch { avatar = ''; }
+  }
+  if (avatar) applyAvatarEl(i, avatar, aid);
+}
+
+function applyAvatarEl(i, avatarUrl, aid) {
+  const el = document.getElementById(`uav${i}`);
+  if (!el) return;
+  if (avatarUrl) {
+    el.innerHTML = `<img src="${esc(avatarUrl)}" alt="${esc(aid)}">`;
+    el.style.background = '';
+  }
+}
+
+// ── Toggle agent section ──────────────────────────────────────────────────────
+async function toggleAgent(i) {
+  const aid = allAgents[i];
+  const sec = document.querySelector(`.user-section[data-idx="${i}"]`);
+  if (!sec) return;
+  const isOpen = sec.classList.contains('open');
+  if (isOpen) { sec.classList.remove('open'); return; }
+  sec.classList.add('open');
+  if (!agentLoaded.has(aid)) {
+    await loadAgentContent(i, aid);
+    agentLoaded.add(aid);
+  }
+}
+
+async function loadAgentContent(i, aid) {
+  if (S.tab === 'conversations') await loadAgentConversations(i, aid);
+  else await loadAgentMemories(i, aid);
+}
+
+// ── Memory load & render ──────────────────────────────────────────────────────
+async function loadAgentMemories(i, aid) {
+  const body = document.getElementById(`ub${i}`);
+  if (!body) return;
+  body.innerHTML = '<div class="u-loading">Loading…</div>';
+  const col = COL[S.tab];
+  try {
+    const params = new URLSearchParams({ collection: col, agent_id: aid, limit: 500 });
+    if (S.q) params.set('q', S.q);
+    const d = await api('/admin/api/memories?' + params);
+    agentItems[aid] = d.items;
+    agentPages[aid] = 0;
+    d.items.forEach(it => { CACHE[it.id] = { ...it, _col: col, _aid: aid }; });
+    renderMemCards(i, aid);
+  } catch(e) {
+    body.innerHTML = `<div class="u-empty">Error: ${e.message}</div>`;
+  }
+}
+
+function renderMemCards(i, aid) {
+  const body = document.getElementById(`ub${i}`);
+  if (!body) return;
+  const items = agentItems[aid] || [];
+  const col   = COL[S.tab];
+  const page  = agentPages[aid] || 0;
+  const total = items.length;
+  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const slice = items.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+
+  const uc = document.getElementById(`uc${i}`);
+  if (uc) uc.textContent = total ? `${total} entries` : '';
+
+  if (!total) {
+    body.innerHTML = '<div class="u-empty">No memories yet</div>';
+    return;
+  }
+
+  const dc  = TYPE[col]  || 'type-profile';
+  const ico = ICON[col]  || '◉';
+  const lbl = LABEL[col] || col;
+
+  const cards = slice.map(it => `
+    <div class="mem-card ${dc}" onclick="toggleCardExpand(this)">
+      <div class="mc-acts" onclick="event.stopPropagation()">
+        <button class="mc-act" onclick="openEditModal('${it.id}')">✎</button>
+        <button class="mc-act del" onclick="delMemory('${it.id}','${col}')">✕</button>
+      </div>
+      <div class="mc-label">${lbl}</div>
+      <div class="mc-text">${esc(it.text || '')}</div>
+      <div class="mc-footer">
+        <span class="mc-icon">${ico}</span>
+        <span class="mc-date">${fmtTs(it.created_ts)}${it.score != null ? `\n${it.score}` : ''}</span>
+      </div>
+    </div>`).join('');
+
+  const pager = pages > 1 ? `
+    <div class="pager">
+      <button class="pager-btn" onclick="changePage(${i},-1)" ${page===0?'disabled':''}>‹</button>
+      <span class="pager-info">${page+1} / ${pages}</span>
+      <button class="pager-btn" onclick="changePage(${i},+1)" ${page>=pages-1?'disabled':''}>›</button>
+    </div>` : '';
+
+  body.innerHTML = `<div class="mem-grid">${cards}</div>${pager}`;
+}
+
+function toggleCardExpand(el) { el.classList.toggle('expanded'); }
+
+function changePage(i, delta) {
+  const aid = allAgents[i];
+  const items = agentItems[aid] || [];
+  const pages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
+  agentPages[aid] = Math.max(0, Math.min(pages - 1, (agentPages[aid] || 0) + delta));
+  renderMemCards(i, aid);
+}
+
+// ── Conversations load & render ───────────────────────────────────────────────
+async function loadAgentConversations(i, aid) {
+  const body = document.getElementById(`ub${i}`);
+  if (!body) return;
+  body.innerHTML = '<div class="u-loading">Loading…</div>';
+  try {
+    const d = await api(`/admin/api/conversations?agent_id=${enc(aid)}&limit=100`);
+    const items = d.items;
+    const uc = document.getElementById(`uc${i}`);
+    if (uc) uc.textContent = items.length ? `${items.length} conversations` : '';
+    if (!items.length) { body.innerHTML = '<div class="u-empty">No conversations yet</div>'; return; }
+
+    const rows = items.map((c, idx) => {
+      const msgs = (c.messages || []).filter(m =>
+        !(m.role === 'system' && (m.content||'').includes('Relevant memories')));
+      return `<div class="conv-card" id="cv-${c.id}">
+        <div class="conv-hd" onclick="toggleConv('${c.id}')">
+          <span class="conv-idx">#${idx+1}</span>
+          <span class="conv-time">${fmtIsoTime(c.created_at)} · ${fmtIsoDate(c.created_at)}</span>
+          <span class="conv-meta">${msgs.length} msg</span>
+          <span class="conv-arr" title="${esc(c.id)}">▾</span>
+        </div>
+        <div class="conv-bd">${msgs.map(m => `
+          <div class="msg">
+            <div class="msg-role ${m.role}">${m.role}</div>
+            <div class="msg-body">${esc(typeof m.content==='string'?m.content:JSON.stringify(m.content))}</div>
+          </div>`).join('')}
+        </div>
+      </div>`;
+    }).join('');
+    body.innerHTML = `<div class="conv-list">${rows}</div>`;
+  } catch(e) {
+    body.innerHTML = `<div class="u-empty">Error: ${e.message}</div>`;
+  }
+}
+
+function toggleConv(id) { document.getElementById('cv-'+id)?.classList.toggle('open'); }
+
+// ── Tab switch ────────────────────────────────────────────────────────────────
+function switchTab(tab) {
+  S.tab = tab; S.q = '';
+  document.getElementById('searchIn').value = '';
+  document.querySelectorAll('.s-tab').forEach(el => el.classList.remove('active'));
+  document.getElementById('tab-'+tab).classList.add('active');
+  const isConv = tab === 'conversations';
+  document.getElementById('addBtn').style.display    = isConv ? 'none' : '';
+  document.getElementById('searchWrap').style.display = isConv ? 'none' : '';
+  agentItems = {}; agentPages = {}; agentLoaded.clear();
+  renderPage();
+}
+
+// ── Search ────────────────────────────────────────────────────────────────────
+function onSearch(q) {
+  S.q = q;
+  clearTimeout(S.timer);
+  if (S.tab === 'conversations') return;
+  S.timer = setTimeout(async () => {
+    for (const aid of [...agentLoaded]) {
+      const i = allAgents.indexOf(aid);
+      if (i === -1) continue;
+      const sec = document.querySelector(`.user-section[data-idx="${i}"]`);
+      if (sec?.classList.contains('open')) {
+        agentItems[aid] = null;
+        await loadAgentMemories(i, aid);
+      }
+    }
+  }, 380);
+}
+
+// ── Settings modal ────────────────────────────────────────────────────────────
+async function openSettings(i, event) {
+  event.stopPropagation();
+  const aid = allAgents[i];
+  settingsAid = aid;
+  document.getElementById('settingsLbl').textContent = aid;
+  document.getElementById('sAvatar').value  = '';
+  document.getElementById('sApiSrc').value  = 'nvidia';
+  document.getElementById('sModel').value   = '';
+  document.getElementById('sNotes').value   = '';
+  refreshAvPreview('', aid);
+
+  try {
+    const d = await api(`/admin/api/agents/${enc(aid)}/settings`);
+    document.getElementById('sAvatar').value  = d.avatar     || '';
+    document.getElementById('sApiSrc').value  = d.api_source || 'nvidia';
+    document.getElementById('sModel').value   = d.llm_model  || '';
+    document.getElementById('sNotes').value   = d.notes      || '';
+    refreshAvPreview(d.avatar || '', aid);
+  } catch {}
+
+  document.getElementById('settingsOv').classList.add('open');
+}
+function closeSettingsOv() { document.getElementById('settingsOv').classList.remove('open'); }
+
+function previewAvatar(url) { refreshAvPreview(url.trim(), settingsAid || '?'); }
+function clearAvatar() {
+  document.getElementById('sAvatar').value = '';
+  refreshAvPreview('', settingsAid || '?');
+}
+function refreshAvPreview(url, aid) {
+  const el = document.getElementById('avPreview');
+  if (url) {
+    el.innerHTML = `<img src="${esc(url)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%">`;
+    el.style.background = '';
+  } else {
+    const i = allAgents.indexOf(aid);
+    const bg = i >= 0 ? (S.night ? AV_NIGHT[i % AV_NIGHT.length] : AV_DAY[i % AV_DAY.length]) : '#ddd';
+    el.innerHTML = ([...aid][0]?.toUpperCase() || '?');
+    el.style.background = bg;
+  }
+}
+function loadAvatarFile(input) {
+  const file = input.files[0];
+  if (!file) return;
+  if (file.size > 800 * 1024) { toast('Image too large (max 800 KB)'); return; }
+  const reader = new FileReader();
+  reader.onload = e => {
+    document.getElementById('sAvatar').value = e.target.result;
+    refreshAvPreview(e.target.result, settingsAid || '?');
+  };
+  reader.readAsDataURL(file);
+}
+
+async function saveSettings() {
+  if (!settingsAid) return;
+  const body = {
+    api_source: document.getElementById('sApiSrc').value,
+    llm_model:  document.getElementById('sModel').value.trim(),
+    notes:      document.getElementById('sNotes').value.trim(),
+    avatar:     document.getElementById('sAvatar').value.trim(),
+  };
+  try {
+    await api(`/admin/api/agents/${enc(settingsAid)}/settings`, { method:'POST', body });
+    sessionStorage.removeItem(`av_${settingsAid}`);
+    toast('Settings saved');
+    closeSettingsOv();
+    const i = allAgents.indexOf(settingsAid);
+    if (i >= 0) applyAvatarEl(i, body.avatar, settingsAid);
+  } catch(e) { toast('Error: '+e.message); }
+}
+
+async function deleteAgentSettings() {
+  if (!settingsAid || !confirm(`Delete settings for "${settingsAid}"?\n(Memory data is kept)`)) return;
+  try {
+    await api(`/admin/api/agents/${enc(settingsAid)}/settings`, { method:'DELETE' });
+    sessionStorage.removeItem(`av_${settingsAid}`);
+    toast('Settings deleted');
+    closeSettingsOv();
+  } catch(e) { toast('Error: '+e.message); }
+}
+
+// ── New agent modal ───────────────────────────────────────────────────────────
+function openNewAgentModal() {
+  document.getElementById('newAid').value   = '';
+  document.getElementById('newNotes').value = '';
+  document.getElementById('newAgentOv').classList.add('open');
+  setTimeout(() => document.getElementById('newAid').focus(), 50);
+}
+function closeNewAgentOv() { document.getElementById('newAgentOv').classList.remove('open'); }
+
+async function createAgent() {
+  const aid   = document.getElementById('newAid').value.trim();
+  const notes = document.getElementById('newNotes').value.trim();
+  if (!aid) return;
+  try {
+    await api(`/admin/api/agents/${enc(aid)}/settings`, {
+      method:'POST', body:{ api_source:'nvidia', llm_model:'', notes, avatar:'' }
+    });
+    toast(`Agent "${aid}" created`);
+    closeNewAgentOv();
+    await loadAgents();
+  } catch(e) { toast('Error: '+e.message); }
+}
+
+// ── Add / edit memory modal ───────────────────────────────────────────────────
+function openAddModal() {
+  editId = null; editCol = null; editAid = null;
+  document.getElementById('memTitle').textContent = 'Add Memory';
+  document.getElementById('memCol').value = COL[S.tab] || 'memory_profile';
+  document.getElementById('memCol').disabled = false;
+  document.getElementById('memTxt').value = '';
+  document.getElementById('memUserG').style.display = '';
+  const sel = document.getElementById('memUser');
+  sel.innerHTML = allAgents.map(a => `<option value="${esc(a)}">${esc(a)}</option>`).join('');
+  document.getElementById('memOv').classList.add('open');
+  setTimeout(() => document.getElementById('memTxt').focus(), 50);
+}
+function openEditModal(id) {
+  const it = CACHE[id]; if (!it) return;
+  editId = id; editCol = it._col; editAid = it._aid;
+  document.getElementById('memTitle').textContent = 'Edit Memory';
+  document.getElementById('memCol').value = it._col;
+  document.getElementById('memCol').disabled = true;
+  document.getElementById('memTxt').value = it.text || '';
+  document.getElementById('memUserG').style.display = 'none';
+  document.getElementById('memOv').classList.add('open');
+  setTimeout(() => document.getElementById('memTxt').focus(), 50);
+}
+function closeMemOv() { document.getElementById('memOv').classList.remove('open'); }
+
+async function saveMemory() {
+  const text = document.getElementById('memTxt').value.trim();
+  const col  = document.getElementById('memCol').value;
+  if (!text) return;
+  try {
+    if (editId) {
+      await api(`/admin/api/memories/${editId}`, { method:'PUT', body:{ collection:editCol, text } });
+      toast('Updated');
+      const i = editAid ? allAgents.indexOf(editAid) : -1;
+      if (i >= 0 && agentLoaded.has(editAid)) {
+        agentItems[editAid] = null;
+        await loadAgentMemories(i, editAid);
+      }
+    } else {
+      const aid = document.getElementById('memUser').value;
+      await api('/admin/api/memories', { method:'POST', body:{ collection:col, text, agent_id:aid } });
+      toast('Added');
+      const i = allAgents.indexOf(aid);
+      if (i >= 0 && agentLoaded.has(aid)) {
+        agentItems[aid] = null;
+        await loadAgentMemories(i, aid);
+      }
+    }
+    closeMemOv();
+    loadGlobalStats();
+  } catch(e) { toast('Error: '+e.message); }
+}
+
+async function delMemory(id, col) {
+  if (!confirm('Delete this memory?')) return;
+  const aid = CACHE[id]?._aid;
+  try {
+    await api(`/admin/api/memories/${id}?collection=${col}`, { method:'DELETE' });
+    toast('Deleted');
+    loadGlobalStats();
+    const i = aid ? allAgents.indexOf(aid) : -1;
+    if (i >= 0 && agentLoaded.has(aid)) {
+      agentItems[aid] = null;
+      await loadAgentMemories(i, aid);
+    }
+  } catch(e) { toast('Error: '+e.message); }
+}
+
+// ── Key modal ─────────────────────────────────────────────────────────────────
+function openKeyModal() {
+  document.getElementById('keyIn').value = S.key;
+  document.getElementById('keyOv').classList.add('open');
+  setTimeout(() => document.getElementById('keyIn').focus(), 50);
+}
+function saveKey() {
+  const k = document.getElementById('keyIn').value.trim();
+  if (!k) return;
+  S.key = k;
+  localStorage.setItem('mgw_k', k);
+  document.getElementById('keyOv').classList.remove('open');
+  updateKeyChip(); boot();
+}
+function updateKeyChip() {
+  document.getElementById('keyChip').textContent = S.key ? `KEY ••${S.key.slice(-4)}` : 'SET KEY';
+}
+
+// ── Backup & Restore ──────────────────────────────────────────────────────────
+let _importData = null;
+let _autoPillOn = false;
+let _histFile   = null;
+
+async function openBackupModal() {
+  _importData = null;
+  document.getElementById('importFile').value = '';
+  document.getElementById('importFileName').textContent = 'No file selected';
+  document.getElementById('importPreview').style.display = 'none';
+  document.getElementById('importResult').style.display  = 'none';
+  document.getElementById('importResult').className = 'bk-result';
+
+  // Populate agent selector for history import
+  _histFile = null;
+  document.getElementById('histFile').value = '';
+  document.getElementById('histFileName').textContent = 'No file selected';
+  document.getElementById('histPreview').style.display = 'none';
+  document.getElementById('histResult').style.display  = 'none';
+  document.getElementById('histResult').className = 'bk-result';
+  const sel = document.getElementById('histAgentSel');
+  sel.innerHTML = allAgents.length
+    ? allAgents.map(a => `<option value="${a}">${a}</option>`).join('')
+    : '<option value="default">default</option>';
+
+  // Load auto-backup settings
+  try {
+    const d = await api('/admin/api/backup/settings');
+    _autoPillOn = d.enabled;
+    document.getElementById('autoPill').classList.toggle('on', _autoPillOn);
+    document.getElementById('autoInterval').value = d.interval_days || 7;
+    const meta = [];
+    if (d.last_backup_at) meta.push(`Last backup: ${d.last_backup_at.slice(0,16).replace('T',' ')}`);
+    meta.push(`Files on server: ${d.backup_count}`);
+    document.getElementById('autoMeta').textContent = meta.join(' · ');
+  } catch {}
+  document.getElementById('backupOv').classList.add('open');
+}
+
+// ── History import helpers ─────────────────────────────────────────────────────
+function previewHistImport(input) {
+  const file = input.files[0];
+  if (!file) return;
+  _histFile = file;
+  document.getElementById('histFileName').textContent = file.name;
+  document.getElementById('histPreview').style.display = 'none';
+  document.getElementById('histResult').style.display  = 'none';
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const data = JSON.parse(e.target.result);
+      let count = 0;
+      if (Array.isArray(data) && data.length && data[0].chat_messages !== undefined) {
+        count = data.length;                          // Claude.ai format
+      } else if (data.agents || data.users) {
+        const agents = data.agents || data.users;
+        for (const aid of Object.keys(agents))
+          count += (agents[aid].conversations || []).length;
+      } else {
+        toast('Unknown format — expected Claude.ai or gateway export'); return;
+      }
+      document.getElementById('histConvCount').textContent = count;
+      document.getElementById('histPreview').style.display = '';
+    } catch(err) { toast('Invalid JSON: ' + err.message); }
+  };
+  reader.readAsText(file);
+}
+
+async function confirmHistImport() {
+  if (!_histFile) return;
+  const agent_id = document.getElementById('histAgentSel').value;
+  if (!agent_id) { toast('Select a target agent first'); return; }
+  const btn = document.getElementById('histImportBtn');
+  const count = document.getElementById('histConvCount').textContent;
+  btn.disabled = true;
+  btn.textContent = `Importing ${count} conversations…`;
+  const res = document.getElementById('histResult');
+  res.style.display = 'none';
+  try {
+    const fd = new FormData();
+    fd.append('agent_id', agent_id);
+    fd.append('file', _histFile);
+    const resp = await fetch('/admin/api/import/conversations', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${S.key}` },
+      body: fd,
+    });
+    if (!resp.ok) { const t = await resp.text(); throw new Error(t); }
+    const d = await resp.json();
+    res.className = 'bk-result ok';
+    res.innerHTML = `✓ Done &nbsp;·&nbsp; Imported: <strong>${d.imported}</strong> &nbsp;·&nbsp; Memories extracted: <strong>${d.memories_created}</strong> &nbsp;·&nbsp; Skipped: ${d.skipped}`;
+    res.style.display = '';
+    toast('Import complete');
+    loadGlobalStats(); loadAgents();
+  } catch(err) {
+    res.className = 'bk-result err';
+    res.textContent = '✕ ' + err.message;
+    res.style.display = '';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Import & Extract';
+  }
+}
+function closeBackupOv() { document.getElementById('backupOv').classList.remove('open'); }
+
+async function doExport() {
+  toast('Preparing export…');
+  try {
+    const r = await fetch('/admin/api/export', {
+      headers: { 'Authorization': `Bearer ${S.key}` }
+    });
+    if (!r.ok) throw new Error(r.status);
+    const blob = await r.blob();
+    const cd   = r.headers.get('Content-Disposition') || '';
+    const m    = cd.match(/filename="([^"]+)"/);
+    const name = m ? m[1] : 'memory_backup.json';
+    const url  = URL.createObjectURL(blob);
+    Object.assign(document.createElement('a'),
+      { href: url, download: name }).click();
+    URL.revokeObjectURL(url);
+    toast('Downloaded ' + name);
+  } catch(e) { toast('Export failed: ' + e.message); }
+}
+
+function previewImport(input) {
+  const file = input.files[0];
+  if (!file) return;
+  document.getElementById('importFileName').textContent = file.name;
+  document.getElementById('importPreview').style.display = 'none';
+  document.getElementById('importResult').style.display  = 'none';
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const data = JSON.parse(e.target.result);
+      if (!data.agents && !data.users) { toast('Invalid backup file'); return; }
+      _importData = data;
+      const agentMap = data.agents || data.users;
+      let users = 0, mems = 0, convs = 0;
+      for (const ud of Object.values(agentMap)) {
+        users++;
+        for (const tier of ['profile','project','recent'])
+          mems  += (ud.memories?.[tier] || []).length;
+        convs += (ud.conversations || []).length;
+      }
+      document.getElementById('pvUsers').textContent = users;
+      document.getElementById('pvMems').textContent  = mems;
+      document.getElementById('pvConvs').textContent = convs;
+      const mode = document.getElementById('importMode').value;
+      document.getElementById('importWarn').textContent =
+        mode === 'overwrite' ? '⚠ Overwrite will delete ALL current data' : '';
+      document.getElementById('importPreview').style.display = '';
+    } catch(e) { toast('Invalid JSON: ' + e.message); }
+  };
+  reader.readAsText(file);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('importMode').addEventListener('change', () => {
+    if (!_importData) return;
+    const mode = document.getElementById('importMode').value;
+    document.getElementById('importWarn').textContent =
+      mode === 'overwrite' ? '⚠ Overwrite will delete ALL current data' : '';
+  });
+});
+
+async function confirmImport() {
+  if (!_importData) return;
+  const mode = document.getElementById('importMode').value;
+  if (mode === 'overwrite' && !confirm('This will DELETE ALL current data and replace it.\nAre you sure?')) return;
+  const btn = document.getElementById('importBtn');
+  btn.disabled = true; btn.textContent = 'Importing…';
+  const res = document.getElementById('importResult');
+  res.style.display = 'none';
+  try {
+    const d = await api('/admin/api/import', { method:'POST', body:{ mode, data:_importData } });
+    res.className = 'bk-result ok';
+    res.innerHTML = `✓ Done<br>
+      Users: ${d.imported_users} &nbsp;·&nbsp;
+      Memories: ${d.imported_memories} &nbsp;·&nbsp;
+      Conversations: ${d.imported_conversations} &nbsp;·&nbsp;
+      Skipped: ${d.skipped}`;
+    res.style.display = '';
+    toast('Import complete');
+    loadGlobalStats(); loadAgents();
+  } catch(e) {
+    res.className = 'bk-result err';
+    res.textContent = '✕ Error: ' + e.message;
+    res.style.display = '';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Import now';
+  }
+}
+
+function toggleAutoPill() {
+  _autoPillOn = !_autoPillOn;
+  document.getElementById('autoPill').classList.toggle('on', _autoPillOn);
+}
+
+async function saveAutoBackup() {
+  const interval = parseInt(document.getElementById('autoInterval').value) || 7;
+  try {
+    await api('/admin/api/backup/settings', {
+      method:'POST', body:{ enabled: String(_autoPillOn), interval_days: String(interval) }
+    });
+    toast('Auto-backup settings saved');
+  } catch(e) { toast('Error: '+e.message); }
+}
+
+async function triggerBackup() {
+  toast('Creating backup…');
+  try {
+    const d = await api('/admin/api/backup/trigger', { method:'POST', body:{} });
+    toast('Saved: ' + d.filename);
+    document.getElementById('autoMeta').textContent =
+      `Last backup: now · Files on server: ${d.backup_count}`;
+  } catch(e) { toast('Error: '+e.message); }
+}
+
+// ── Theme ─────────────────────────────────────────────────────────────────────
+function applyTheme() {
+  document.body.classList.toggle('night', S.night);
+  document.getElementById('themeL').textContent = S.night ? 'NIGHT' : 'DAY';
+  // Update initial avatars
+  document.querySelectorAll('.u-av-init').forEach(el => {
+    if (el.querySelector('img')) return; // already has image
+    const i = parseInt(el.id.replace('uav',''));
+    el.style.background = S.night ? AV_NIGHT[i % AV_NIGHT.length] : AV_DAY[i % AV_DAY.length];
+  });
+}
+function toggleTheme() {
+  S.night = !S.night;
+  localStorage.setItem('mgw_n', S.night ? '1' : '0');
+  applyTheme();
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+function toast(msg) {
+  const w = document.getElementById('toastWrap');
+  const el = document.createElement('div');
+  el.className = 'toast'; el.textContent = msg;
+  w.appendChild(el);
+  setTimeout(() => el.remove(), 2600);
+}
+
+// ── Utils ─────────────────────────────────────────────────────────────────────
+function setArea(html) { document.getElementById('area').innerHTML = html; }
+function enc(s) { return encodeURIComponent(s); }
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function fmtTs(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  return d.toLocaleDateString('zh-CN',{year:'2-digit',month:'2-digit',day:'2-digit'});
+}
+function fmtIsoTime(iso) {
+  if (!iso) return '';
+  return new Date(iso).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',hour12:false});
+}
+function fmtIsoDate(iso) {
+  if (!iso) return '';
+  return new Date(iso).toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit'});
+}
+</script>
+</body>
+</html>
