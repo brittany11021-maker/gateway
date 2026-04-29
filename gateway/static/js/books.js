@@ -188,7 +188,7 @@ async function openReadView(bookId) {
     <div class="ann-popup" id="annPopup" style="display:none">
       <button class="ann-popup-btn" onclick="openNoteOverlay()">+ 批注</button>
       <button class="ann-popup-btn" onclick="addBookmark()">🔖 书签</button>
-      <button class="ann-popup-btn" onclick="openBookChat()">💬 问</button>
+      <button class="ann-popup-btn" id="bookChatBtn" onclick="openBookChat()">💬 聊</button>
     </div>
     <div class="note-overlay" id="noteOverlay" style="display:none" onclick="if(event.target===this)closeNoteOverlay()">
       <div class="note-box" onclick="event.stopPropagation()">
@@ -205,7 +205,7 @@ async function openReadView(bookId) {
         <div class="note-quote" id="bookChatQuote"></div>
         <div id="bookChatMsgs" style="max-height:300px;overflow-y:auto;margin:10px 0;display:flex;flex-direction:column;gap:8px"></div>
         <div style="display:flex;gap:6px;align-items:flex-end">
-          <textarea class="note-ta" id="bookChatInput" placeholder="问 agent…" style="flex:1;min-height:44px" onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter'){event.preventDefault();sendBookChat()}"></textarea>
+          <textarea class="note-ta" id="bookChatInput" placeholder="和 agent 聊…" style="flex:1;min-height:44px" onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter'){event.preventDefault();sendBookChat()}"></textarea>
           <button class="btn btn-p" onclick="sendBookChat()" style="height:44px;padding:0 14px">发送</button>
         </div>
         <div style="display:flex;justify-content:flex-end;margin-top:8px">
@@ -384,6 +384,8 @@ function onTextSelect(e) {
   popup.style.left = (selRect.left + selRect.width / 2 - 40) + 'px';
   popup.style.top  = (selRect.top + window.scrollY - 42) + 'px';
   popup.style.display = '';
+  const _chatBtn = popup.querySelector('[onclick="openBookChat()"]');
+  if (_chatBtn) _chatBtn.textContent = '💬 和' + _readAgent + '聊';
 }
 
 function onTextSelectTouch(e) {
@@ -398,6 +400,8 @@ function onTextSelectTouch(e) {
   popup.style.left = Math.max(0, touch.clientX - 60) + 'px';
   popup.style.top  = Math.max(0, touch.clientY + window.scrollY - 52) + 'px';
   popup.style.display = '';
+  const _chatBtnT = popup.querySelector('[onclick="openBookChat()"]');
+  if (_chatBtnT) _chatBtnT.textContent = '💬 和' + _readAgent + '聊';
 }
 
 function hideAnnPopup() {
@@ -456,8 +460,33 @@ function renderAnnotations() {
     return;
   }
   list.innerHTML = _readAnns.map(a => {
-    const hasCmt   = !!a.comment;
     const isBookmk = a.color === 'bookmark';
+    const isChat   = a.color === 'chat';
+
+    if (isChat) {
+      let chatLines = '';
+      try {
+        const hist = JSON.parse(a.comment || '[]');
+        chatLines = hist.map(m => {
+          const who = m.role === 'user' ? '你' : esc(a.agent_id);
+          const col = m.role === 'user' ? 'color:var(--accent,#6366f1)' : 'opacity:.85';
+          return `<div style="margin:2px 0;font-size:11px;${col}"><b>${who}</b>: ${esc((m.content||'').slice(0,160))}${(m.content||'').length>160?'…':''}</div>`;
+        }).join('');
+      } catch(_) {}
+      return `
+      <div class="ann-card ann-bubble">
+        <span style="font-size:10px;opacity:.55">💬 对话</span>
+        <div class="ann-quote">${esc(a.selected_text.slice(0,100))}${a.selected_text.length>100?'…':''}</div>
+        <div style="margin:6px 0;border-left:2px solid var(--border,#333);padding-left:6px">${chatLines}</div>
+        <div class="ann-meta">
+          <span style="font-weight:600;font-size:10px">${esc(a.agent_id)}</span>
+          <span style="color:var(--muted);font-size:10px">· p.${a.page} · ${fmtIsoDate(a.created_at)}</span>
+          <button class="ann-copy" onclick="deleteAnnotation('${a.annotation_id}')" title="Delete" style="color:var(--danger)">✕</button>
+        </div>
+      </div>`;
+    }
+
+    const hasCmt   = !!a.comment;
     const cardCls  = hasCmt ? 'ann-card ann-bubble' : 'ann-card ann-plain';
     const tag      = isBookmk ? '<span class="ann-bookmark" title="书签">🔖</span>' : '';
     return `
@@ -535,7 +564,7 @@ async function exportAnnotations(bookId) {
 function applyHighlights() {
   const container = document.querySelector('.read-page-content');
   if (!container || !_readAnns.length) return;
-  const pageAnns = _readAnns.filter(a => a.page === _readPage);
+  const pageAnns = _readAnns.filter(a => a.page === _readPage && a.color !== 'chat');
   if (!pageAnns.length) return;
   // Longest first so shorter matches don't split longer ones
   pageAnns.sort((a, b) => b.selected_text.length - a.selected_text.length);
@@ -669,12 +698,14 @@ async function doUpload() {
 
 // ── Book chat (划线问 agent) ──────────────────────────────────────────────────
 let _bookChatHistory = [];
+let _bookChatDisplay = [];   // display-only history (no embedded page context)
 let _bookChatQuote   = '';
 
 function openBookChat() {
   if (!_annPopup) return;
   _bookChatQuote   = _annPopup.text;
   _bookChatHistory = [];
+  _bookChatDisplay = [];
   hideAnnPopup();
   const overlay = document.getElementById('bookChatOverlay');
   if (!overlay) return;
@@ -682,7 +713,7 @@ function openBookChat() {
     '\u300c' + _bookChatQuote.slice(0, 120) + (_bookChatQuote.length > 120 ? '\u2026' : '') + '\u300d';
   document.getElementById('bookChatMsgs').innerHTML = '';
   const inp = document.getElementById('bookChatInput');
-  if (inp) { inp.placeholder = '\u95ee ' + _readAgent + '\u2026'; inp.value = ''; }
+  if (inp) { inp.placeholder = '和 ' + _readAgent + ' 聊…'; inp.value = ''; }
   overlay.style.display = '';
   setTimeout(() => inp && inp.focus(), 50);
 }
@@ -690,7 +721,21 @@ function openBookChat() {
 function closeBookChat() {
   const el = document.getElementById('bookChatOverlay');
   if (el) el.style.display = 'none';
+  // Auto-save chat if there's at least one full exchange
+  if (_bookChatDisplay.length >= 2 && _readBook) {
+    api(`/api/books/${_readBook.book_id}/annotations`, {
+      method: 'POST',
+      body: {
+        agent_id: _readAgent,
+        selected_text: _bookChatQuote.slice(0, 500) || '(no quote)',
+        comment: JSON.stringify(_bookChatDisplay),
+        page: _readPage,
+        color: 'chat',
+      }
+    }).then(() => loadAnnotations()).catch(() => {});
+  }
   _bookChatHistory = [];
+  _bookChatDisplay = [];
   _bookChatQuote   = '';
 }
 
@@ -704,6 +749,7 @@ function _appendBookChatMsg(role, text) {
   d.textContent = text;
   box.appendChild(d);
   box.scrollTop = box.scrollHeight;
+  return d;
 }
 
 async function sendBookChat() {
@@ -712,8 +758,9 @@ async function sendBookChat() {
   if (!msg) return;
   inp.value = '';
   _appendBookChatMsg('user', msg);
+  _bookChatDisplay.push({ role: 'user', content: msg });
 
-  // First turn: embed context into user message, preserving agent system prompt
+  // First turn: embed context into user message
   let userContent = msg;
   if (_bookChatHistory.length === 0) {
     const title = (_readBook && _readBook.title) || '';
@@ -726,13 +773,15 @@ async function sendBookChat() {
   }
   _bookChatHistory.push({ role: 'user', content: userContent });
 
+  const box = document.getElementById('bookChatMsgs');
   const thinking = document.createElement('div');
   thinking.style.cssText = 'align-self:flex-start;opacity:.45;font-size:12px;padding:4px 8px';
   thinking.textContent = '\u2026';
-  document.getElementById('bookChatMsgs').appendChild(thinking);
-  document.getElementById('bookChatMsgs').scrollTop = 9999;
+  box.appendChild(thinking);
+  box.scrollTop = box.scrollHeight;
 
   try {
+    console.log('[bookChat] sending, agent=', _readAgent, 'key?', !!S.key, 'msgs=', _bookChatHistory.length);
     const resp = await fetch('/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -740,14 +789,42 @@ async function sendBookChat() {
         'Authorization': 'Bearer ' + S.key,
         'X-Agent-ID': _readAgent,
       },
-      body: JSON.stringify({ messages: _bookChatHistory, stream: false }),
+      body: JSON.stringify({ messages: _bookChatHistory, stream: true }),
     });
-    if (!resp.ok) throw new Error(await resp.text());
-    const data  = await resp.json();
-    const reply = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '(\u65e0\u56de\u590d)';
+    console.log('[bookChat] resp status=', resp.status, 'ok=', resp.ok);
+    if (!resp.ok) { thinking.remove(); throw new Error(await resp.text()); }
+
     thinking.remove();
-    _appendBookChatMsg('assistant', reply);
-    _bookChatHistory.push({ role: 'assistant', content: reply });
+    const replyDiv = document.createElement('div');
+    replyDiv.style.cssText = 'align-self:flex-start;background:var(--surface2,#2a2a2a);padding:6px 10px;border-radius:10px 10px 10px 2px;font-size:13px;max-width:85%;white-space:pre-wrap';
+    box.appendChild(replyDiv);
+
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let reply = '';
+    let buf = '';
+    outer: while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        const raw = line.slice(5).trim();
+        if (raw === '[DONE]') break outer;
+        try {
+          const chunk = JSON.parse(raw);
+          const delta = chunk.choices?.[0]?.delta?.content;
+          if (delta) { reply += delta; replyDiv.textContent = reply; box.scrollTop = box.scrollHeight; }
+          else { console.log('[bookChat] chunk no content:', JSON.stringify(chunk.choices?.[0]?.delta).slice(0,80)); }
+        } catch(_) {}
+      }
+    }
+    console.log('[bookChat] done, replyLen=', reply.length, '|', reply.slice(0,60));
+    if (!reply) replyDiv.textContent = '(\u65e0\u56de\u590d)';
+    _bookChatHistory.push({ role: 'assistant', content: reply || '(\u65e0\u56de\u590d)' });
+    _bookChatDisplay.push({ role: 'assistant', content: reply || '(\u65e0\u56de\u590d)' });
   } catch(e) {
     thinking.remove();
     _appendBookChatMsg('assistant', '\u9519\u8bef\uff1a' + e.message);

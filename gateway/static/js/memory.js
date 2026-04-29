@@ -58,7 +58,13 @@ function renderPage() {
     </div>`;
   }).join('');
 
-  setArea(`<div class="agent-card-list">${cards}</div>`);
+  const hint = S.tab === 'project'
+    ? '<div style="font-size:10px;color:var(--muted);padding:0 2px 10px">◈ L2 Events — 中期事件/知识记忆</div>'
+    : S.tab === 'agent'
+    ? '<div style="font-size:10px;color:var(--muted);padding:0 2px 10px">◉ L1 Profile — 永久角色/关系记忆</div>'
+    : '';
+
+  setArea(`<div class="agent-card-list">${hint}${cards}</div>`);
   visibleAgents.forEach((aid, i) => restoreAvatar(aid, i));
 }
 
@@ -91,35 +97,65 @@ let _agentDetailTab = 'l1';
 let _agentDetailItems = {};  // tab → items array
 
 const TIER_CFG = {
-  l1: { col:'memory_profile',  label:'L1 — Profile', icon:'◉', cls:'type-profile',
+  l1: { col:'L1', label:'L1 — Profile', icon:'◉', cls:'type-memory',
         desc:'永久记忆·角色/关系' },
-  l2: { col:'memory_project',  label:'L2 — Project', icon:'◈', cls:'type-project',
-        desc:'中期·项目/知识' },
-  l3: { col:'memory_recent',   label:'L3 — Recent',  icon:'◑', cls:'type-recent',
+  l2: { col:'L2', label:'L2 — Events',  icon:'◈', cls:'type-memory',
+        desc:'中期·事件/知识', typeFilter: null },
+  l2project: { col:'L2', label:'L2 — Project', icon:'◈', cls:'type-memory',
+        desc:'中期·任务/项目', typeFilter: 'project' },
+  l3: { col:'L3', label:'L3 — Recent',  icon:'◑', cls:'type-memory',
         desc:'近期·~30天' },
-  history: { col:null, label:'History', icon:'⟳', cls:'type-recent', desc:'原始对话' },
-  daily:   { col:null, label:'Daily',   icon:'✦', cls:'type-profile', desc:'日记事件' },
+  l4: { col:'L4', label:'L4 — Atomic',  icon:'·', cls:'type-memory',
+        desc:'原子细节·短暂观察' },
+  l5: { col:null,  label:'L5 — Archive', icon:'⌛', cls:'type-memory',
+        desc:'对话摘要·留底层' },
+  history: { col:null, label:'History', icon:'⟳', cls:'type-memory', desc:'原始对话' },
+  daily:   { col:null, label:'Daily',   icon:'✦', cls:'type-memory', desc:'日记事件' },
 };
 
 async function openAgentPage(aid) {
   _agentPageAid   = aid;
-  _agentDetailTab = 'l1';
   _agentDetailItems = {};
   _setToolbarMode('detail', aid);
 
+  // Default sub-tab: project→l2project, memory→l1
+  _agentDetailTab = (S.tab === 'project') ? 'l2project' : 'l1';
+
   const atype = agentTypes[aid] || 'agent';
-  const tabs = ['l1', 'l2', 'l3', 'history'];
-  if (atype === 'character') tabs.splice(3, 0, 'daily');
+  const tabs = S.tab === 'project'
+    ? ['l1', 'l2project', 'l3', 'l4', 'l5', 'history']
+    : ['l1', 'l2', 'l3', 'l4', 'l5', 'history'];
+  if (atype === 'character') tabs.splice(5, 0, 'daily');
 
   const tabsHtml = tabs.map(t => {
     const cfg = TIER_CFG[t];
-    return `<button class="detail-tab ${t==='l1'?'active':''}" data-tab="${t}"
+    return `<button class="detail-tab ${t===_agentDetailTab?'active':''}" data-tab="${t}"
       onclick="switchAgentDetailTab('${t}')">${cfg.icon} ${cfg.label}</button>`;
   }).join('');
 
   const badge = atype === 'character'
     ? '<span style="font-size:10px;background:rgba(180,100,220,.15);color:#b464dc;border-radius:4px;padding:2px 8px">character</span>'
     : '<span style="font-size:10px;background:rgba(60,140,255,.12);color:#3c8cff;border-radius:4px;padding:2px 8px">agent</span>';
+
+  // Memory tab: show pending-L1 warning banner
+  let pendingBanner = '';
+  if (S.tab !== 'project') {
+    try {
+      const pd = await api(`/api/admin/memories?agent_id=${enc(aid)}&layer=L1&limit=50`);
+      const pc = (pd.items || []).filter(x => x.status === 'pending_l1').length;
+      if (pc > 0) {
+        pendingBanner = `<div id="pending-banner" style="background:rgba(255,180,0,.12);border:1px solid rgba(255,180,0,.3);
+          border-radius:6px;padding:8px 12px;margin-bottom:10px;font-size:12px;color:#c8960a;display:flex;
+          align-items:center;gap:8px">
+          <span>⏳</span>
+          <span><b>${pc} 条 L1 记忆待确认</b>，请切换到 L1 — Profile 查看</span>
+          <button onclick="switchAgentDetailTab('l1')" style="margin-left:auto;font-size:11px;
+            background:rgba(255,180,0,.2);border:none;border-radius:4px;padding:2px 8px;
+            cursor:pointer;color:#c8960a">查看</button>
+        </div>`;
+      }
+    } catch(_) {}
+  }
 
   setArea(`
     <div class="detail-page">
@@ -136,6 +172,7 @@ async function openAgentPage(aid) {
         </div>
         <div class="detail-tabs">${tabsHtml}</div>
       </div>
+      ${pendingBanner ? `<div style="padding:0 4px">${pendingBanner}</div>` : ''}
       <div id="detail-body"><div class="u-loading">Loading…</div></div>
     </div>`);
 
@@ -147,7 +184,7 @@ async function openAgentPage(aid) {
     if (el && cached) { el.innerHTML = `<img src="${esc(cached)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%">`; el.style.background=''; }
   }
 
-  await loadDetailTab('l1');
+  await loadDetailTab(_agentDetailTab);
 }
 
 function closeAgentPage() {
@@ -175,14 +212,16 @@ async function loadDetailTab(tab) {
 
   if (tab === 'history') { await loadDetailHistory(aid); return; }
   if (tab === 'daily')   { await loadDetailDaily(aid);   return; }
+  if (tab === 'l5')      { await loadDetailL5(aid);      return; }
 
   const cfg = TIER_CFG[tab];
   try {
-    const params = new URLSearchParams({ collection: cfg.col, agent_id: aid, limit: 500 });
+    const params = new URLSearchParams({ layer: cfg.col, agent_id: aid, limit: 500 });
     if (S.q) params.set('q', S.q);
-    const d = await api('/admin/api/memories?' + params);
+    if (cfg.typeFilter) params.set('type', cfg.typeFilter);
+    const d = await api('/api/admin/memories?' + params);
     _agentDetailItems[tab] = d.items;
-    d.items.forEach(it => { CACHE[it.id] = { ...it, _col: cfg.col, _aid: aid }; });
+    d.items.forEach(it => { CACHE[it.id] = { ...it, _layer: cfg.col, _aid: aid }; });
     renderDetailCards(tab);
   } catch(e) {
     body.innerHTML = `<div class="u-empty">Error: ${e.message}</div>`;
@@ -206,19 +245,39 @@ function renderDetailCards(tab) {
     body.innerHTML = countHtml + '<div class="u-empty">No memories yet</div>'; return;
   }
 
-  const cards = slice.map(it => `
-    <div class="mem-card ${cfg.cls}" onclick="toggleCardExpand(this)">
+  const cards = slice.map(it => {
+    const statusLabels = {
+      pending_l1:         '⏳ 待确认',
+      potential_duplicate:'⚠ 疑似重复',
+      updated:            '↺ 已更新',
+      related:            '~ 相关',
+    };
+    const statusBadge = (it.status && it.status !== 'new')
+      ? `<div class="mc-status mc-status-${it.status}">${statusLabels[it.status] || it.status}</div>`
+      : '';
+    const confirmBtn = it.status === 'pending_l1'
+      ? `<button class="mc-act ok" onclick="confirmL1Memory('${it.id}')">✓</button>`
+      : '';
+    const prevContent = it.previous_content
+      ? `<details class="mc-prev"><summary>查看旧版本</summary><div class="mc-prev-body">${esc(it.previous_content)}</div></details>`
+      : '';
+    return `
+    <div class="mem-card ${cfg.cls}${it.status === 'pending_l1' ? ' mc-pending' : ''}" onclick="toggleCardExpand(this)">
       <div class="mc-acts" onclick="event.stopPropagation()">
+        ${confirmBtn}
         <button class="mc-act" onclick="openEditModal('${it.id}')">✎</button>
-        <button class="mc-act del" onclick="delMemoryDetail('${it.id}','${cfg.col}')">✕</button>
+        <button class="mc-act del" onclick="delMemoryDetail('${it.id}')">✕</button>
       </div>
+      ${statusBadge}
       <div class="mc-label">${cfg.label}</div>
-      <div class="mc-text">${esc(it.text || '')}</div>
+      <div class="mc-text">${esc(it.content || '')}</div>
+      ${prevContent}
       <div class="mc-footer">
         <span class="mc-icon">${cfg.icon}</span>
-        <span class="mc-date">${fmtTs(it.created_ts)}</span>
+        <span class="mc-date">${fmtTs(it.created_at)}</span>
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 
   const pager = pages > 1 ? `
     <div class="pager">
@@ -253,11 +312,16 @@ async function loadDetailHistory(aid) {
           <span class="conv-meta">${msgs.length} msg</span>
           <span class="conv-arr" title="${esc(c.id)}">▾</span>
         </div>
-        <div class="conv-bd">${msgs.map(m => `
+        <div class="conv-bd">${msgs.map(m => {
+          const provTag = (m.role === 'assistant' && (m._provider || m._model))
+            ? `<span style="font-size:9px;color:var(--muted);margin-left:6px;opacity:.7">${esc(m._provider||'')}${m._provider&&m._model?'·':''}${esc(m._model||'')}</span>`
+            : '';
+          return `
           <div class="msg">
-            <div class="msg-role ${m.role}">${m.role}</div>
+            <div class="msg-role ${m.role}">${m.role}${provTag}</div>
             <div class="msg-body">${esc(typeof m.content==='string'?m.content:JSON.stringify(m.content))}</div>
-          </div>`).join('')}
+          </div>`;
+        }).join('')}
         </div>
       </div>`;
     }).join('');
@@ -292,10 +356,57 @@ async function loadDetailDaily(aid) {
   }
 }
 
-async function delMemoryDetail(id, col) {
+async function loadDetailL5(aid) {
+  const body = document.getElementById('detail-body');
+  const cfg  = TIER_CFG['l5'];
+  try {
+    const params = new URLSearchParams({ agent_id: aid, limit: 100 });
+    if (S.q) params.set('q', S.q);
+    // Use search endpoint when there's a query, otherwise list
+    const endpoint = S.q
+      ? `/api/admin/l5/search?agent_id=${encodeURIComponent(aid)}&q=${encodeURIComponent(S.q)}&limit=50`
+      : `/api/admin/l5?${params}`;
+    const d = await api(endpoint);
+    const items = d.items || [];
+    if (!items.length) {
+      body.innerHTML = `<div style="font-size:10px;color:var(--muted);margin-bottom:12px;padding:0 2px">
+        ${cfg.desc} · 0 entries</div><div class="u-empty">No summaries yet</div>`;
+      return;
+    }
+    const cards = items.map(it => `
+      <div class="mem-card ${cfg.cls}" onclick="toggleCardExpand(this)">
+        <div class="mc-acts" onclick="event.stopPropagation()">
+          <button class="mc-act del" onclick="delL5Summary('${it.id}')">✕</button>
+        </div>
+        <div class="mc-label">${cfg.label}</div>
+        <div class="mc-text">${esc(it.summary || '')}</div>
+        ${it.keywords ? `<div style="font-size:10px;color:var(--muted);margin-top:4px">${esc(it.keywords)}</div>` : ''}
+        <div class="mc-footer">
+          <span class="mc-icon">${cfg.icon}</span>
+          <span class="mc-date">${fmtTs(it.created_at)}</span>
+        </div>
+      </div>`).join('');
+    body.innerHTML = `<div style="font-size:10px;color:var(--muted);margin-bottom:12px;padding:0 2px">
+      ${cfg.desc} · ${items.length} entries</div>
+      <div class="mem-grid">${cards}</div>`;
+  } catch(e) {
+    body.innerHTML = `<div class="u-empty">Error loading L5: ${e.message}</div>`;
+  }
+}
+
+async function delL5Summary(id) {
+  if (!confirm('Delete this summary?')) return;
+  try {
+    await api(`/api/admin/l5/${id}`, { method:'DELETE' });
+    toast('Deleted');
+    await loadDetailL5(_agentPageAid);
+  } catch(e) { toast('Error: '+e.message); }
+}
+
+async function delMemoryDetail(id) {
   if (!confirm('Delete this memory?')) return;
   try {
-    await api(`/admin/api/memories/${id}?collection=${col}`, { method:'DELETE' });
+    await api(`/api/admin/memories/${id}`, { method:'DELETE' });
     toast('Deleted');
     loadGlobalStats();
     delete _agentDetailItems[_agentDetailTab];
@@ -378,6 +489,47 @@ function onSearch(q) {
   }, 380);
 }
 
+// ── B/C chain editor ──────────────────────────────────────────────────────────
+const CHAIN_SLOTS = 5;
+
+function _renderChainEditor(slots, providerNames) {
+  const rows = Array.from({length: CHAIN_SLOTS}, (_, i) => {
+    const s = (slots && slots[i]) || {provider:'', enabled:true, models:[]};
+    const opts = ['', ...providerNames].map(p =>
+      `<option value="${esc(p)}" ${s.provider===p?'selected':''}>${p || '— none —'}</option>`
+    ).join('');
+    const label = `B${i+1}${i===0?' (主)':i===1?' (备1)':i===2?' (备2)':''}`;
+    return `
+    <div class="chain-slot" data-slot="${i}" style="display:flex;gap:8px;align-items:flex-start;margin-bottom:8px">
+      <div style="display:flex;flex-direction:column;align-items:center;gap:4px;padding-top:6px;min-width:44px">
+        <span style="font-size:10px;color:var(--muted);font-weight:600">${label}</span>
+        <label style="display:flex;align-items:center;gap:3px;font-size:10px;cursor:pointer">
+          <input type="checkbox" class="slot-en" ${s.enabled!==false?'checked':''} style="width:12px;height:12px">
+          <span style="color:var(--muted)">on</span>
+        </label>
+      </div>
+      <div style="flex:1;display:flex;flex-direction:column;gap:4px">
+        <select class="slot-prov form-sel" style="font-size:11px;padding:4px 6px">${opts}</select>
+        <textarea class="slot-models form-ta" rows="2" style="font-size:11px;min-height:40px"
+          placeholder="模型名，一行一个（C1, C2...）">${(s.models||[]).join('\n')}</textarea>
+      </div>
+    </div>`;
+  });
+  return `<div id="chainEditor">${rows.join('')}</div>`;
+}
+
+function _readChainEditor() {
+  const slots = [];
+  document.querySelectorAll('#chainEditor .chain-slot').forEach(el => {
+    slots.push({
+      enabled:  el.querySelector('.slot-en').checked,
+      provider: el.querySelector('.slot-prov').value,
+      models:   el.querySelector('.slot-models').value.split(/[\n,]/).map(s=>s.trim()).filter(Boolean),
+    });
+  });
+  return {slots};
+}
+
 // ── Settings modal ────────────────────────────────────────────────────────────
 function openSettingsByAid(aid, event) {
   if (event) event.stopPropagation();
@@ -389,7 +541,7 @@ function openSettingsByAid(aid, event) {
   document.getElementById('sNotes').value  = '';
   refreshAvPreview('', aid);
 
-  api(`/admin/api/agents/${enc(aid)}/settings`).then(d => {
+  api(`/admin/api/agents/${enc(aid)}/settings`).then(async d => {
     document.getElementById('sAvatar').value = d.avatar    || '';
     document.getElementById('sModel').value  = d.llm_model || '';
     document.getElementById('sChain').value  = d.api_chain || '';
@@ -404,6 +556,16 @@ function openSettingsByAid(aid, event) {
     document.getElementById('sProxyCfg').value = Object.keys(pcfg).length
       ? JSON.stringify(pcfg, null, 2) : '';
     onAgentTypeChange(atype);
+
+    // Render B/C chain editor
+    let provNames = [];
+    try {
+      if (!_provData) _provData = await api('/admin/api/providers');
+      provNames = (_provData.providers || []).map(p => p.name);
+    } catch {}
+    const chainCfg = d.llm_chain_config || {};
+    const el = document.getElementById('sChainEditor');
+    if (el) el.innerHTML = _renderChainEditor(chainCfg.slots, provNames);
   }).catch(() => {});
 
   loadEnvChainForAgent(aid);
@@ -458,6 +620,7 @@ async function saveSettings() {
   if (!settingsAid) return;
   let mcp_proxy_config = {};
   try { mcp_proxy_config = JSON.parse(document.getElementById('sProxyCfg').value || '{}'); } catch {}
+  const llm_chain_config = document.getElementById('chainEditor') ? _readChainEditor() : {};
   const body = {
     llm_model:        document.getElementById('sModel').value.trim(),
     api_chain:        document.getElementById('sChain').value.trim(),
@@ -467,6 +630,7 @@ async function saveSettings() {
     mcp_enabled:      document.getElementById('sMcpEnabled').checked,
     auto_memory:      document.getElementById('sAutoMemory').checked,
     mcp_proxy_config,
+    llm_chain_config,
     system_prompt:    document.getElementById('sSysPrompt').value,
   };
   try {
@@ -488,7 +652,7 @@ async function distillHistory() {
   if (btn) btn.disabled = true;
   if (msg) msg.textContent = 'Running…';
   try {
-    const d = await api(`/admin/api/agents/${enc(settingsAid)}/distill-history`, { method:'POST' });
+    const d = await api(`/api/admin/agents/${enc(settingsAid)}/distill-history`, { method:'POST' });
     const txt = `✓ ${d.processed} convs, +${d.memories_added} memories`;
     if (msg) msg.textContent = txt;
     toast(txt);
@@ -563,8 +727,8 @@ function openAddModal() {
   document.getElementById('memTitle').textContent = 'Add Memory';
 
   // Pre-select collection based on current detail tab
-  const tabToCol = { l1:'memory_profile', l2:'memory_project', l3:'memory_recent' };
-  const defaultCol = tabToCol[_agentDetailTab] || 'memory_profile';
+  const tabToCol = { l1:'L1', l2:'L2', l3:'L3', l4:'L4' };
+  const defaultCol = tabToCol[_agentDetailTab] || 'L1';
   document.getElementById('memCol').value = defaultCol;
   document.getElementById('memCol').disabled = false;
   document.getElementById('memTxt').value = '';
@@ -596,11 +760,11 @@ async function classifyMemory() {
   res.textContent = '分析中…'; res.style.color = 'var(--muted)';
   const aid = (document.getElementById('memUser') || {}).value || _agentPageAid || '';
   try {
-    const r = await api('/admin/api/memories/classify', {
+    const r = await api('/api/admin/memories/classify', {
       method: 'POST', body: { text, agent_id: aid }
     });
     document.getElementById('memCol').value = r.collection;
-    const icons = { l1:'◉', l2:'◈', l3:'◑' };
+    const icons = { l1:'◉', l2:'◈', l3:'◑', l4:'·' };
     res.innerHTML = `<span style="color:var(--text)">${icons[r.tier]||''} ${esc(r.label)}</span>` +
                     `<span style="color:var(--muted);margin-left:6px">${esc(r.reason)}</span>`;
     res.style.color = '';
@@ -613,11 +777,11 @@ async function classifyMemory() {
 
 function openEditModal(id) {
   const it = CACHE[id]; if (!it) return;
-  editId = id; editCol = it._col; editAid = it._aid;
+  editId = id; editCol = it._layer; editAid = it._aid;
   document.getElementById('memTitle').textContent = 'Edit Memory';
-  document.getElementById('memCol').value = it._col;
+  document.getElementById('memCol').value = it._layer || 'L1';
   document.getElementById('memCol').disabled = true;
-  document.getElementById('memTxt').value = it.text || '';
+  document.getElementById('memTxt').value = it.content || '';
   document.getElementById('memUserG').style.display = 'none';
   document.getElementById('memOv').classList.add('open');
   setTimeout(() => document.getElementById('memTxt').focus(), 50);
@@ -630,7 +794,7 @@ async function saveMemory() {
   if (!text) return;
   try {
     if (editId) {
-      await api(`/admin/api/memories/${editId}`, { method:'PUT', body:{ collection:editCol, text } });
+      await api(`/api/admin/memories/${editId}`, { method:'PUT', body:{ content: text } });
       toast('Updated');
       if (_agentPageAid && editAid === _agentPageAid) {
         delete _agentDetailItems[_agentDetailTab];
@@ -638,12 +802,12 @@ async function saveMemory() {
       }
     } else {
       const aid = document.getElementById('memUser').value || _agentPageAid;
-      await api('/admin/api/memories', { method:'POST', body:{ collection:col, text, agent_id:aid } });
+      await api('/api/admin/memories', { method:'POST', body:{ layer: col, content: text, agent_id: aid, type: 'diary' } });
       toast('Added');
       if (_agentPageAid === aid) {
         // Refresh the relevant tier tab
-        const colToTab = { memory_profile:'l1', memory_project:'l2', memory_recent:'l3' };
-        const targetTab = colToTab[col];
+        const layerToTab = { L1:'l1', L2:'l2', L3:'l3', L4:'l4' };
+        const targetTab = layerToTab[col];
         if (targetTab) {
           delete _agentDetailItems[targetTab];
           if (_agentDetailTab === targetTab) await loadDetailTab(targetTab);
@@ -655,16 +819,25 @@ async function saveMemory() {
   } catch(e) { toast('Error: '+e.message); }
 }
 
-async function delMemory(id, col) {
+async function delMemory(id) {
   if (!confirm('Delete this memory?')) return;
   const aid = CACHE[id]?._aid;
   try {
-    await api(`/admin/api/memories/${id}?collection=${col}`, { method:'DELETE' });
+    await api(`/api/admin/memories/${id}`, { method:'DELETE' });
     toast('Deleted');
     loadGlobalStats();
     if (_agentPageAid && aid === _agentPageAid) {
       delete _agentDetailItems[_agentDetailTab];
       await loadDetailTab(_agentDetailTab);
     }
+  } catch(e) { toast('Error: '+e.message); }
+}
+
+async function confirmL1Memory(id) {
+  try {
+    await api(`/api/admin/memories/${id}/confirm-l1`, { method:'POST' });
+    toast('已确认');
+    delete _agentDetailItems[_agentDetailTab];
+    await loadDetailTab(_agentDetailTab);
   } catch(e) { toast('Error: '+e.message); }
 }

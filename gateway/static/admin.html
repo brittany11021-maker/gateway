@@ -35,8 +35,8 @@
   <div class="s-tab" id="tab-character" onclick="switchTab('character')">
     <div class="s-num" id="n-character">—</div><div class="s-lbl">Character</div>
   </div>
-  <div class="s-tab" id="tab-recent" onclick="switchTab('recent')">
-    <div class="s-num" id="n-recent">—</div><div class="s-lbl">Recent</div>
+  <div class="s-tab" id="tab-memory" onclick="switchTab('memory')">
+    <div class="s-num" id="n-memory">—</div><div class="s-lbl">Memory</div>
   </div>
   <div class="s-tab" id="tab-project" onclick="switchTab('project')">
     <div class="s-num" id="n-project">—</div><div class="s-lbl">Project</div>
@@ -84,12 +84,13 @@
       <select class="form-sel" id="memUser"></select>
     </div>
     <div class="form-g">
-      <label class="form-lbl">Collection</label>
+      <label class="form-lbl">Layer</label>
       <div style="display:flex;align-items:center;gap:8px">
         <select class="form-sel" id="memCol" style="flex:1">
-          <option value="memory_profile">L1 — Profile (永久·角色关系)</option>
-          <option value="memory_project">L2 — Project (中期·项目知识)</option>
-          <option value="memory_recent">L3 — Recent (近期·30天)</option>
+          <option value="L1">L1 — Profile（永久·角色/关系）</option>
+          <option value="L2">L2 — Events（中期·事件/知识）</option>
+          <option value="L3">L3 — Recent（近期·~30天）</option>
+          <option value="L4">L4 — Atomic（短暂·原子细节）</option>
         </select>
         <button class="btn btn-s btn-g" id="classifyBtn"
           onclick="classifyMemory()" style="font-size:10px;white-space:nowrap;flex-shrink:0">🤖 分类</button>
@@ -132,8 +133,12 @@
       <input class="form-in" id="sModel" placeholder="e.g. deepseek-ai/deepseek-r1">
     </div>
     <div class="form-g">
-      <label class="form-lbl">API Chain <span style="opacity:.45;font-weight:400">(blank = use default chain)</span></label>
+      <label class="form-lbl">API Chain <span style="opacity:.45;font-weight:400">(legacy, 单一模型备用)</span></label>
       <input class="form-in" id="sChain" placeholder="e.g. nvidia,openrouter">
+    </div>
+    <div class="form-g">
+      <label class="form-lbl">B/C 链路配置 <span style="opacity:.45;font-weight:400">(B层provider × C层model，优先于上方 legacy 字段)</span></label>
+      <div id="sChainEditor" style="margin-top:4px"><div style="font-size:11px;color:var(--muted)">Loading…</div></div>
     </div>
     <div class="form-g">
       <label class="form-lbl">Effective Config <span style="opacity:.45;font-weight:400">(from .env)</span></label>
@@ -383,10 +388,10 @@
 <div class="toasts" id="toastWrap"></div>
 
 <script src="/static/js/api.js?v=6"></script>
-<script src="/static/js/memory.js?v=10"></script>
+<script src="/static/js/memory.js?v=12"></script>
 <script src="/static/js/backup.js?v=2"></script>
-<script src="/static/js/books.js?v=9"></script>
-<script src="/static/js/providers.js?v=2"></script>
+<script src="/static/js/books.js?v=11"></script>
+<script src="/static/js/providers.js?v=3"></script>
 <script src="/static/js/mcp.js?v=3"></script>
 <script src="/static/js/daily.js?v=2"></script>
 <script src="/static/js/worldbook.js?v=1"></script>

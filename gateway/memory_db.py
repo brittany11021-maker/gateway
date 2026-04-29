@@ -12,7 +12,7 @@ from typing import Optional
 DB_PATH = Path("/app/data/memory.db")
 _db: Optional[aiosqlite.Connection] = None
 VALID_LAYERS = {"L1", "L2", "L3", "L4"}
-VALID_TYPES = {"anchor", "diary", "treasure", "message"}
+VALID_TYPES = {"anchor", "diary", "treasure", "message", "reading_progress", "book_annotation", "book_reflection"}
 
 
 async def init_db(path: Optional[Path] = None) -> aiosqlite.Connection:
@@ -378,15 +378,18 @@ async def memory_wakeup(agent_id):
     now = _now()
     cur = await db.execute(
         "SELECT * FROM memories WHERE agent_id = ? AND type = 'anchor' AND archived = 0 "
+        "AND COALESCE(confirmed,1) = 1 "
         "ORDER BY importance DESC, created_at ASC", (agent_id,))
     anchors = [_row_to_dict(r) for r in await cur.fetchall()]
     cur = await db.execute(
         "SELECT * FROM memories WHERE agent_id = ? AND importance >= 4 AND archived = 0 "
+        "AND COALESCE(confirmed,1) = 1 "
         "AND created_at >= datetime('now', '-7 days') "
         "ORDER BY importance DESC, created_at DESC LIMIT 10", (agent_id,))
     recent_important = [_row_to_dict(r) for r in await cur.fetchall()]
     cur = await db.execute(
         "SELECT * FROM memories WHERE agent_id = ? AND read_by_agent = 0 AND archived = 0 "
+        "AND COALESCE(confirmed,1) = 1 "
         "ORDER BY importance DESC, created_at DESC LIMIT 10", (agent_id,))
     unread = [_row_to_dict(r) for r in await cur.fetchall()]
     # Mark unread memories as seen by agent
@@ -400,6 +403,7 @@ async def memory_wakeup(agent_id):
         await db.commit()
     cur = await db.execute(
         "SELECT * FROM memories WHERE agent_id = ? AND archived = 0 "
+        "AND COALESCE(confirmed,1) = 1 "
         "AND created_at < datetime('now', '-3 days') ORDER BY RANDOM() LIMIT 2", (agent_id,))
     random_float = [_row_to_dict(r) for r in await cur.fetchall()]
     return {"anchors": anchors, "recent_important": recent_important,
@@ -411,6 +415,7 @@ async def memory_surface(agent_id):
     now = _now()
     cur = await db.execute(
         "SELECT * FROM memories WHERE agent_id = ? AND read_by_agent = 0 AND archived = 0 "
+        "AND COALESCE(confirmed,1) = 1 "
         "ORDER BY importance DESC, created_at DESC LIMIT 5", (agent_id,))
     unread = [_row_to_dict(r) for r in await cur.fetchall()]
     if unread:
@@ -423,6 +428,7 @@ async def memory_surface(agent_id):
         await db.commit()
     cur = await db.execute(
         "SELECT * FROM memories WHERE agent_id = ? AND archived = 0 "
+        "AND COALESCE(confirmed,1) = 1 "
         "AND created_at < datetime('now', '-3 days') ORDER BY RANDOM() LIMIT 1", (agent_id,))
     random_float = [_row_to_dict(r) for r in await cur.fetchall()]
     return {"unread": unread, "random_float": random_float}
@@ -798,14 +804,20 @@ async def memory_write_smart(
     source: str = "",
     parent_id: str = "",
 ) -> dict:
-    """Write memory with automatic similarity-based dedup and status tagging.
+    """Write memory with automatic similarity-based dedup, rewrite, and L1 protection.
 
     Similarity thresholds (Jaccard over tokens + CJK bigrams):
       ≥ 0.85 → very likely duplicate: queue to pending_dedup, do NOT write
-                returns {"action": "queued", ...}
-      ≥ 0.55 → potential_duplicate: write with confirmed=0
+      ≥ 0.55 + L2/L3 → REWRITE: update existing memory in-place, save old content
+                        to previous_content, mark status='updated'
+      ≥ 0.55 + other layers → write with confirmed=0, status='potential_duplicate'
       ≥ 0.25 → related: write with status='related', related_ids=[similar_id]
       < 0.25 → new: plain write
+
+    L1 protection:
+      Any write to L1 (or importance=5) is stored with confirmed=0.
+      The memory is written but NOT returned in normal reads until confirmed.
+      Use memory_confirm_l1() to approve.
 
     anchor/treasure types always bypass similarity check (permanent, never skip).
     """
@@ -845,7 +857,40 @@ async def memory_write_smart(
         return {"action": "queued", "id": pending_id,
                 "similar_id": best_id, "ratio": best_ratio}
 
-    # Write the memory
+    # ── L2/L3 Rewrite: update existing memory in-place ──────────────────────
+    if best_ratio >= 0.55 and layer in ("L2", "L3") and best_id:
+        now = _now()
+        await _snapshot_version(db, best_id, changed_by="rewrite")
+        await db.execute(
+            """UPDATE memories
+               SET content=?, previous_content=?, status='updated',
+                   updated_at=?, version=COALESCE(version,0)+1
+               WHERE id=?""",
+            (content, best_content, now, best_id),
+        )
+        await db.commit()
+        cur = await db.execute("SELECT * FROM memories WHERE id=?", (best_id,))
+        row = await cur.fetchone()
+        mem = _row_to_dict(row)
+        mem.update({"action": "rewritten", "previous_content": best_content,
+                    "ratio": best_ratio})
+        return mem
+
+    # ── L1 protection: write with confirmed=0 ───────────────────────────────
+    if layer == "L1" or importance >= 5:
+        mem = await memory_write(agent_id, content, layer, type_, importance, tags, source, parent_id)
+        mem_id = mem["id"]
+        # Find existing confirmed L1 memory with similar content to link as predecessor
+        related = [best_id] if best_id and best_ratio >= 0.25 else []
+        await db.execute(
+            "UPDATE memories SET confirmed=0, status='pending_l1', related_ids=? WHERE id=?",
+            (json.dumps(related, ensure_ascii=False), mem_id),
+        )
+        await db.commit()
+        mem.update({"confirmed": 0, "status": "pending_l1", "related_ids": related})
+        return mem
+
+    # ── Write the memory (L2/L3 low-similarity, L4) ─────────────────────────
     mem = await memory_write(agent_id, content, layer, type_, importance, tags, source, parent_id)
     mem_id = mem["id"]
 
@@ -867,6 +912,40 @@ async def memory_write_smart(
         mem.update({"status": "new", "related_ids": [], "confirmed": 1})
 
     return mem
+
+
+async def memory_confirm_l1(memory_id: str) -> Optional[dict]:
+    """Confirm a pending L1 memory (set confirmed=1, status='new').
+
+    Returns the updated memory, or None if not found.
+    """
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM memories WHERE id=? AND confirmed=0", (memory_id,)
+    )
+    row = await cur.fetchone()
+    if not row:
+        return None
+    now = _now()
+    await db.execute(
+        "UPDATE memories SET confirmed=1, status='new', updated_at=? WHERE id=?",
+        (now, memory_id),
+    )
+    await db.commit()
+    cur = await db.execute("SELECT * FROM memories WHERE id=?", (memory_id,))
+    return _row_to_dict(await cur.fetchone())
+
+
+async def memory_list_pending_l1(agent_id: str) -> list[dict]:
+    """Return all unconfirmed L1 memories for an agent (confirmed=0)."""
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM memories WHERE agent_id=? AND confirmed=0 AND archived=0 "
+        "ORDER BY created_at DESC",
+        (agent_id,),
+    )
+    rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows]
 
 
 # ── Daily Life Generator ──────────────────────────────────────────────────────
@@ -1454,6 +1533,125 @@ async def project_list_completed_stale(agent_id: str, days: int = 14) -> list:
         (agent_id, f"-{days} days"),
     )
     return [dict(r) for r in await cur.fetchall()]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# L5 留底层 — conversation_summaries
+# 每次对话结束后自动生成摘要 + #关键词 标签，靠 FTS5 关键词搜索（不是向量语义搜索）
+# 保留 60 天，超期自动清理
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_L5_INIT = """
+CREATE TABLE IF NOT EXISTS conversation_summaries (
+    id          TEXT PRIMARY KEY,
+    agent_id    TEXT NOT NULL,
+    session_id  TEXT DEFAULT '',
+    summary     TEXT NOT NULL,
+    keywords    TEXT DEFAULT '',   -- space-separated #tags, e.g. "#读书 #哲学 #约伯记"
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_l5_agent ON conversation_summaries (agent_id, created_at DESC);
+CREATE VIRTUAL TABLE IF NOT EXISTS l5_fts USING fts5(
+    id UNINDEXED, agent_id UNINDEXED, summary, keywords,
+    tokenize='unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS l5_ai AFTER INSERT ON conversation_summaries BEGIN
+    INSERT INTO l5_fts(id, agent_id, summary, keywords)
+    VALUES (new.id, new.agent_id, new.summary, new.keywords);
+END;
+CREATE TRIGGER IF NOT EXISTS l5_ad AFTER DELETE ON conversation_summaries BEGIN
+    DELETE FROM l5_fts WHERE id = old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS l5_au AFTER UPDATE OF summary, keywords ON conversation_summaries BEGIN
+    DELETE FROM l5_fts WHERE id = old.id;
+    INSERT INTO l5_fts(id, agent_id, summary, keywords)
+    VALUES (new.id, new.agent_id, new.summary, new.keywords);
+END;
+"""
+
+
+async def _ensure_l5_table(db) -> None:
+    for stmt in _L5_INIT.strip().split(";"):
+        s = stmt.strip()
+        if s:
+            try:
+                await db.execute(s)
+            except Exception:
+                pass
+    await db.commit()
+
+
+async def l5_write(
+    agent_id: str,
+    summary: str,
+    keywords: str = "",
+    session_id: str = "",
+) -> dict:
+    """Write a conversation summary to L5.
+
+    keywords: space-separated #tags, e.g. "#读书 #哲学"
+    """
+    db = await get_db()
+    await _ensure_l5_table(db)
+    sid = str(uuid.uuid4())
+    now = _now()
+    await db.execute(
+        "INSERT INTO conversation_summaries (id, agent_id, session_id, summary, keywords, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (sid, agent_id, session_id, summary, keywords, now),
+    )
+    await db.commit()
+    return {"id": sid, "agent_id": agent_id, "session_id": session_id,
+            "summary": summary, "keywords": keywords, "created_at": now}
+
+
+async def l5_search(agent_id: str, query: str, limit: int = 10) -> list[dict]:
+    """FTS5 keyword search over L5 summaries for an agent."""
+    db = await get_db()
+    await _ensure_l5_table(db)
+    # Build FTS query: split on spaces, join with OR
+    terms = [t.lstrip("#") for t in query.split() if t]
+    if not terms:
+        return []
+    fts_query = " OR ".join(terms)
+    try:
+        cursor = await db.execute(
+            "SELECT s.* FROM conversation_summaries s "
+            "JOIN l5_fts f ON s.id = f.id "
+            "WHERE f.l5_fts MATCH ? AND f.agent_id = ? "
+            "ORDER BY rank LIMIT ?",
+            (fts_query, agent_id, limit),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+async def l5_list(agent_id: str, limit: int = 30) -> list[dict]:
+    """Return recent L5 summaries for an agent, newest first."""
+    db = await get_db()
+    await _ensure_l5_table(db)
+    cursor = await db.execute(
+        "SELECT * FROM conversation_summaries WHERE agent_id = ? "
+        "ORDER BY created_at DESC LIMIT ?",
+        (agent_id, limit),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def l5_cleanup(agent_id: str, days: int = 60) -> int:
+    """Delete L5 summaries older than `days`. Returns count deleted."""
+    db = await get_db()
+    await _ensure_l5_table(db)
+    cur = await db.execute(
+        "DELETE FROM conversation_summaries "
+        "WHERE agent_id = ? AND created_at < datetime('now', ?)",
+        (agent_id, f"-{days} days"),
+    )
+    await db.commit()
+    return cur.rowcount
+
 
 async def close_db():
     global _db

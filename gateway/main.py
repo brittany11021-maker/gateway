@@ -26,7 +26,7 @@ from mcp.server.fastmcp import FastMCP
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, FieldCondition, Filter, MatchValue,
-    PointStruct, PointVectors, Range, VectorParams, PayloadSchemaType,
+    PointStruct, VectorParams, PayloadSchemaType,
 )
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -67,12 +67,24 @@ from memory_db import dedup_resolve as _mem_dedup_resolve
 from memory_db import memory_mark_read as _mem_mark_read
 from memory_db import memory_cleanup as _mem_cleanup
 from memory_db import memory_write_smart as _mem_write_smart
+from memory_db import (
+    memory_confirm_l1 as _mem_confirm_l1,
+    memory_list_pending_l1 as _mem_pending_l1,
+)
 from memory_db import daily_write as _daily_write, daily_read as _daily_read
 from memory_db import daily_list as _daily_list, daily_delete as _daily_delete
 from memory_db import (
     project_upsert as _proj_upsert, project_list as _proj_list,
     project_complete as _proj_complete, project_archive as _proj_archive,
     project_list_completed_stale as _proj_stale,
+)
+from memory_db import (
+    l5_write as _l5_write, l5_search as _l5_search,
+    l5_list as _l5_list, l5_cleanup as _l5_cleanup,
+)
+from memory_db import (
+    l5_write as _l5_write, l5_search as _l5_search,
+    l5_list as _l5_list, l5_cleanup as _l5_cleanup,
 )
 
 
@@ -87,6 +99,7 @@ EMBED_DIM       = 1024
 PROVIDERS: dict[str, dict] = {}       # name → {api_key, base_url}
 _DEFAULT_CHAIN: list[str]  = []       # ordered list of provider names
 _EMBED_PNAME:   str        = ""       # which provider to use for embeddings
+_last_successful_llm_ts: dict      = {}  # {"ts": float} — updated on every successful LLM call
 
 
 async def _reload_providers() -> None:
@@ -134,6 +147,35 @@ def _agent_llm_config(
     return model, chain
 
 
+def _build_call_list(agent_cfg: dict) -> list[tuple[str, dict, str]]:
+    """Build ordered (provider_name, provider_dict, model) call list from llm_chain_config.
+    Falls back to simple api_chain + llm_model if llm_chain_config not set."""
+    chain_cfg = agent_cfg.get("llm_chain_config") or {}
+    slots = chain_cfg.get("slots") or []
+    result: list[tuple[str, dict, str]] = []
+    for slot in slots:
+        if not slot.get("enabled", True):
+            continue
+        pname = slot.get("provider", "")
+        if not pname or pname not in PROVIDERS:
+            continue
+        p = PROVIDERS[pname]
+        models = [m.strip() for m in (slot.get("models") or []) if str(m).strip()]
+        if not models:
+            models = [agent_cfg.get("llm_model", "") or ""]
+        for m in models:
+            result.append((pname, p, m))
+    if not result:
+        # Backward-compat: use flat api_chain + llm_model
+        db_model = agent_cfg.get("llm_model", "")
+        db_chain = agent_cfg.get("api_chain", "")
+        model, chain = _agent_llm_config("", db_model, db_chain)
+        for pname in chain:
+            if pname in PROVIDERS:
+                result.append((pname, PROVIDERS[pname], model))
+    return result
+
+
 def _log_fallback(agent_id: str, chain: list[str], idx: int, reason: str) -> None:
     print(f"[fallback] agent={agent_id} {chain[idx]}→{chain[idx+1]} reason={reason}", flush=True)
 
@@ -162,17 +204,18 @@ async def _call_llm_simple(prompt: str, agent_id: str = "default") -> str:
     raise RuntimeError("All providers failed")
 
 # Priority-ordered fallback models on NVIDIA NIM API (best per brand)
+# Last verified: 2026-04-28
 _CHEAP_LLM_MODELS = [
-    "google/gemma-3-27b-it",            # Gemma best
-    "deepseek-ai/deepseek-r1",          # DeepSeek best
-    "thudm/glm-4-32b-0414",             # GLM best (strong Chinese)
-    "moonshotai/kimi-k1.5",             # Kimi best
+    "deepseek-ai/deepseek-v4-pro",                  # DeepSeek V4 Pro ✅ (primary)
+    "moonshotai/kimi-k2.5",                         # Kimi K2.5 ✅ (backup)
+    "z-ai/glm-5.1",                                 # GLM-5.1 ✅ (backup)
+    "google/gemma-4-31b-it",                        # Gemma-4 31B ✅ (backup)
 ]
 
 async def _call_llm_cheap(prompt: str) -> str:
     """Call NVIDIA NIM LLM for background tasks (distillation, auto-extract).
 
-    Tries models in priority order: gemma-3-27b → deepseek-r1 → glm-4-32b → kimi-k1.5.
+    Tries models in priority order: deepseek-v4-pro → kimi-k2.5 → glm-5.1 → gemma-4-31b.
     DISTILL_MODEL env var inserts an override at position 0.
     Only uses the 'nvidia-llm' provider — never falls back to other providers.
     Raises RuntimeError if ALL models fail.
@@ -214,7 +257,6 @@ async def _call_llm_cheap(prompt: str) -> str:
 
 
 RECENT_DAYS     = 30
-COLLECTIONS     = ["memory_profile", "memory_project", "memory_recent"]
 BACKUP_DIR      = Path("/app/backups")
 MAX_BACKUPS     = 7
 BOOK_COLLECTION = "book_chunks"
@@ -2002,6 +2044,25 @@ async def read_book_page(book_id: str, page: int, agent_id: str = "default") -> 
                WHERE book_id=$1::uuid""",
             book_id, agent_id, json.dumps({"page": page, "last_read": today}),
         )
+        _book_meta = await conn.fetchrow(
+            "SELECT title, total_pages FROM books WHERE book_id=$1::uuid", book_id
+        )
+    # Write reading progress to Palimpsest L2 (upsert by book tag)
+    try:
+        _bt   = (_book_meta["title"] if _book_meta else None) or book_id
+        _tp   = (_book_meta["total_pages"] if _book_meta else None) or "?"
+        _prog = f"[阅读进度] 《{_bt}》已读至第 {page} 页（共 {_tp} 页，{today}）"
+        _tag  = f"book:{book_id}"
+        _existing = await _mem_list(agent_id=agent_id, layer="L2",
+                                    type_="reading_progress", limit=50)
+        _hit = next((m for m in _existing if _tag in (m.get("tags") or [])), None)
+        if _hit:
+            await _mem_update(_hit["id"], content=_prog, changed_by="read_book_page")
+        else:
+            await _mem_write(agent_id, _prog, layer="L2", type_="reading_progress",
+                             importance=2, tags=["book", _tag], source="read_book_page")
+    except Exception as _rpe:
+        print(f"[read_book_page] L2 write error: {_rpe}")
     return "[Page " + str(page) + "]\n" + content
 
 
@@ -2023,7 +2084,6 @@ async def search_book(
         vec = await _embed(query, input_type="query")
     except Exception as e:
         return "Embed error: " + str(e)
-    from qdrant_client.http.models import Filter, FieldCondition, MatchValue
     qfilter = None
     if book_id:
         qfilter = Filter(must=[FieldCondition(key="book_id", match=MatchValue(value=book_id))])
@@ -2125,12 +2185,64 @@ async def save_annotation(
         return "Error: selected_text is required."
     color = AGENT_COLORS.get(agent_id, "#6366f1")
     async with _db_pool.acquire() as conn:
+        _ann_title = await conn.fetchval(
+            "SELECT title FROM books WHERE book_id=$1::uuid", book_id
+        )
         ann_id = await conn.fetchval(
             "INSERT INTO annotations (book_id, agent_id, selected_text, comment, page, color) "
             "VALUES ($1::uuid, $2, $3, $4, $5, $6) RETURNING annotation_id",
             book_id, agent_id, selected_text.strip(), comment, page, color,
         )
+    # Write annotation to Palimpsest L3
+    try:
+        _bt2 = _ann_title or book_id
+        _ann_mem = f"[阅读摘注] 《{_bt2}》p.{page}: {selected_text.strip()[:200]}"
+        if comment:
+            _ann_mem += f" ——{comment}"
+        await _mem_write_smart(
+            agent_id=agent_id, content=_ann_mem,
+            layer="L3", type_="book_annotation", importance=3,
+            tags=["book", f"book:{book_id}"], source="save_annotation",
+        )
+    except Exception as _ape:
+        print(f"[save_annotation] L3 write error: {_ape}")
     return "Annotation saved: " + str(ann_id) + " (p." + str(page) + ")"
+
+
+@_mcp.tool()
+async def book_reflection(
+    book_id: str,
+    reflection: str,
+    agent_id: str = "default",
+) -> str:
+    """Record a reflection or insight about a book into long-term memory (L1).
+
+    Use after finishing a book or a significant chapter — for thoughts, feelings,
+    personal connections, or takeaways that are worth remembering long-term.
+
+    Args:
+        book_id:    UUID of the book.
+        reflection: The reflection or insight text.
+        agent_id:   Agent recording the reflection.
+    """
+    if not reflection.strip():
+        return "Error: reflection is required."
+    async with _db_pool.acquire() as conn:
+        _refl_title = await conn.fetchval(
+            "SELECT title FROM books WHERE book_id=$1::uuid", book_id
+        )
+    _bt = _refl_title or book_id
+    _content = f"[读后感] 《{_bt}》: {reflection.strip()}"
+    try:
+        result = await _mem_write_smart(
+            agent_id=agent_id, content=_content,
+            layer="L1", type_="book_reflection", importance=3,
+            tags=["book", f"book:{book_id}", "reflection"], source="book_reflection",
+        )
+        action = result.get("action", "written")
+        return f"Reflection saved to L1 ({action}): {_bt}"
+    except Exception as e:
+        return f"Error saving reflection: {e}"
 
 
 @_mcp.tool()
@@ -2341,6 +2453,21 @@ async def startup():
             "ALTER TABLE agent_settings ADD COLUMN IF NOT EXISTS system_prompt TEXT DEFAULT ''"
         )
         await conn.execute(
+            "ALTER TABLE agent_settings ADD COLUMN IF NOT EXISTS prompt_enabled BOOLEAN DEFAULT TRUE"
+        )
+        await conn.execute(
+            "ALTER TABLE agent_settings ADD COLUMN IF NOT EXISTS worldbook_enabled BOOLEAN DEFAULT TRUE"
+        )
+        await conn.execute(
+            "ALTER TABLE agent_settings ADD COLUMN IF NOT EXISTS prompt_inject_mode TEXT DEFAULT 'always'"
+        )
+        await conn.execute(
+            "ALTER TABLE agent_settings ADD COLUMN IF NOT EXISTS llm_chain_config JSONB DEFAULT '{}'"
+        )
+        await conn.execute(
+            "ALTER TABLE worldbook_entries ADD COLUMN IF NOT EXISTS embedding JSONB DEFAULT NULL"
+        )
+        await conn.execute(
             """CREATE TABLE IF NOT EXISTS user_profiles (
                 id         SERIAL PRIMARY KEY,
                 agent_id   TEXT NOT NULL DEFAULT '',
@@ -2407,29 +2534,9 @@ async def startup():
     asyncio.create_task(_nightly_character_loop())  # Nightly daily-life gen
     asyncio.create_task(_nightly_agent_loop())      # Nightly agent project maintenance
     asyncio.create_task(_register_telegram_webhook())  # Telegram bot webhook
+    asyncio.create_task(_heartbeat_loop())           # 24h LLM liveness watchdog
 
     _qdrant = QdrantClient(url=QDRANT_URL)
-    for col in COLLECTIONS:
-        # Auto-migrate if vector dim changed (e.g. local 384 → API 1024)
-        if _qdrant.collection_exists(col):
-            info = _qdrant.get_collection(col)
-            if info.config.params.vectors.size != EMBED_DIM:
-                print(f"[startup] dim mismatch in {col} "
-                      f"({info.config.params.vectors.size}→{EMBED_DIM}), recreating...")
-                _qdrant.delete_collection(col)
-        if not _qdrant.collection_exists(col):
-            _qdrant.create_collection(
-                collection_name=col,
-                vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
-            )
-        try:
-            _qdrant.create_payload_index(
-                collection_name=col,
-                field_name="agent_id",
-                field_schema=PayloadSchemaType.KEYWORD,
-            )
-        except Exception:
-            pass
 
     # book_chunks Qdrant collection
     if not _qdrant.collection_exists(BOOK_COLLECTION):
@@ -2446,6 +2553,40 @@ async def startup():
     # Start MCP Streamable HTTP session manager as a background task
     global _sh_task
     _sh_task = asyncio.create_task(_run_sh_session_manager())
+
+
+async def _heartbeat_loop() -> None:
+    """Background task: check gateway liveness every hour.
+    If no successful LLM response in >24h, send a Telegram alert.
+    Uses _last_successful_llm_ts to track last success timestamp."""
+    import time as _time
+    ALERT_AFTER = 24 * 3600   # 24 hours in seconds
+    CHECK_EVERY = 3600        # check every hour
+    alerted = False           # avoid spamming; re-arm after recovery
+
+    while True:
+        await asyncio.sleep(CHECK_EVERY)
+        try:
+            now = _time.time()
+            last = _last_successful_llm_ts.get("ts", now)  # default: now (startup)
+            elapsed = now - last
+            if elapsed > ALERT_AFTER and not alerted:
+                hours = int(elapsed // 3600)
+                msg = (
+                    f"⚠️ <b>Gateway 警报</b>\n"
+                    f"已 <b>{hours}h</b> 未收到成功的 LLM 响应。\n"
+                    f"请检查服务器状态：memory.513129.xyz"
+                )
+                await _telegram_send(msg, parse_mode="HTML")
+                print(f"[heartbeat] ALERT sent — no LLM response for {hours}h", flush=True)
+                alerted = True
+            elif elapsed <= ALERT_AFTER and alerted:
+                # Recovery — reset alert flag
+                alerted = False
+                await _telegram_send("✅ <b>Gateway 恢复</b> — LLM 响应正常", parse_mode="HTML")
+                print("[heartbeat] Recovery alert sent", flush=True)
+        except Exception as e:
+            print(f"[heartbeat] check error: {e}", flush=True)
 
 
 async def _run_sh_session_manager() -> None:
@@ -2494,6 +2635,8 @@ async def _embed(text: str, input_type: str = "query") -> list[float]:
     p = PROVIDERS.get(_EMBED_PNAME)
     if not p:
         raise RuntimeError(f"Embed provider '{_EMBED_PNAME}' not configured in env")
+    # Truncate to ~500 chars (nv-embedqa-e5-v5 limit ~512 tokens)
+    text = text[:500] if len(text) > 500 else text
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             f"{p['base_url']}/embeddings",
@@ -2507,58 +2650,6 @@ async def _embed(text: str, input_type: str = "query") -> list[float]:
         )
         resp.raise_for_status()
         return resp.json()["data"][0]["embedding"]
-
-
-# ── Memory helpers ─────────────────────────────────────────────────────────────
-def _trim_recent(agent_id: str, max_count: int = 100) -> None:
-    """Keep only the newest max_count entries in memory_recent for an agent."""
-    recs, _ = _qdrant.scroll(
-        "memory_recent",
-        scroll_filter=_agent_filter(agent_id),
-        limit=max_count + 300,
-        with_payload=["created_ts"],
-        with_vectors=False,
-    )
-    if len(recs) > max_count:
-        by_age = sorted(recs, key=lambda r: r.payload.get("created_ts", 0))
-        to_del = [r.id for r in by_age[:len(recs) - max_count]]
-        _qdrant.delete("memory_recent", points_selector=to_del)
-
-
-def _agent_filter(agent_id: str) -> Filter:
-    return Filter(must=[FieldCondition(key="agent_id", match=MatchValue(value=agent_id))])
-
-
-async def _store_memory(collection: str, text: str, agent_id: str, session_id: str) -> None:
-    vec = await _embed(text, input_type="passage")
-    _qdrant.upsert(
-        collection_name=collection,
-        points=[PointStruct(
-            id=str(uuid.uuid4()),
-            vector=vec,
-            payload={
-                "text":       text,
-                "agent_id":   agent_id,
-                "session_id": session_id,
-                "created_ts": time.time(),
-            },
-        )],
-    )
-
-
-async def _retrieve_memories(agent_id: str, query: str, k: int = 5) -> list[str]:
-    vec = await _embed(query, input_type="query")
-    results = []
-    for col in COLLECTIONS:
-        hits = _qdrant.search(
-            collection_name=col,
-            query_vector=vec,
-            query_filter=_agent_filter(agent_id),
-            limit=k,
-            score_threshold=0.3,
-        )
-        results.extend(h.payload.get("text", "") for h in hits)
-    return [m for m in results if m]
 
 
 async def _store_conversation(conv_id: str, agent_id: str, session_id: str, messages: list) -> None:
@@ -2664,31 +2755,22 @@ async def _distill_and_store(agent_id: str, session_id: str, messages: list,
             raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
         data = json.loads(raw)
 
-        # ── Write to Qdrant (backward compat: L1→profile, L2→project, L3+L4→recent) ──
-        qdrant_tasks = (
-            [_store_memory("memory_profile", t, agent_id, session_id) for t in data.get("L1", [])]
-          + [_store_memory("memory_project", t, agent_id, session_id) for t in data.get("L2", [])]
-          + [_store_memory("memory_recent",  t, agent_id, session_id) for t in data.get("L3", [])]
-          + [_store_memory("memory_recent",  t, agent_id, session_id) for t in data.get("L4", [])]
-        )
-        if qdrant_tasks:
-            await asyncio.gather(*qdrant_tasks, return_exceptions=True)
-
         # ── Write to Palimpsest L1-L4 (main memory per architecture design) ──
+        _track = data.get("track", "emotional")
         layer_importance = {"L1": 4, "L2": 3, "L3": 2, "L4": 1}
         for layer, imp in layer_importance.items():
             for text in data.get(layer, []):
                 try:
+                    mem_type = "project" if (layer == "L2" and _track in ("practical", "mixed")) else "diary"
                     await _mem_write_smart(
                         agent_id=agent_id, content=text,
-                        layer=layer, type_="diary", importance=imp,
+                        layer=layer, type_=mem_type, importance=imp,
                         tags=["distilled"], source="distill",
                     )
                 except Exception as _mwe:
                     print(f"[distill] palimpsest {layer} write error: {_mwe}")
 
         # ── Project sub-memory upsert (practical/mixed track) ──
-        _track = data.get("track", "emotional")
         _proj = data.get("project")
         if _track in ("practical", "mixed") and isinstance(_proj, dict) and _proj.get("name"):
             try:
@@ -2701,15 +2783,6 @@ async def _distill_and_store(agent_id: str, session_id: str, messages: list,
             except Exception as _pe:
                 print(f"[distill] project upsert error: {_pe}")
 
-        cutoff = time.time() - RECENT_DAYS * 86400
-        _qdrant.delete(
-            collection_name="memory_recent",
-            points_selector=Filter(must=[
-                FieldCondition(key="agent_id",   match=MatchValue(value=agent_id)),
-                FieldCondition(key="created_ts", range=Range(lt=cutoff)),
-            ]),
-        )
-        _trim_recent(agent_id, max_count=100)
     except Exception as e:
         print(f"[distill error] {type(e).__name__}: {e}")
         raise  # propagate so distill-history can count skipped
@@ -2722,11 +2795,6 @@ async def _collect_all_agents() -> set[str]:
             agents.add(r["agent_id"])
         for r in await conn.fetch("SELECT agent_id FROM agent_settings"):
             agents.add(r["agent_id"])
-    for col in COLLECTIONS:
-        recs, _ = _qdrant.scroll(col, limit=10000, with_payload=["agent_id"], with_vectors=False)
-        for r in recs:
-            if aid := r.payload.get("agent_id"):
-                agents.add(aid)
     return agents
 
 
@@ -2744,22 +2812,7 @@ async def _build_export_data() -> dict:
             settings = {k: (v.isoformat() if hasattr(v, "isoformat") else v)
                         for k, v in dict(row).items()}
 
-        memories: dict = {}
-        for col in COLLECTIONS:
-            tier = col.replace("memory_", "")
-            recs, _ = _qdrant.scroll(
-                col, scroll_filter=_agent_filter(aid),
-                limit=10000, with_payload=True, with_vectors=False,
-            )
-            memories[tier] = [
-                {
-                    "id":         str(r.id),
-                    "content":    r.payload.get("text", ""),
-                    "created_at": r.payload.get("created_ts", 0),
-                    "session_id": r.payload.get("session_id", ""),
-                }
-                for r in recs
-            ]
+        memories: dict = {}  # Qdrant memory collections removed; Palimpsest is the memory store
 
         async with _db_pool.acquire() as conn:
             rows = await conn.fetch(
@@ -3067,6 +3120,7 @@ async def _get_agent_config(agent_id: str) -> dict:
         "agent_type": "agent", "mcp_enabled": True,
         "auto_memory": False, "mcp_proxy_config": {},
         "llm_model": "", "api_chain": "",
+        "prompt_enabled": True, "worldbook_enabled": True, "prompt_inject_mode": "always",
     }
     try:
         async with _db_pool.acquire() as conn:
@@ -3083,7 +3137,15 @@ async def _get_agent_config(agent_id: str) -> dict:
                 ),
                 "llm_model":        row.get("llm_model") or "",
                 "api_chain":        row.get("api_chain") or "",
+                "llm_chain_config": (
+                    row.get("llm_chain_config")
+                    if isinstance(row.get("llm_chain_config"), dict)
+                    else json.loads(row.get("llm_chain_config") or "{}")
+                ),
                 "system_prompt":    row.get("system_prompt") or "",
+                "prompt_enabled":   row.get("prompt_enabled") if row.get("prompt_enabled") is not None else True,
+                "worldbook_enabled": row.get("worldbook_enabled") if row.get("worldbook_enabled") is not None else True,
+                "prompt_inject_mode": row.get("prompt_inject_mode") or "always",
             }
     except Exception:
         pass
@@ -3323,6 +3385,88 @@ async def _auto_extract_character_memory(agent_id: str, messages: list) -> None:
         print(f"[auto_extract] {agent_id}: {e}")
 
 
+async def _generate_l5_summary(agent_id: str, session_id: str, messages: list) -> None:
+    """Generate a conversation summary and write it to L5 留底层.
+
+    Uses cheap LLM to produce a 2-3 sentence summary + #关键词 tags.
+    Skips if the conversation has fewer than 2 user turns.
+    """
+    user_turns = [m for m in messages if m.get("role") == "user"
+                  and isinstance(m.get("content"), str)]
+    if len(user_turns) < 2:
+        return
+
+    history = "\n".join(
+        f"{m['role'].upper()}: {m['content']}"
+        for m in messages
+        if isinstance(m.get("content"), str) and m["role"] in ("user", "assistant")
+    )
+    if not history.strip():
+        return
+
+    prompt = (
+        "你是对话摘要助手。请用2-3句话总结以下对话的核心内容，然后列出3-6个关键词标签。\n\n"
+        "输出格式（只输出这两行，不要其他内容）：\n"
+        "摘要：<2-3句话的摘要>\n"
+        "关键词：#标签1 #标签2 #标签3\n\n"
+        f"对话：\n{history[:3000]}"
+    )
+    try:
+        raw = await _call_llm_cheap(prompt)
+        summary = ""
+        keywords = ""
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.startswith("摘要：") or line.startswith("摘要:"):
+                summary = line.split("：", 1)[-1].split(":", 1)[-1].strip()
+            elif line.startswith("关键词：") or line.startswith("关键词:"):
+                keywords = line.split("：", 1)[-1].split(":", 1)[-1].strip()
+        if not summary:
+            # Fallback: use the whole response as summary
+            summary = raw[:300]
+        await _l5_write(agent_id=agent_id, summary=summary,
+                        keywords=keywords, session_id=session_id)
+        print(f"[l5] {agent_id} summary written ({len(summary)}c, kw={keywords!r})")
+    except Exception as e:
+        print(f"[l5] summary generation failed for {agent_id}: {e}")
+
+
+async def _generate_l5_summary(agent_id: str, session_id: str, messages: list) -> None:
+    """Generate a short summary + #keywords for L5 留底层 after each conversation."""
+    history = "\n".join(
+        f"{m['role'].upper()}: {m['content']}"
+        for m in messages
+        if isinstance(m.get("content"), str) and m["role"] in ("user", "assistant")
+    )
+    if not history.strip():
+        return
+    prompt = (
+        "请用2-4句话总结以下对话的核心内容，然后给出3-8个#关键词（中文，用空格分隔）。\n"
+        "格式：\n"
+        "摘要：<2-4句话>\n"
+        "关键词：#词1 #词2 #词3\n\n"
+        f"对话：\n{history[-3000:]}"
+    )
+    try:
+        raw = await _call_llm_cheap(prompt)
+        summary = ""
+        keywords = ""
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.startswith("摘要：") or line.startswith("摘要:"):
+                summary = line.split("：", 1)[-1].split(":", 1)[-1].strip()
+            elif line.startswith("关键词：") or line.startswith("关键词:"):
+                keywords = line.split("：", 1)[-1].split(":", 1)[-1].strip()
+        if not summary:
+            # fallback: use first non-empty line as summary
+            summary = next((l.strip() for l in raw.splitlines() if l.strip()), raw[:200])
+        await _l5_write(agent_id=agent_id, summary=summary,
+                        keywords=keywords, session_id=session_id)
+        print(f"[l5] {agent_id} summary written ({len(summary)}c, kw={keywords!r})", flush=True)
+    except Exception as e:
+        print(f"[l5] summary generation failed for {agent_id}: {e}", flush=True)
+
+
 async def _post_conversation_tasks(
     agent_id: str, session_id: str, full: list,
     cid: str, agent_type: str, auto_memory: bool,
@@ -3333,9 +3477,11 @@ async def _post_conversation_tasks(
         if auto_memory:
             await _auto_extract_character_memory(agent_id, full)
         # Character agents use daily_events as their memory store; skip Qdrant distillation
-        return
-    # Agent type: distill into Qdrant profile/project/recent
-    await _distill_and_store(agent_id, session_id, full, agent_type=agent_type)
+    else:
+        # Agent type: distill into Qdrant profile/project/recent
+        await _distill_and_store(agent_id, session_id, full, agent_type=agent_type)
+    # L5 留底层：所有 agent 类型都生成对话摘要
+    await _generate_l5_summary(agent_id, session_id, full)
 
 
 def _strip_injection(messages: list) -> list:
@@ -3435,10 +3581,25 @@ async def _resolve_worldbook(agent_id: str, messages: list) -> list[dict]:
                     except Exception:
                         pass
             elif mode == "vector":
-                seed = " ".join(row["keywords"] or []) or row["name"] or ""
-                if seed:
+                stored = row.get("embedding")
+                if stored and isinstance(stored, list):
+                    seed_emb = stored
+                elif stored:
                     try:
-                        seed_emb = await _embed(seed)
+                        seed_emb = json.loads(stored) if isinstance(stored, str) else list(stored)
+                    except Exception:
+                        seed_emb = None
+                else:
+                    # Fallback: compute on-the-fly when no pre-computed embedding exists
+                    seed = " ".join(row["keywords"] or []) or row["name"] or ""
+                    seed_emb = None
+                    if seed:
+                        try:
+                            seed_emb = await _embed(seed)
+                        except Exception:
+                            pass
+                if seed_emb:
+                    try:
                         last_emb = await _get_last_embed()
                         if last_emb:
                             matched = _cosine(seed_emb, last_emb) >= 0.60
@@ -3518,9 +3679,12 @@ async def chat_completions(request: Request, body: dict, cred: HTTPAuthorization
 
     # System prompt: inject agent/character base persona before anything else
     _sys_prompt = _agent_cfg.get("system_prompt", "").strip()
-    if _sys_prompt:
-        # If a system message already exists, prepend to it; otherwise insert at index 0
-        if messages and messages[0].get("role") == "system":
+    _inject_mode = _agent_cfg.get("prompt_inject_mode", "always")
+    if _sys_prompt and _agent_cfg.get("prompt_enabled", True):
+        _has_system = bool(messages and messages[0].get("role") == "system")
+        if _inject_mode == "skip_if_system_present" and _has_system:
+            pass  # client (e.g. SillyTavern) already handles system prompt injection
+        elif _has_system:
             messages[0] = {**messages[0], "content": _sys_prompt + "\n\n" + messages[0]["content"]}
         else:
             messages = [{"role": "system", "content": _sys_prompt}] + messages
@@ -3551,9 +3715,10 @@ async def chat_completions(request: Request, body: dict, cred: HTTPAuthorization
         print(f"[user_profile] error: {_upe}")
 
     # Worldbook: inject lore/persona entries for any agent type
-    _wb_entries = await _resolve_worldbook(agent_id, messages)
-    if _wb_entries:
-        messages = _apply_worldbook(messages, _wb_entries)
+    if _agent_cfg.get("worldbook_enabled", True):
+        _wb_entries = await _resolve_worldbook(agent_id, messages)
+        if _wb_entries:
+            messages = _apply_worldbook(messages, _wb_entries)
 
     if _agent_type == "character":
         # Cooldown check: if character has a cooldown window, return brief busy message
@@ -3635,45 +3800,31 @@ async def chat_completions(request: Request, body: dict, cred: HTTPAuthorization
                 messages[0] = {**messages[0], "content": _mem_ctx + "\n\n" + messages[0]["content"]}
             else:
                 messages = [{"role": "system", "content": _mem_ctx}] + messages
-        else:
-            # Fallback: Qdrant semantic search (agents with no L1-L4 data yet)
-            _last_user = next(
-                (m["content"] for m in reversed(messages)
-                 if m.get("role") == "user" and isinstance(m.get("content"), str)), "",
-            )
-            if _last_user:
-                mems = await _retrieve_memories(agent_id, _last_user)
-                if mems:
-                    mem_text = "[Relevant memories about the user]\n" + "\n".join(f"- {m}" for m in mems)
-                    if messages and messages[0]["role"] == "system":
-                        messages[0] = {**messages[0], "content": mem_text + "\n\n" + messages[0]["content"]}
-                    else:
-                        messages = [{"role": "system", "content": mem_text}] + messages
-
-    # Resolve model + provider chain (DB overrides env)
-    db_model = _agent_cfg["llm_model"]
-    db_chain = _agent_cfg["api_chain"]
-    model, chain = _agent_llm_config(agent_id, db_model, db_chain)
+    # Build ordered (provider, model) call list from llm_chain_config or fallback
+    call_list = _build_call_list(_agent_cfg)
+    # Explicit model in request body overrides everything
+    req_model = body.get("model", "")
 
     payload = {k: v for k, v in body.items() if k not in ("agent_id", "session_id")}
     payload["messages"] = messages
-    if not body.get("model"):           # explicit model in request takes priority
-        payload["model"] = model
 
     if stream:
         async def event_stream() -> AsyncGenerator[bytes, None]:
             collected: list[str] = []
-            for i, pname in enumerate(chain):
-                p = PROVIDERS[pname]
+            used_pname = ""
+            used_model = ""
+            for i, (pname, p, slot_model) in enumerate(call_list):
+                cur_model = req_model or slot_model
+                slot_payload = {**payload, "model": cur_model} if cur_model else payload
                 hdrs = {"Authorization": f"Bearer {p['api_key']}", "Content-Type": "application/json"}
                 try:
-                    async with httpx.AsyncClient(timeout=300) as client:
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=8.0, read=60.0, write=10.0, pool=5.0)) as client:
                         async with client.stream(
                             "POST", f"{p['base_url']}/chat/completions",
-                            headers=hdrs, json=payload,
+                            headers=hdrs, json=slot_payload,
                         ) as resp:
-                            if resp.status_code in (404, 429, 500, 502, 503) and i < len(chain) - 1:
-                                _log_fallback(agent_id, chain, i, str(resp.status_code))
+                            if resp.status_code in (404, 429, 500, 502, 503) and i < len(call_list) - 1:
+                                print(f"[fallback] agent={agent_id} {pname}/{cur_model}→next reason={resp.status_code}", flush=True)
                                 continue
                             async for line in resp.aiter_lines():
                                 if line:
@@ -3685,14 +3836,21 @@ async def chat_completions(request: Request, body: dict, cred: HTTPAuthorization
                                                 collected.append(d["content"])
                                         except Exception:
                                             pass
-                    break  # success — stop trying providers
-                except (httpx.TimeoutException, httpx.ConnectError) as e:
-                    if i < len(chain) - 1:
-                        _log_fallback(agent_id, chain, i, type(e).__name__)
+                    used_pname = pname
+                    used_model = cur_model
+                    break  # success — stop trying
+                except (httpx.TimeoutException, httpx.ConnectError,
+                        httpx.RemoteProtocolError, httpx.ReadError) as e:
+                    if not collected and i < len(call_list) - 1:
+                        print(f"[fallback] agent={agent_id} {pname}/{cur_model}→next reason={type(e).__name__}", flush=True)
                         continue
-                    raise
+                    print(f"[stream] {pname} dropped mid-stream ({type(e).__name__}): {e}", flush=True)
+                    yield b"data: [DONE]\n\n"
+                    break
             if collected:
-                full = _strip_injection(messages) + [{"role": "assistant", "content": "".join(collected)}]
+                import time as _hb_time
+                _last_successful_llm_ts["ts"] = _hb_time.time()
+                full = _strip_injection(messages) + [{"role": "assistant", "content": "".join(collected), "_provider": used_pname, "_model": used_model}]
                 cid  = str(uuid.uuid4())
                 asyncio.create_task(_post_conversation_tasks(
                     agent_id, session_id, full, cid, _agent_type, _auto_memory))
@@ -3701,20 +3859,21 @@ async def chat_completions(request: Request, body: dict, cred: HTTPAuthorization
 
     # Non-streaming with fallback
     data: dict = {}
-    for i, pname in enumerate(chain):
-        p = PROVIDERS[pname]
+    used_pname = ""
+    used_model = ""
+    for i, (pname, p, slot_model) in enumerate(call_list):
+        cur_model = req_model or slot_model
+        slot_payload = {**payload, "model": cur_model} if cur_model else payload
         hdrs = {"Authorization": f"Bearer {p['api_key']}", "Content-Type": "application/json"}
         try:
-            async with httpx.AsyncClient(timeout=300) as client:
-                resp = await client.post(f"{p['base_url']}/chat/completions", headers=hdrs, json=payload)
-            if resp.status_code in (404, 429, 500, 502, 503) and i < len(chain) - 1:
-                _log_fallback(agent_id, chain, i, str(resp.status_code))
+            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=8.0, read=90.0, write=10.0, pool=5.0)) as client:
+                resp = await client.post(f"{p['base_url']}/chat/completions", headers=hdrs, json=slot_payload)
+            if resp.status_code in (404, 429, 500, 502, 503) and i < len(call_list) - 1:
+                print(f"[fallback] agent={agent_id} {pname}/{cur_model}→next reason={resp.status_code}", flush=True)
                 continue
             try:
                 data = resp.json()
             except Exception:
-                # Some providers return NDJSON or SSE even for non-streaming —
-                # extract the first complete JSON object from the body.
                 text = resp.text.strip()
                 if text.startswith("data:"):
                     text = text[5:].strip()
@@ -3724,10 +3883,12 @@ async def chat_completions(request: Request, body: dict, cred: HTTPAuthorization
                     print(f"[chat] unparseable response from {pname} "
                           f"(status={resp.status_code}): {resp.text[:300]}", flush=True)
                     raise HTTPException(502, f"Invalid response from {pname}: {je}")
+            used_pname = pname
+            used_model = cur_model
             break
         except (httpx.TimeoutException, httpx.ConnectError) as e:
-            if i < len(chain) - 1:
-                _log_fallback(agent_id, chain, i, type(e).__name__)
+            if i < len(call_list) - 1:
+                print(f"[fallback] agent={agent_id} {pname}/{cur_model}→next reason={type(e).__name__}", flush=True)
                 continue
             raise
     else:
@@ -3735,7 +3896,9 @@ async def chat_completions(request: Request, body: dict, cred: HTTPAuthorization
 
     try:
         reply = data["choices"][0]["message"]["content"]
-        full  = _strip_injection(messages) + [{"role": "assistant", "content": reply}]
+        import time as _hb_time2
+        _last_successful_llm_ts["ts"] = _hb_time2.time()
+        full  = _strip_injection(messages) + [{"role": "assistant", "content": reply, "_provider": used_pname, "_model": used_model}]
         cid   = str(uuid.uuid4())
         asyncio.create_task(_post_conversation_tasks(
             agent_id, session_id, full, cid, _agent_type, _auto_memory))
@@ -3756,6 +3919,9 @@ async def list_providers(_=Depends(_require_key)):
         "providers":     [{"name": r["name"], "base_url": r["base_url"], "is_embed": r["is_embed"]} for r in rows],
         "default_chain": chain_row["value"] if chain_row else ",".join(_DEFAULT_CHAIN),
         "embed_provider": _EMBED_PNAME,
+        "distill_model":    os.getenv("DISTILL_MODEL", ""),
+        "distill_providers": [p["name"] for p in [{"name": r["name"]} for r in rows] if False],  # 用 _CHEAP_LLM_MODELS 替代
+
     }
 
 
@@ -3843,8 +4009,6 @@ async def admin_agents(_=Depends(_require_key)):
 @app.get("/admin/api/stats")
 async def admin_stats(agent_id: str = "default", _=Depends(_require_key)):
     counts: dict = {}
-    for col in COLLECTIONS:
-        counts[col] = _qdrant.count(col, count_filter=_agent_filter(agent_id)).count
     async with _db_pool.acquire() as conn:
         counts["conversations"] = await conn.fetchval(
             "SELECT COUNT(*) FROM conversations WHERE agent_id=$1", agent_id)
@@ -3852,7 +4016,7 @@ async def admin_stats(agent_id: str = "default", _=Depends(_require_key)):
 
 
 # ── Admin: list/search memories ────────────────────────────────────────────────
-@app.post("/admin/api/memories/classify")
+@app.post("/api/admin/memories/classify")
 async def classify_memory_tier(body: dict, _=Depends(_require_key)):
     """Use LLM to suggest the best memory tier for a given text.
     Returns: { tier: 'l1'|'l2'|'l3', collection: str, label: str, reason: str }
@@ -3914,9 +4078,9 @@ async def classify_memory_tier(body: dict, _=Depends(_require_key)):
         tier = parsed.get("tier", "l3")
         reason = parsed.get("reason", "")
         tier_map = {
-            "l1": ("memory_profile", "L1 — Profile (永久·角色关系)"),
-            "l2": ("memory_project", "L2 — Project (中期·项目知识)"),
-            "l3": ("memory_recent",  "L3 — Recent (近期·30天)"),
+            "l1": ("L1", "L1 — Profile（永久·角色/关系）"),
+            "l2": ("L2", "L2 — Events（中期·事件/知识）"),
+            "l3": ("L3", "L3 — Recent（近期·~30天）"),
         }
         col, label = tier_map.get(tier, tier_map["l3"])
         return {"tier": tier, "collection": col, "label": label, "reason": reason}
@@ -3925,62 +4089,17 @@ async def classify_memory_tier(body: dict, _=Depends(_require_key)):
         # Fallback: simple heuristic
         low = text.lower()
         if any(w in low for w in ["名字", "身份", "性格", "一直", "永远", "关系", "出生", "职业"]):
-            tier, col, label = "l1", "memory_profile", "L1 — Profile (永久·角色关系)"
+            tier, col, label = "l1", "L1", "L1 — Profile（永久·角色/关系）"
         elif any(w in low for w in ["项目", "计划", "工作", "学习", "进度", "版本"]):
-            tier, col, label = "l2", "memory_project", "L2 — Project (中期·项目知识)"
+            tier, col, label = "l2", "L2", "L2 — Events（中期·事件/知识）"
         else:
-            tier, col, label = "l3", "memory_recent", "L3 — Recent (近期·30天)"
+            tier, col, label = "l3", "L3", "L3 — Recent（近期·~30天）"
         return {"tier": tier, "collection": col, "label": label,
                 "reason": f"启发式分类（LLM不可用: {e}）"}
 
 
-@app.get("/admin/api/memories")
-async def admin_list(collection: str = "memory_profile", agent_id: str = "default",
-                     q: str = "", limit: int = 100, _=Depends(_require_key)):
-    if collection not in COLLECTIONS:
-        raise HTTPException(400, "Invalid collection")
-    if q:
-        hits = _qdrant.search(collection, query_vector=await _embed(q),
-                              query_filter=_agent_filter(agent_id), limit=limit)
-        items = [{"id": str(h.id), "score": round(h.score, 3), **h.payload} for h in hits]
-    else:
-        recs, _ = _qdrant.scroll(collection, scroll_filter=_agent_filter(agent_id),
-                                 limit=limit, with_payload=True, with_vectors=False)
-        items = [{"id": str(r.id), **r.payload} for r in recs]
-    return {"items": items}
-
-
-# ── Admin: add memory ──────────────────────────────────────────────────────────
-@app.post("/admin/api/memories")
-async def admin_add(body: dict, _=Depends(_require_key)):
-    col  = body.get("collection", "memory_profile")
-    text = body.get("text", "").strip()
-    aid  = body.get("agent_id", "default")
-    if col not in COLLECTIONS or not text:
-        raise HTTPException(400, "Invalid params")
-    await _store_memory(col, text, aid, "manual")
-    return {"ok": True}
-
-
-# ── Admin: update memory ───────────────────────────────────────────────────────
-@app.put("/admin/api/memories/{point_id}")
-async def admin_update(point_id: str, body: dict, _=Depends(_require_key)):
-    col  = body.get("collection", "memory_profile")
-    text = body.get("text", "").strip()
-    if col not in COLLECTIONS or not text:
-        raise HTTPException(400, "Invalid params")
-    _qdrant.set_payload(col, payload={"text": text}, points=[point_id])
-    _qdrant.update_vectors(col, points=[PointVectors(id=point_id, vector=await _embed(text, "passage"))])
-    return {"ok": True}
-
-
-# ── Admin: delete memory ───────────────────────────────────────────────────────
-@app.delete("/admin/api/memories/{point_id}")
-async def admin_delete(point_id: str, collection: str = "memory_profile", _=Depends(_require_key)):
-    if collection not in COLLECTIONS:
-        raise HTTPException(400, "Invalid collection")
-    _qdrant.delete(collection, points_selector=[point_id])
-    return {"ok": True}
+# Qdrant admin CRUD endpoints removed — Palimpsest is now the primary memory system.
+# Use /api/admin/memories/* for all memory management.
 
 
 
@@ -4219,6 +4338,52 @@ async def pal_rollback(memory_id: str, body: dict, _=Depends(_require_key)):
     return _pal_row(mem)
 
 
+# ── L1 pending confirmation ──────────────────────────────────────────────────
+
+@app.get("/api/admin/memories/pending-l1")
+async def pal_pending_l1(agent_id: str, _=Depends(_require_key)):
+    """List all unconfirmed L1 memories (confirmed=0) for an agent."""
+    rows = await _mem_pending_l1(agent_id)
+    return {"items": [_pal_row(r) for r in rows], "total": len(rows)}
+
+
+@app.post("/api/admin/memories/{memory_id}/confirm-l1")
+async def pal_confirm_l1(memory_id: str, _=Depends(_require_key)):
+    """Confirm a pending L1 memory (set confirmed=1)."""
+    mem = await _mem_confirm_l1(memory_id)
+    if not mem:
+        raise HTTPException(404, "Memory not found or already confirmed")
+    return _pal_row(mem)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Admin: L5 留底层 — conversation summaries
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/admin/l5")
+async def l5_list_api(agent_id: str, limit: int = 30, _=Depends(_require_key)):
+    """List recent L5 conversation summaries for an agent."""
+    rows = await _l5_list(agent_id=agent_id, limit=limit)
+    return {"items": rows, "total": len(rows)}
+
+
+@app.get("/api/admin/l5/search")
+async def l5_search_api(agent_id: str, q: str, limit: int = 10, _=Depends(_require_key)):
+    """FTS5 keyword search over L5 summaries."""
+    rows = await _l5_search(agent_id=agent_id, query=q, limit=limit)
+    return {"items": rows, "total": len(rows)}
+
+
+@app.delete("/api/admin/l5/{summary_id}")
+async def l5_delete_api(summary_id: str, _=Depends(_require_key)):
+    """Hard-delete a single L5 summary."""
+    from memory_db import l5_delete as _l5_del
+    ok = await _l5_del(summary_id)
+    if not ok:
+        raise HTTPException(404, "Summary not found")
+    return {"ok": True}
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Admin: Worldbook — Books
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4297,6 +4462,7 @@ def _entry_dict(row) -> dict:
         except Exception: d["keywords"] = []
     elif kws is None:
         d["keywords"] = []
+    d.pop("embedding", None)  # internal vector, not returned in API responses
     return d
 
 
@@ -4323,18 +4489,35 @@ async def wb_list_entries(
     return {"entries": [_entry_dict(r) for r in rows], "count": len(rows)}
 
 
+async def _wb_entry_embedding(trigger_mode: str, keywords: list, name: str):
+    """Pre-compute embedding for a worldbook entry's trigger seed (vector mode only)."""
+    if trigger_mode != "vector":
+        return None
+    seed = " ".join(k for k in (keywords or []) if k) or name or ""
+    if not seed:
+        return None
+    try:
+        return await _embed(seed)
+    except Exception as _e:
+        print(f"[worldbook] embedding error: {_e}")
+        return None
+
+
 @app.post("/admin/api/worldbook/entries")
 async def wb_create_entry(body: dict, _=Depends(_require_key)):
     kws = body.get("keywords", [])
     if not isinstance(kws, list): kws = []
+    _trigger_mode = body.get("trigger_mode", "keyword")
+    _emb = await _wb_entry_embedding(_trigger_mode, kws, body.get("name", ""))
+    _emb_json = json.dumps(_emb) if _emb else None
     async with _db_pool.acquire() as conn:
         row = await conn.fetchrow("""
             INSERT INTO worldbook_entries
               (book_id, agent_id, name, enabled, content, constant,
                trigger_mode, keywords, regex, scan_depth,
-               position, role, priority)
+               position, role, priority, embedding)
             VALUES
-              ($1::uuid, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13)
+              ($1::uuid, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13, $14::jsonb)
             RETURNING *
         """,
             body.get("book_id") or None,
@@ -4343,13 +4526,14 @@ async def wb_create_entry(body: dict, _=Depends(_require_key)):
             bool(body.get("enabled",True)),
             body.get("content",""),
             bool(body.get("constant",True)),
-            body.get("trigger_mode","keyword"),
+            _trigger_mode,
             json.dumps(kws),
             body.get("regex",""),
             int(body.get("scan_depth",3)),
             body.get("position","after_system"),
             body.get("role","system"),
             int(body.get("priority",10)),
+            _emb_json,
         )
     return _entry_dict(row)
 
@@ -4358,12 +4542,16 @@ async def wb_create_entry(body: dict, _=Depends(_require_key)):
 async def wb_update_entry(entry_id: str, body: dict, _=Depends(_require_key)):
     kws = body.get("keywords", [])
     if not isinstance(kws, list): kws = []
+    _trigger_mode = body.get("trigger_mode", "keyword")
+    _emb = await _wb_entry_embedding(_trigger_mode, kws, body.get("name", ""))
+    _emb_json = json.dumps(_emb) if _emb else None
     async with _db_pool.acquire() as conn:
         row = await conn.fetchrow("""
             UPDATE worldbook_entries SET
               name=$2, enabled=$3, content=$4, constant=$5,
               trigger_mode=$6, keywords=$7::jsonb, regex=$8, scan_depth=$9,
-              position=$10, role=$11, priority=$12, agent_id=$13
+              position=$10, role=$11, priority=$12, agent_id=$13,
+              embedding=$14::jsonb
             WHERE id=$1::uuid RETURNING *
         """,
             entry_id,
@@ -4371,7 +4559,7 @@ async def wb_update_entry(entry_id: str, body: dict, _=Depends(_require_key)):
             bool(body.get("enabled",True)),
             body.get("content",""),
             bool(body.get("constant",True)),
-            body.get("trigger_mode","keyword"),
+            _trigger_mode,
             json.dumps(kws),
             body.get("regex",""),
             int(body.get("scan_depth",3)),
@@ -4379,6 +4567,7 @@ async def wb_update_entry(entry_id: str, body: dict, _=Depends(_require_key)):
             body.get("role","system"),
             int(body.get("priority",10)),
             body.get("agent_id",""),
+            _emb_json,
         )
     if not row: raise HTTPException(404, "Entry not found")
     return _entry_dict(row)
@@ -4576,8 +4765,6 @@ async def admin_delete_npc(agent_id: str, name: str, _=Depends(_require_key)):
 @app.get("/admin/api/stats/global")
 async def admin_global_stats(_=Depends(_require_key)):
     counts: dict = {}
-    for col in COLLECTIONS:
-        counts[col] = _qdrant.count(col).count
     async with _db_pool.acquire() as conn:
         counts["conversations"] = await conn.fetchval("SELECT COUNT(*) FROM conversations")
         counts["books"] = await conn.fetchval("SELECT COUNT(*) FROM books")
@@ -4599,7 +4786,7 @@ async def get_agent_settings(agent_id: str, _=Depends(_require_key)):
     if not row:
         return {"agent_id": agent_id, "llm_model": "", "api_chain": "", "notes": "", "avatar": "",
                 "agent_type": "agent", "mcp_enabled": True, "auto_memory": False,
-                "mcp_proxy_config": {}, "system_prompt": ""}
+                "mcp_proxy_config": {}, "system_prompt": "", "llm_chain_config": {}}
     d = dict(row)
     cfg = d.get("mcp_proxy_config")
     if isinstance(cfg, dict):
@@ -4611,6 +4798,13 @@ async def get_agent_settings(agent_id: str, _=Depends(_require_key)):
             d["mcp_proxy_config"] = {}
     else:
         d["mcp_proxy_config"] = {}
+    # Decode llm_chain_config
+    lcc = d.get("llm_chain_config")
+    if not isinstance(lcc, dict):
+        try:
+            d["llm_chain_config"] = json.loads(lcc or "{}")
+        except Exception:
+            d["llm_chain_config"] = {}
     return d
 
 
@@ -4619,16 +4813,22 @@ async def save_agent_settings(agent_id: str, body: dict, _=Depends(_require_key)
     _proxy_cfg = body.get("mcp_proxy_config") or {}
     if not isinstance(_proxy_cfg, str):
         _proxy_cfg = json.dumps(_proxy_cfg)
+    _chain_cfg = body.get("llm_chain_config") or {}
+    if not isinstance(_chain_cfg, str):
+        _chain_cfg = json.dumps(_chain_cfg)
     async with _db_pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO agent_settings
                 (agent_id, llm_model, api_chain, notes, avatar,
-                 agent_type, mcp_enabled, auto_memory, mcp_proxy_config, system_prompt, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,now())
+                 agent_type, mcp_enabled, auto_memory, mcp_proxy_config, system_prompt,
+                 prompt_enabled, worldbook_enabled, llm_chain_config, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13::jsonb,now())
             ON CONFLICT (agent_id) DO UPDATE SET
                 llm_model=$2, api_chain=$3, notes=$4, avatar=$5,
                 agent_type=$6, mcp_enabled=$7, auto_memory=$8,
-                mcp_proxy_config=$9::jsonb, system_prompt=$10, updated_at=now()
+                mcp_proxy_config=$9::jsonb, system_prompt=$10,
+                prompt_enabled=$11, worldbook_enabled=$12,
+                llm_chain_config=$13::jsonb, updated_at=now()
         """, agent_id,
              body.get("llm_model", ""),
              body.get("api_chain", ""),
@@ -4638,7 +4838,10 @@ async def save_agent_settings(agent_id: str, body: dict, _=Depends(_require_key)
              body.get("mcp_enabled", True),
              body.get("auto_memory", False),
              _proxy_cfg,
-             body.get("system_prompt", ""))
+             body.get("system_prompt", ""),
+             body.get("prompt_enabled", True),
+             body.get("worldbook_enabled", True),
+             _chain_cfg)
     return {"ok": True}
 
 
@@ -4650,10 +4853,10 @@ async def delete_agent_settings(agent_id: str, _=Depends(_require_key)):
 
 
 # ── Admin: conversations ───────────────────────────────────────────────────────
-@app.post("/admin/api/agents/{agent_id}/distill-history")
+@app.post("/api/admin/agents/{agent_id}/distill-history")
 async def distill_agent_history(agent_id: str, _=Depends(_require_key)):
     """Re-run LLM distillation on all stored conversations for an agent.
-    agent-type  → profile/project/recent Qdrant memories.
+    agent-type  → Palimpsest L1-L4 memories.
     character   → daily_events (auto_extract source).
     """
     async with _db_pool.acquire() as conn:
@@ -4670,11 +4873,6 @@ async def distill_agent_history(agent_id: str, _=Depends(_require_key)):
         )
     agent_type  = (cfg_row["agent_type"] if cfg_row else None) or "agent"
     auto_memory = bool(cfg_row["auto_memory"]) if cfg_row else False
-
-    before = sum(
-        _qdrant.count(col, count_filter=_agent_filter(agent_id)).count
-        for col in COLLECTIONS
-    )
 
     processed = skipped = 0
     for row in rows:
@@ -4695,15 +4893,11 @@ async def distill_agent_history(agent_id: str, _=Depends(_require_key)):
             print(f"[distill-history] {agent_id} {sid}: {e}")
             skipped += 1
 
-    after = sum(
-        _qdrant.count(col, count_filter=_agent_filter(agent_id)).count
-        for col in COLLECTIONS
-    )
     return {
         "agent_id": agent_id,
         "processed": processed,
         "skipped": skipped,
-        "memories_added": max(0, after - before),
+        "memories_added": processed,  # approximate: one distill call per conv
     }
 
 
@@ -4749,15 +4943,6 @@ async def import_data(body: dict, _=Depends(_require_key)):
         raise HTTPException(400, "Invalid backup: missing 'agents' key")
 
     if mode == "overwrite":
-        for col in COLLECTIONS:
-            _qdrant.delete_collection(col)
-            _qdrant.create_collection(
-                col, vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE))
-            try:
-                _qdrant.create_payload_index(
-                    col, field_name="agent_id", field_schema=PayloadSchemaType.KEYWORD)
-            except Exception:
-                pass
         async with _db_pool.acquire() as conn:
             await conn.execute("DELETE FROM conversations")
             await conn.execute("DELETE FROM agent_settings")
@@ -4783,40 +4968,8 @@ async def import_data(body: dict, _=Depends(_require_key)):
                     s.get("llm_model", ""), s.get("notes", ""), s.get("avatar", ""),
                 )
 
-        # memories
-        for tier, items in ud.get("memories", {}).items():
-            col = f"memory_{tier}"
-            if col not in COLLECTIONS:
-                continue
-            for item in items:
-                content = item.get("content", "")
-                if not content:
-                    continue
-                item_id = item.get("id", str(uuid.uuid4()))
-                if mode == "merge":
-                    try:
-                        if _qdrant.retrieve(col, ids=[item_id]):
-                            skipped += 1
-                            continue
-                    except Exception:
-                        pass
-                try:
-                    vec = await _embed(content, "passage")
-                    created = item.get("created_at", time.time())
-                    _qdrant.upsert(col, points=[PointStruct(
-                        id=item_id, vector=vec,
-                        payload={
-                            "text":       content,
-                            "agent_id":   aid,
-                            "session_id": item.get("session_id", "import"),
-                            "created_ts": float(created) if isinstance(created, (int, float))
-                                          else time.time(),
-                        },
-                    )])
-                    imported_memories += 1
-                except Exception as e:
-                    print(f"[import] memory err: {e}")
-                    skipped += 1
+        # memories (legacy field in export; Palimpsest is the actual memory store now)
+        # Skip Qdrant memory import — Qdrant is only used for book_chunks
 
         # conversations
         for conv in ud.get("conversations", []):
@@ -4898,11 +5051,6 @@ async def import_conversations(
 
     # ── process ───────────────────────────────────────────────────────────────
     imported = skipped = 0
-    # snapshot memory counts before we start
-    before_total = sum(
-        _qdrant.count(col, count_filter=_agent_filter(agent_id)).count
-        for col in COLLECTIONS
-    )
 
     for conv in conversations:
         msgs = conv.get("messages", [])
@@ -4929,16 +5077,10 @@ async def import_conversations(
             continue
 
         imported += 1
-        # LLM distillation (fire-and-wait so we get accurate memory counts)
+        # LLM distillation into Palimpsest L1-L4
         await _distill_and_store(agent_id, sid, msgs)
 
-    after_total = sum(
-        _qdrant.count(col, count_filter=_agent_filter(agent_id)).count
-        for col in COLLECTIONS
-    )
-    memories_created = max(0, after_total - before_total)
-
-    return {"imported": imported, "memories_created": memories_created, "skipped": skipped}
+    return {"imported": imported, "skipped": skipped}
 
 
 @app.post("/api/conversations/bulk")
@@ -5686,6 +5828,7 @@ _MCP_GROUPS = {
     "search_book":        ("Books", "Semantic search in books"),
     "get_reading_context":("Books", "Load reading context"),
     "save_annotation":    ("Books", "Save highlight/annotation"),
+    "book_reflection":    ("Books", "Record book reflection → L1"),
     "daily_life_read":    ("Screentime", "Read daily life journal"),
     "daily_life_write":   ("Screentime", "Write a journal entry"),
     "daily_life_generate":("Screentime", "AI-generate today's entry"),
@@ -5889,10 +6032,13 @@ async def telegram_webhook(request: Request):
                 json={"agent_id": agent_id, "messages": messages,
                       "session_id": session_key, "stream": False},
             )
+        if _resp.status_code != 200:
+            raise RuntimeError(f"HTTP {_resp.status_code}: {_resp.text[:200]}")
         _rd   = _resp.json()
         reply = _rd["choices"][0]["message"]["content"]
     except Exception as _we:
         print(f"[telegram webhook] chat error: {_we}")
+        await _telegram_send(f"⚠️ 出错了：{_we}", chat_id=chat_id)
         return {"ok": True}
 
     history.append({"role": "user",      "content": text})

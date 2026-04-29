@@ -24,16 +24,21 @@ async function _loadProviders() {
 }
 
 function _renderProviders() {
-  const { providers, default_chain, embed_provider } = _provData;
+  const { providers, default_chain, embed_provider, distill_model, distill_providers } = _provData;
 
-  const provRows = providers.map(p => `
+  const defaultChainArr = default_chain.split(',').map(s=>s.trim()).filter(Boolean);
+  const provRows = providers.map((p, idx) => {
+    const gwIdx = defaultChainArr.indexOf(p.name);
+    const gwLabel = gwIdx === 0 ? 'gateway1·主' : gwIdx === 1 ? 'gateway2·备1' : gwIdx === 2 ? 'gateway3·备2' : gwIdx > 2 ? `gateway${gwIdx+1}` : '';
+    return `
     <div class="prov-row" id="prow-${esc(p.name)}">
       <div class="prov-info">
         <span class="prov-name">${esc(p.name)}</span>
+        ${gwLabel ? `<span style="font-size:9px;background:rgba(60,140,255,.12);color:#3c8cff;border-radius:4px;padding:1px 7px;margin-left:5px">${gwLabel}</span>` : ''}
         <span class="prov-url">${esc(p.base_url)}</span>
         <div class="prov-tags">
           ${p.is_embed ? `<span class="prov-tag embed">embed</span>` : ''}
-          ${default_chain.split(',').map(s=>s.trim()).includes(p.name) ? `<span class="prov-tag default">default chain</span>` : ''}
+          ${(distill_providers||[]).includes(p.name) ? `<span class="prov-tag" style="background:rgba(120,200,120,.15);color:#4a9e4a">A层·蒸馏</span>` : ''}
         </div>
       </div>
       <div class="prov-status" id="pstatus-${esc(p.name)}">
@@ -45,7 +50,8 @@ function _renderProviders() {
         onclick="editProvider('${esc(p.name)}')">Edit</button>
       <button type="button" class="btn btn-d" style="font-size:9px;padding:5px 10px"
         onclick="deleteProvider('${esc(p.name)}')">✕</button>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 
   const configSection = `
     <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
@@ -55,6 +61,16 @@ function _renderProviders() {
         <div style="display:flex;gap:8px">
           <input class="form-in" id="chainInput" value="${esc(default_chain)}" placeholder="nvidia,openrouter" style="flex:1">
           <button type="button" class="btn btn-g" style="font-size:9px;padding:5px 12px;white-space:nowrap" onclick="saveChain()">Save</button>
+        </div>
+      </div>
+      <div class="form-g" style="margin-bottom:8px">
+        <label class="form-lbl">A 层蒸馏模型 <span style="opacity:.45">(DISTILL_MODEL，后台蒸馏/自动任务)</span></label>
+        <div style="display:flex;gap:8px">
+          <input class="form-in" id="distillModelInput" value="${esc(distill_model||'')}" placeholder="google/gemma-4-31b-it" style="flex:1">
+          <button type="button" class="btn btn-g" style="font-size:9px;padding:5px 12px;white-space:nowrap" onclick="saveDistillModel()">Save</button>
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-top:3px">
+          当前 A 层 fallback 链：<b>${esc((distill_providers||[]).join(' → ') || '—')}</b>
         </div>
       </div>
     </div>`;
@@ -173,6 +189,16 @@ async function testProvider(name) {
   } catch(e) {
     statusEl.innerHTML = `<span class="prov-dot err"></span><span style="font-size:9px;color:var(--danger);margin-left:3px">fail</span>`;
   }
+}
+
+async function saveDistillModel() {
+  const model = document.getElementById('distillModelInput').value.trim();
+  if (!model) { toast('请输入模型名'); return; }
+  try {
+    await api('/admin/api/gateway-config', { method: 'POST', body: { distill_model: model } });
+    toast('A 层蒸馏模型已保存，下次蒸馏生效');
+    await _loadProviders();
+  } catch(e) { toast('Error: ' + e.message); }
 }
 
 // ── Effective config display in agent settings modal ──────────────────────────
