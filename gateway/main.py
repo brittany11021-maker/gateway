@@ -5251,6 +5251,65 @@ async def del_user_config(key: str, _=Depends(_require_key)):
     return {"ok": True}
 
 
+# ── Daily Skeleton config ──────────────────────────────────────────────────
+_DAILY_SKELETON_DEFAULT = {
+    "template":   "freelancer",
+    "wake_up":    {"range": ["08:00", "11:00"], "bias": "late"},
+    "sleep":      {"range": ["23:00", "02:00"]},
+    "habits":     ["喝咖啡", "午睡"],
+    "work_style": "remote",
+}
+
+@app.get("/admin/api/config/daily-skeleton")
+async def get_daily_skeleton(_=Depends(_require_key)):
+    import json as _j
+    async with _db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM user_config WHERE key='daily_skeleton'")
+    if not row:
+        return _DAILY_SKELETON_DEFAULT
+    v = row["value"]
+    return v if isinstance(v, dict) else _j.loads(v)
+
+@app.post("/admin/api/config/daily-skeleton")
+async def set_daily_skeleton(body: dict, _=Depends(_require_key)):
+    import json as _j
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO user_config(key,value,updated_at) VALUES('daily_skeleton',$1::jsonb,NOW()) "
+            "ON CONFLICT(key) DO UPDATE SET value=$1::jsonb, updated_at=NOW()",
+            _j.dumps(body)
+        )
+    return {"ok": True}
+
+
+# ── Screen-time rules config ───────────────────────────────────────────────
+@app.get("/admin/api/config/screen-time-rules")
+async def get_screen_time_rules(_=Depends(_require_key)):
+    import json as _j
+    async with _db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM user_config WHERE key='screen_time_rules'")
+    if not row:
+        return {"rules": _DEFAULT_SCREEN_RULES, "using_defaults": True}
+    v = row["value"]
+    rules = v if isinstance(v, list) else _j.loads(v)
+    return {"rules": rules, "using_defaults": False}
+
+@app.post("/admin/api/config/screen-time-rules")
+async def set_screen_time_rules(body: dict, _=Depends(_require_key)):
+    """body: {"rules": [...]}"""
+    import json as _j
+    rules = body.get("rules")
+    if not isinstance(rules, list):
+        raise HTTPException(400, "body.rules must be an array")
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO user_config(key,value,updated_at) VALUES('screen_time_rules',$1::jsonb,NOW()) "
+            "ON CONFLICT(key) DO UPDATE SET value=$1::jsonb, updated_at=NOW()",
+            _j.dumps(rules)
+        )
+    return {"ok": True, "count": len(rules)}
+
+
 @app.get("/admin/api/user-profiles")
 async def list_user_profiles(_=Depends(_require_key)):
     """List all user profiles."""
@@ -5788,7 +5847,11 @@ async def _check_activity_rules(agent_id: str, app: str, category: str, duration
     import datetime as _dt2, re as _re2
     async with _db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT value FROM user_config WHERE key='screen_time_rules'")
-    rules = list(row["value"]) if row and row["value"] else _DEFAULT_SCREEN_RULES
+    if row and row["value"]:
+        _rv = row["value"]
+        rules = _rv if isinstance(_rv, list) else __import__("json").loads(_rv)
+    else:
+        rules = _DEFAULT_SCREEN_RULES
 
     # Today's totals for threshold checks
     totals = await _act_totals(agent_id)

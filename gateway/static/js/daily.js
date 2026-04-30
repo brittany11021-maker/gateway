@@ -20,26 +20,30 @@ async function loadDailyTab() {
 function _renderDailyShell() {
   document.getElementById('area').innerHTML = `
     <div class="d-tabs">
-      <button class="d-tab" id="dtab-journal"  onclick="_switchDailySub('journal')">📔 Journal</button>
-      <button class="d-tab" id="dtab-state"    onclick="_switchDailySub('state')">🎭 State</button>
-      <button class="d-tab" id="dtab-events"   onclick="_switchDailySub('events')">🎲 Events</button>
-      <button class="d-tab" id="dtab-npcs"     onclick="_switchDailySub('npcs')">👥 NPCs</button>
+      <button class="d-tab" id="dtab-journal"    onclick="_switchDailySub('journal')">📔 Journal</button>
+      <button class="d-tab" id="dtab-state"      onclick="_switchDailySub('state')">🎭 State</button>
+      <button class="d-tab" id="dtab-events"     onclick="_switchDailySub('events')">🎲 Events</button>
+      <button class="d-tab" id="dtab-npcs"       onclick="_switchDailySub('npcs')">👥 NPCs</button>
+      <button class="d-tab" id="dtab-skeleton"   onclick="_switchDailySub('skeleton')">🗓 Skeleton</button>
+      <button class="d-tab" id="dtab-screentime" onclick="_switchDailySub('screentime')">📱 Screen Rules</button>
     </div>
     <div id="daily-sub"></div>`;
 }
 
 function _switchDailySub(tab) {
   _dailySubTab = tab;
-  ['journal','state','events','npcs'].forEach(t => {
+  ['journal','state','events','npcs','skeleton','screentime'].forEach(t => {
     document.getElementById('dtab-'+t)?.classList.toggle('active', t === tab);
   });
   const sub = document.getElementById('daily-sub');
   if (!sub) return;
   sub.innerHTML = '<div class="page-loading">Loading…</div>';
-  if (tab === 'journal') _loadJournal();
-  else if (tab === 'state')   _loadState();
-  else if (tab === 'events')  _loadEvents();
-  else if (tab === 'npcs')    _loadNpcs();
+  if (tab === 'journal')    _loadJournal();
+  else if (tab === 'state')      _loadState();
+  else if (tab === 'events')     _loadEvents();
+  else if (tab === 'npcs')       _loadNpcs();
+  else if (tab === 'skeleton')   _loadSkeleton();
+  else if (tab === 'screentime') _loadScreenTime();
 }
 
 // ── Journal ────────────────────────────────────────────────────────────────
@@ -407,4 +411,213 @@ async function _deleteNpc(aid, name) {
 
 function esc(s) {
   return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Daily Skeleton ─────────────────────────────────────────────────────────
+async function _loadSkeleton() {
+  const sub = document.getElementById('daily-sub');
+  sub.innerHTML = `
+    <div class="d-panel">
+      <div class="d-panel-head">🗓 Daily Skeleton
+        <button class="btn btn-s btn-p" style="margin-left:auto" onclick="_saveSkeleton()">Save</button>
+      </div>
+      <div id="skeletonBody" style="margin-top:14px"><div class="page-loading" style="font-size:11px">Loading…</div></div>
+    </div>`;
+  try {
+    const s = await apiFetch('/admin/api/config/daily-skeleton');
+    document.getElementById('skeletonBody').innerHTML = _buildSkeletonForm(s);
+  } catch(e) {
+    document.getElementById('skeletonBody').innerHTML =
+      `<span style="color:var(--danger);font-size:11px">${e}</span>`;
+  }
+}
+
+function _buildSkeletonForm(s) {
+  const tpls = ['freelancer','student','office','custom'];
+  const styles = ['remote','office','hybrid','flexible'];
+  const wu = s.wake_up || {};
+  const sl = s.sleep   || {};
+  const habits = Array.isArray(s.habits) ? s.habits.join(', ') : (s.habits||'');
+  return `
+    <div class="state-grid">
+      <div class="state-field">
+        <label class="form-lbl">Template</label>
+        <select class="form-sel" id="skTpl">
+          ${tpls.map(t => `<option value="${t}" ${s.template===t?'selected':''}>${t}</option>`).join('')}
+        </select>
+      </div>
+      <div class="state-field">
+        <label class="form-lbl">Work Style</label>
+        <select class="form-sel" id="skStyle">
+          ${styles.map(t => `<option value="${t}" ${s.work_style===t?'selected':''}>${t}</option>`).join('')}
+        </select>
+      </div>
+      <div class="state-field">
+        <label class="form-lbl">Wake-up range</label>
+        <div style="display:flex;gap:6px;align-items:center">
+          <input class="form-in" id="skWuFrom" value="${esc((wu.range||[])[0]||'08:00')}" placeholder="08:00" style="width:80px">
+          <span style="opacity:.5">–</span>
+          <input class="form-in" id="skWuTo"   value="${esc((wu.range||[])[1]||'11:00')}" placeholder="11:00" style="width:80px">
+          <select class="form-sel" id="skWuBias" style="width:90px">
+            ${['normal','early','late'].map(b => `<option value="${b}" ${(wu.bias||'normal')===b?'selected':''}>${b}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <div class="state-field">
+        <label class="form-lbl">Sleep range</label>
+        <div style="display:flex;gap:6px;align-items:center">
+          <input class="form-in" id="skSlFrom" value="${esc((sl.range||[])[0]||'23:00')}" placeholder="23:00" style="width:80px">
+          <span style="opacity:.5">–</span>
+          <input class="form-in" id="skSlTo"   value="${esc((sl.range||[])[1]||'02:00')}" placeholder="02:00" style="width:80px">
+        </div>
+      </div>
+      <div class="state-field" style="grid-column:span 2">
+        <label class="form-lbl">Habits <span style="opacity:.5">(comma-separated)</span></label>
+        <input class="form-in" id="skHabits" value="${esc(habits)}" placeholder="喝咖啡, 午睡, 加班" style="width:100%">
+      </div>
+    </div>`;
+}
+
+async function _saveSkeleton() {
+  const habitsRaw = document.getElementById('skHabits').value.trim();
+  const body = {
+    template:   document.getElementById('skTpl').value,
+    work_style: document.getElementById('skStyle').value,
+    wake_up: {
+      range: [
+        document.getElementById('skWuFrom').value.trim(),
+        document.getElementById('skWuTo').value.trim(),
+      ],
+      bias: document.getElementById('skWuBias').value,
+    },
+    sleep: {
+      range: [
+        document.getElementById('skSlFrom').value.trim(),
+        document.getElementById('skSlTo').value.trim(),
+      ],
+    },
+    habits: habitsRaw ? habitsRaw.split(',').map(h => h.trim()).filter(Boolean) : [],
+  };
+  try {
+    await apiFetch('/admin/api/config/daily-skeleton', { method:'POST', body: JSON.stringify(body) });
+    toast('Skeleton saved ✓');
+  } catch(e) { toast('Error: '+e); }
+}
+
+
+// ── Screen Time Rules ──────────────────────────────────────────────────────
+async function _loadScreenTime() {
+  const sub = document.getElementById('daily-sub');
+  sub.innerHTML = `
+    <div class="d-panel">
+      <div class="d-panel-head">📱 Screen Time Rules
+        <button class="btn btn-s btn-accent" style="margin-left:auto" onclick="_addScreenRule()">+ Rule</button>
+        <button class="btn btn-s btn-p"      style="margin-left:4px"  onclick="_saveScreenRules()">Save All</button>
+      </div>
+      <div style="font-size:10px;color:var(--muted);margin:6px 0 10px">
+        Condition syntax: <code>category:游戏 &gt; 120</code> · <code>app:王者荣耀 &gt; 60</code> · <code>any AND hour &gt;= 1</code><br>
+        Variables in push: <code>{app}</code> <code>{category}</code> <code>{minutes}</code>
+      </div>
+      <div id="screenRulesList"></div>
+      <div id="screenRulesMsg" style="font-size:11px;margin-top:6px"></div>
+    </div>`;
+  _fetchScreenRules();
+}
+
+let _screenRules = [];
+
+async function _fetchScreenRules() {
+  const el = document.getElementById('screenRulesList');
+  if (!el) return;
+  try {
+    const data = await apiFetch('/admin/api/config/screen-time-rules');
+    _screenRules = data.rules || [];
+    const badge = data.using_defaults
+      ? ' <span style="font-size:10px;color:var(--muted)">(defaults)</span>' : '';
+    document.querySelector('.d-panel-head').innerHTML =
+      `📱 Screen Time Rules${badge}
+       <button class="btn btn-s btn-accent" style="margin-left:auto" onclick="_addScreenRule()">+ Rule</button>
+       <button class="btn btn-s btn-p"      style="margin-left:4px"  onclick="_saveScreenRules()">Save All</button>`;
+    _renderScreenRules();
+  } catch(e) {
+    el.innerHTML = `<span style="color:var(--danger);font-size:11px">${e}</span>`;
+  }
+}
+
+function _renderScreenRules() {
+  const el = document.getElementById('screenRulesList');
+  if (!el) return;
+  if (!_screenRules.length) {
+    el.innerHTML = '<div class="daily-empty">No rules. Click + Rule to add.</div>';
+    return;
+  }
+  el.innerHTML = _screenRules.map((r, i) => `
+    <div class="screen-rule-row" id="srule-${i}">
+      <div class="sr-idx">${i+1}</div>
+      <div class="sr-fields">
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <div style="flex:3;min-width:180px">
+            <label class="form-lbl">Condition</label>
+            <input class="form-in sr-cond" data-i="${i}" value="${esc(r.condition||'')}"
+              placeholder="category:游戏 > 120" style="width:100%">
+          </div>
+          <div style="flex:3;min-width:180px">
+            <label class="form-lbl">Push message</label>
+            <input class="form-in sr-push" data-i="${i}" value="${esc(r.push||'')}"
+              placeholder="还在打{app}？" style="width:100%">
+          </div>
+          <div style="flex:1;min-width:120px">
+            <label class="form-lbl">Cooldown category</label>
+            <input class="form-in sr-cd" data-i="${i}" value="${esc(r.cooldown_category||'game_check')}"
+              placeholder="game_check" style="width:100%">
+          </div>
+          <div style="flex:1;min-width:100px">
+            <label class="form-lbl">Bark sound <span style="opacity:.5">(opt)</span></label>
+            <input class="form-in sr-sound" data-i="${i}" value="${esc(r.bark_sound||'')}"
+              placeholder="" style="width:100%">
+          </div>
+        </div>
+      </div>
+      <button class="btn-icon" style="align-self:center;flex-shrink:0" onclick="_removeScreenRule(${i})" title="Remove">✕</button>
+    </div>`).join('');
+}
+
+function _collectScreenRules() {
+  return _screenRules.map((_, i) => ({
+    condition:        document.querySelector(`.sr-cond[data-i="${i}"]`)?.value.trim() || '',
+    push:             document.querySelector(`.sr-push[data-i="${i}"]`)?.value.trim() || '',
+    cooldown_category: document.querySelector(`.sr-cd[data-i="${i}"]`)?.value.trim() || 'game_check',
+    bark_sound:       document.querySelector(`.sr-sound[data-i="${i}"]`)?.value.trim() || '',
+  })).filter(r => r.condition && r.push);
+}
+
+function _addScreenRule() {
+  // flush current edits first
+  _screenRules = _collectScreenRules();
+  _screenRules.push({ condition: '', push: '', cooldown_category: 'game_check', bark_sound: '' });
+  _renderScreenRules();
+  // focus new condition field
+  const newCond = document.querySelector(`.sr-cond[data-i="${_screenRules.length-1}"]`);
+  newCond?.focus();
+}
+
+function _removeScreenRule(i) {
+  _screenRules = _collectScreenRules();
+  _screenRules.splice(i, 1);
+  _renderScreenRules();
+}
+
+async function _saveScreenRules() {
+  const rules = _collectScreenRules();
+  const msg = document.getElementById('screenRulesMsg');
+  try {
+    const r = await apiFetch('/admin/api/config/screen-time-rules',
+      { method:'POST', body: JSON.stringify({ rules }) });
+    _screenRules = rules;
+    if (msg) { msg.style.color='var(--ok)'; msg.textContent=`✓ ${r.count} rules saved`; }
+    toast('Screen rules saved ✓');
+  } catch(e) {
+    if (msg) { msg.style.color='var(--danger)'; msg.textContent='✗ '+e; }
+    toast('Error: '+e);
+  }
 }

@@ -17,7 +17,7 @@
   --overlay-bg:   rgba(0,0,0,0.35);
   --card-profile: #D2D5FF;
   --card-project: #BEF0D5;
-  --card-recent:  #FFD4C8;
+  --card-memory:  #FFD4C8;
 }
 /* ── Variables: Night ───────────────────────────────────────────────────── */
 body.night {
@@ -38,7 +38,7 @@ body.night {
   --overlay-bg:   rgba(0,0,0,0.60);
   --card-profile: rgba(90,100,220,0.30);
   --card-project: rgba(40,148,90,0.28);
-  --card-recent:  rgba(210,80,70,0.28);
+  --card-memory:  rgba(210,80,70,0.28);
 }
 
 /* ── Reset ──────────────────────────────────────────────────────────────── */
@@ -196,7 +196,8 @@ body.night .pill::after { transform: translateX(13px); background: var(--text); 
 .mem-card:hover { transform: translateY(-2px); box-shadow: 0 8px 28px rgba(0,0,0,.13); }
 .mem-card.type-profile { background: var(--card-profile); }
 .mem-card.type-project { background: var(--card-project); }
-.mem-card.type-recent  { background: var(--card-recent); }
+.mem-card.type-recent  { background: var(--card-memory); }
+.mem-card.type-memory  { background: var(--card-memory); }
 .mc-label { font-size: 9px; letter-spacing: .14em; text-transform: uppercase; font-weight: 700; color: var(--text); opacity: 0.65; margin-bottom: 8px; flex-shrink: 0; }
 .mc-text {
   font-size: 11.5px; line-height: 1.5; color: var(--text);
@@ -217,9 +218,35 @@ body.night .pill::after { transform: translateX(13px); background: var(--text); 
 }
 .mc-act:hover { background: rgba(0,0,0,0.22); }
 .mc-act.del:hover { background: rgba(200,0,0,0.2); color: var(--danger); }
+.mc-act.ok:hover  { background: rgba(0,160,80,0.2); color: #2a9; }
 body.night .mc-act { background: rgba(255,255,255,0.12); }
 body.night .mc-act:hover { background: rgba(255,255,255,0.22); }
 body.night .mc-act.del:hover { background: rgba(200,60,60,0.25); }
+body.night .mc-act.ok:hover  { background: rgba(0,200,100,0.2); color: #4db; }
+
+/* ── Pending / status badges ─────────────────────────────────────────────── */
+.mc-pending { border-left: 3px solid var(--accent); }
+.mc-status {
+  font-size: 9px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+  padding: 2px 6px; border-radius: 4px; display: inline-block; margin-bottom: 6px;
+  background: rgba(0,0,0,0.08); color: var(--muted);
+}
+.mc-status-pending_l1          { background: rgba(100,120,255,0.15); color: var(--accent); }
+.mc-status-potential_duplicate { background: rgba(220,160,0,0.15);   color: #b88000; }
+.mc-status-updated             { background: rgba(0,160,80,0.12);    color: #2a9; }
+.mc-status-related             { background: rgba(0,0,0,0.08);       color: var(--muted); }
+body.night .mc-status-potential_duplicate { color: #e6b800; }
+body.night .mc-status-updated             { color: #4db; }
+
+/* ── Previous content diff ───────────────────────────────────────────────── */
+.mc-prev { margin-top: 8px; font-size: 10px; color: var(--muted); }
+.mc-prev summary { cursor: pointer; user-select: none; }
+.mc-prev-body {
+  margin-top: 4px; padding: 6px 8px; border-radius: 6px;
+  background: rgba(0,0,0,0.06); white-space: pre-wrap; word-break: break-word;
+  font-size: 10px; line-height: 1.5;
+}
+body.night .mc-prev-body { background: rgba(255,255,255,0.06); }
 
 /* ── Pagination ─────────────────────────────────────────────────────────── */
 .pager { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 14px 0 2px; }
@@ -1401,3 +1428,25 @@ body.night .msg-role.assistant { color: #6fcfa5; }
   line-height: 1.4; word-break: break-word;
   transition: color .2s;
 }
+
+/* ── Screen-time rule rows ──────────────────────────────────────────────── */
+.screen-rule-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 8px;
+  background: var(--ghost-bg);
+}
+.sr-idx {
+  flex-shrink: 0;
+  width: 20px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  padding-top: 24px;
+  text-align: center;
+}
+.sr-fields { flex: 1; min-width: 0; }
