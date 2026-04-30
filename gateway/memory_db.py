@@ -1037,6 +1037,62 @@ async def daily_delete(event_id: str) -> bool:
     return cur.rowcount > 0
 
 
+# ── Activity Events (screen time / app usage) ────────────────────────────────
+
+async def activity_write(
+    agent_id: str,
+    app: str,
+    duration_minutes: int,
+    category: str = "",
+    reported_at: str = "",
+) -> dict:
+    """Record one app-usage event from iOS Shortcut / Android Macro.
+
+    Returns the saved event dict.
+    """
+    import uuid as _uuid
+    db = await get_db()
+    await _ensure_p1_tables(db)
+    eid = str(_uuid.uuid4())
+    now = reported_at or _now()
+    await db.execute(
+        "INSERT INTO activity_events (id, agent_id, app, category, duration_minutes, reported_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (eid, agent_id, app, category, duration_minutes, now),
+    )
+    await db.commit()
+    return {"id": eid, "agent_id": agent_id, "app": app, "category": category,
+            "duration_minutes": duration_minutes, "reported_at": now}
+
+
+async def activity_recent(agent_id: str, hours: int = 4) -> list[dict]:
+    """Return activity events in the last *hours* hours, newest first."""
+    db = await get_db()
+    await _ensure_p1_tables(db)
+    cutoff = _now()  # ISO string; use datetime arithmetic in SQL
+    rows = await db.execute_fetchall(
+        "SELECT * FROM activity_events "
+        "WHERE agent_id=? AND reported_at >= datetime('now', ?) "
+        "ORDER BY reported_at DESC",
+        (agent_id, f"-{hours} hours"),
+    )
+    return [dict(r) for r in rows]
+
+
+async def activity_today_totals(agent_id: str) -> dict[str, int]:
+    """Return total minutes per category for today."""
+    db = await get_db()
+    await _ensure_p1_tables(db)
+    rows = await db.execute_fetchall(
+        "SELECT category, SUM(duration_minutes) as total "
+        "FROM activity_events "
+        "WHERE agent_id=? AND reported_at >= date('now') "
+        "GROUP BY category",
+        (agent_id,),
+    )
+    return {r["category"] or "其他": r["total"] for r in rows}
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # P1: Character State, Random Events, NPC Network
 # ═══════════════════════════════════════════════════════════════════════════════

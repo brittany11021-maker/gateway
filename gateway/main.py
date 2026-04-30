@@ -74,6 +74,10 @@ from memory_db import (
 from memory_db import daily_write as _daily_write, daily_read as _daily_read
 from memory_db import daily_list as _daily_list, daily_delete as _daily_delete
 from memory_db import (
+    activity_write as _act_write, activity_recent as _act_recent,
+    activity_today_totals as _act_totals,
+)
+from memory_db import (
     project_upsert as _proj_upsert, project_list as _proj_list,
     project_complete as _proj_complete, project_archive as _proj_archive,
     project_list_completed_stale as _proj_stale,
@@ -3693,6 +3697,26 @@ async def _proxy_call_tool(
                         parts.append(f"🌤 天气：{_weather}")
             except Exception:
                 pass
+            # Activity injection — recent 4h app usage (if any reported)
+            try:
+                _acts = await _act_recent(agent_id, hours=4)
+                if _acts:
+                    import datetime as _dt_a
+                    _act_lines = []
+                    for _a in _acts[:6]:  # max 6 entries
+                        try:
+                            _t = _dt_a.datetime.fromisoformat(
+                                str(_a["reported_at"]).replace("Z", "").split("+")[0]
+                            )
+                            _act_lines.append(
+                                f"{_t.strftime('%H:%M')} {_a['app']} ({_a['duration_minutes']}分钟)"
+                                + (f" {_a['category']}" if _a.get("category") else "")
+                            )
+                        except Exception:
+                            _act_lines.append(f"{_a['app']} ({_a['duration_minutes']}分钟)")
+                    parts.append("📱 最近动态\n" + "\n".join(_act_lines))
+            except Exception:
+                pass
             return chr(10).join(parts)
         except Exception as e:
             print(f"[proxy] memory_surface: {e}")
@@ -5589,6 +5613,149 @@ async def import_conversations(
         await _distill_and_store(agent_id, sid, msgs)
 
     return {"imported": imported, "skipped": skipped}
+
+
+@app.post("/api/activity/{agent_id}")
+async def post_activity(agent_id: str, body: dict, _=Depends(_require_key)):
+    """Receive an app-usage event from iOS Shortcut / Android Macro.
+
+    Body:
+      app              (str)  — app name, e.g. "小红书"
+      duration_minutes (int)  — usage duration
+      category         (str)  — 聊天|游戏|娱乐|工作|学习|其他  (optional)
+      timestamp        (str)  — ISO8601 UTC; defaults to now
+
+    The endpoint also runs push-rule checks and may send a Bark notification
+    if a rule threshold is crossed and the cooldown has expired.
+    """
+    app_name = str(body.get("app", "")).strip()
+    if not app_name:
+        raise HTTPException(400, "app is required")
+    duration = int(body.get("duration_minutes", 0))
+    category = str(body.get("category", "")).strip()
+    ts = str(body.get("timestamp", "")).strip()
+
+    # 1. Persist
+    ev = await _act_write(
+        agent_id=agent_id, app=app_name,
+        duration_minutes=duration, category=category,
+        reported_at=ts,
+    )
+
+    # 2. Run push rules (best-effort — never fail the response)
+    try:
+        await _check_activity_rules(agent_id, app_name, category, duration)
+    except Exception as _re:
+        print(f"[activity] rule check error: {_re}", flush=True)
+
+    return {"ok": True, "event": ev}
+
+
+@app.get("/api/activity/{agent_id}")
+async def get_activity(agent_id: str, hours: int = 4, _=Depends(_require_key)):
+    """Return recent activity events for an agent."""
+    events = await _act_recent(agent_id, hours=hours)
+    totals = await _act_totals(agent_id)
+    return {"events": events, "today_totals": totals}
+
+
+async def _check_activity_rules(agent_id: str, app: str, category: str, duration_minutes: int):
+    """Evaluate screen-time push rules and fire Bark notifications if triggered.
+
+    Rules come from user_config['screen_time_rules'] (JSON array).
+    Each rule: {condition, push, cooldown_category, bark_sound?}
+    condition examples: "category:游戏 > 120", "any > 0 AND hour >= 1"
+    """
+    import datetime as _dt2, re as _re2
+    async with _db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM user_config WHERE key='screen_time_rules'")
+    rules = list(row["value"]) if row and row["value"] else _DEFAULT_SCREEN_RULES
+
+    # Today's totals for threshold checks
+    totals = await _act_totals(agent_id)
+    hour_now = _dt2.datetime.utcnow().hour  # UTC; adjust if needed
+
+    for rule in rules:
+        cond  = rule.get("condition", "")
+        push  = rule.get("push", "")
+        cd_cat = rule.get("cooldown_category", "game_check")
+        sound  = rule.get("bark_sound", "")
+        if not cond or not push:
+            continue
+
+        # Evaluate condition (simple pattern matching)
+        triggered = False
+        try:
+            triggered = _eval_rule_condition(cond, category, app, totals, hour_now, duration_minutes)
+        except Exception:
+            continue
+
+        if triggered:
+            allowed = await _cd_gate(agent_id, cd_cat)
+            if allowed:
+                msg = push.format(app=app, category=category, minutes=duration_minutes)
+                try:
+                    await bark_push(msg, sound=sound)
+                    print(f"[activity] rule fired: {cond!r} → bark: {msg!r}", flush=True)
+                except Exception as _be:
+                    print(f"[activity] bark error: {_be}", flush=True)
+
+
+def _eval_rule_condition(cond: str, category: str, app: str,
+                         totals: dict, hour: int, last_duration: int) -> bool:
+    """Minimal rule evaluator. Supported patterns:
+      category:<cat> > <min>    — today's total for category
+      app:<name> > <min>        — last single report duration
+      any > <min> AND hour >= <h>
+      any AND hour >= <h>
+    """
+    import re as _re3
+    cond = cond.strip()
+
+    # Split on AND
+    parts = [p.strip() for p in cond.split(" AND ")]
+    results = []
+    for part in parts:
+        m = _re3.match(r"category:(\S+)\s*>\s*(\d+)", part)
+        if m:
+            cat_key, threshold = m.group(1), int(m.group(2))
+            total = sum(v for k, v in totals.items() if k == cat_key)
+            results.append(total > threshold)
+            continue
+        m = _re3.match(r"app:(.+?)\s*>\s*(\d+)", part)
+        if m:
+            app_key, threshold = m.group(1).strip(), int(m.group(2))
+            results.append(app.lower() == app_key.lower() and last_duration > threshold)
+            continue
+        m = _re3.match(r"any\s*>\s*(\d+)", part)
+        if m:
+            results.append(last_duration > int(m.group(1)))
+            continue
+        m = _re3.match(r"hour\s*>=\s*(\d+)", part)
+        if m:
+            results.append(hour >= int(m.group(1)))
+            continue
+        m = _re3.match(r"hour\s*<\s*(\d+)", part)
+        if m:
+            results.append(hour < int(m.group(1)))
+            continue
+        if part == "any":
+            results.append(True)
+            continue
+        results.append(False)
+
+    return bool(results) and all(results)
+
+
+# Default screen-time rules (used when user_config has no screen_time_rules key)
+_DEFAULT_SCREEN_RULES = [
+    {"condition": "category:游戏 > 120", "push": "还在打{app}？已经玩了不少时间了",
+     "cooldown_category": "game_check"},
+    {"condition": "category:游戏 > 120 AND hour >= 23", "push": "还在打{app}？早点睡觉",
+     "cooldown_category": "game_check"},
+    {"condition": "any AND hour >= 1", "push": "怎么还不睡？",
+     "cooldown_category": "late_night"},
+]
 
 
 @app.post("/api/conversations/bulk")
