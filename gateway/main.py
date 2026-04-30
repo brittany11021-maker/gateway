@@ -11,7 +11,7 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import AsyncGenerator
 
@@ -2533,6 +2533,7 @@ async def startup():
     asyncio.create_task(_auto_cleanup_loop())  # Palimpsest auto-cleanup
     asyncio.create_task(_nightly_character_loop())  # Nightly daily-life gen
     asyncio.create_task(_nightly_agent_loop())      # Nightly agent project maintenance
+    asyncio.create_task(_nightly_dream_loop())      # Nightly dream: L4→L3 + GitHub Obsidian
     asyncio.create_task(_register_telegram_webhook())  # Telegram bot webhook
     asyncio.create_task(_heartbeat_loop())           # 24h LLM liveness watchdog
 
@@ -3085,6 +3086,225 @@ async def _nightly_agent_loop() -> None:
         await asyncio.sleep(24 * 3600)
 
 
+# ── Dream System ──────────────────────────────────────────────────────────────
+
+async def _github_write_node(path: str, content: str, commit_msg: str) -> bool:
+    """Write (create or update) a file in the configured GitHub Obsidian repo.
+
+    Requires env vars: GITHUB_TOKEN and GITHUB_OBSIDIAN_REPO (e.g. 'user/vault').
+    Returns True on success, False if not configured or on error.
+    """
+    import base64 as _b64
+    token = os.environ.get("GITHUB_TOKEN", "")
+    repo  = os.environ.get("GITHUB_OBSIDIAN_REPO", "")
+    if not token or not repo:
+        return False
+    url     = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+            # GET to check if file exists and retrieve SHA
+            r = await client.get(url, headers=headers)
+            sha = r.json().get("sha") if r.status_code == 200 else None
+            body: dict = {
+                "message": commit_msg,
+                "content": _b64.b64encode(content.encode("utf-8")).decode(),
+            }
+            if sha:
+                body["sha"] = sha
+            r = await client.put(url, headers=headers, json=body)
+            if r.status_code in (200, 201):
+                print(f"[github] wrote {path}", flush=True)
+                return True
+            print(f"[github] write failed {r.status_code}: {r.text[:200]}", flush=True)
+            return False
+    except Exception as e:
+        print(f"[github] error writing {path}: {e}", flush=True)
+        return False
+
+
+async def _agent_dream(agent_id: str) -> str:
+    """Consolidate L4 fragments → L3 memories and write a knowledge-graph node to GitHub.
+
+    1. Pull L4 memories from the past 14 days (skip if < 3 fragments)
+    2. LLM groups them into 2-3 thematic clusters
+    3. Write one L3 consolidated memory per cluster to Palimpsest
+    4. Push a markdown summary to GitHub Obsidian (if GITHUB_TOKEN configured)
+
+    Returns a status string for logging.
+    """
+    # ── Fetch L4 fragments ─────────────────────────────────────────────────────
+    frags = await _mem_list(agent_id=agent_id, layer="L4", limit=60)
+    # Filter to last 14 days (created_at is ISO string from SQLite)
+    _cutoff_dt = datetime.utcnow() - timedelta(days=14)
+    recent: list[dict] = []
+    for f in frags:
+        ca = f.get("created_at") or ""
+        try:
+            dt = datetime.fromisoformat(str(ca).replace("Z", "+00:00").split("+")[0])
+            if dt >= _cutoff_dt:
+                recent.append(f)
+        except Exception:
+            recent.append(f)  # keep if unparseable
+    frags = recent if recent else frags  # fallback: use all if none pass
+    if len(frags) < 3:
+        return f"skip ({len(frags)} L4 fragments)"
+
+    _nl = chr(10)
+    frag_block = _nl.join(
+        f"- [{f.get('created_at','?')[:10]}] {f['content'][:120]}"
+        for f in frags[:40]
+    )
+
+    prompt = (
+        f"You are the memory consolidation system for AI agent '{agent_id}'." + _nl
+        + "Below are raw L4 atomic memory fragments from the past 2 weeks." + _nl
+        + "Task:" + _nl
+        + "1. Identify 2-3 thematic patterns across these fragments (skip if no clear pattern)" + _nl
+        + "2. For each pattern, write ONE consolidated L3 memory (richer than any single fragment, 40-100 chars)" + _nl
+        + "3. Write a brief dream narrative (60-120 chars, metaphorical, in first person as the agent, in Chinese)" + _nl
+        + _nl + "RULES: use explicit names (用户/Iris/etc.), never 你/我, include 5W1H context." + _nl
+        + 'Output ONLY valid JSON (no markdown fences):' + _nl
+        + '{"clusters":[{"theme":"short label","l3_memory":"consolidated text","importance":3}],'
+        + '"dream_narrative":"poetic Chinese narrative"}' + _nl + _nl
+        + "L4 Fragments:" + _nl + frag_block
+    )
+
+    try:
+        raw = await _call_llm_cheap(prompt)
+        if raw.startswith("```"):
+            raw = raw.split(_nl, 1)[1].rsplit("```", 1)[0]
+        data = json.loads(raw.strip())
+    except Exception as e:
+        return f"llm/parse error: {e}"
+
+    clusters      = data.get("clusters") or []
+    dream_narr    = str(data.get("dream_narrative") or "").strip()
+    written_l3    = 0
+    today_str     = datetime.utcnow().strftime("%Y-%m-%d")
+
+    # ── Write L3 consolidated memories ────────────────────────────────────────
+    for cl in clusters[:3]:
+        text = str(cl.get("l3_memory", "")).strip()
+        if not text:
+            continue
+        imp = max(2, min(4, int(cl.get("importance", 3))))
+        try:
+            await _mem_write_smart(
+                agent_id=agent_id, content=text,
+                layer="L3", type_="diary", importance=imp,
+                tags=["dream_consolidated"], source="agent_dream",
+            )
+            written_l3 += 1
+        except Exception as we:
+            print(f"[agent_dream] L3 write error: {we}", flush=True)
+
+    # ── Push to GitHub Obsidian ────────────────────────────────────────────────
+    gh_ok = False
+    if dream_narr or clusters:
+        _cluster_md = ""
+        for cl in clusters[:3]:
+            _cluster_md += (
+                f"\n### {cl.get('theme','—')}\n"
+                f"{cl.get('l3_memory','')}\n"
+            )
+        md_content = (
+            f"---\ndate: {today_str}\nagent: {agent_id}\ntype: memory-consolidation\n"
+            f"tags: [dream, memory, L3]\n---\n\n"
+            f"# Memory Dream — {today_str}\n\n"
+            f"## Dream Narrative\n{dream_narr or '—'}\n\n"
+            f"## Consolidated Patterns{_cluster_md}\n"
+            f"## Raw Fragments (L4 sample)\n"
+            + "\n".join(f"- {f['content'][:80]}" for f in frags[:10])
+        )
+        gh_ok = await _github_write_node(
+            path=f"memory-nodes/{agent_id}/{today_str}.md",
+            content=md_content,
+            commit_msg=f"dream: {agent_id} {today_str}",
+        )
+
+    return (
+        f"L3×{written_l3} written"
+        + (f", github={'ok' if gh_ok else 'skip'}" if (dream_narr or clusters) else "")
+    )
+
+
+async def _character_dream(agent_id: str) -> str:
+    """Generate a dream narrative for a character agent based on recent daily_events.
+
+    The dream is stored in character_state.dream_text / dream_date.
+    Returns the dream text or a skip message.
+    """
+    events = await _daily_read(agent_id=agent_id, days=7)
+    if len(events) < 3:
+        return f"skip ({len(events)} events)"
+
+    _nl = chr(10)
+    event_block = _nl.join(
+        f"- [{e['date']} {e.get('mood','?')}] {e['summary']}"
+        for e in events[:15]
+    )
+
+    prompt = (
+        f"你是角色 '{agent_id}'。以下是你最近几天的日常事件。" + _nl
+        + "根据这些事件，生成你昨晚做的一个梦的简短叙述。" + _nl
+        + "要求：中文、第一人称、带有隐喻、60-120字、有情感温度。" + _nl
+        + "只输出梦境叙述本身，不要任何解释或JSON。" + _nl + _nl
+        + "近期事件：" + _nl + event_block
+    )
+
+    try:
+        dream_text = (await _call_llm_cheap(prompt)).strip()
+        # Remove any accidental code fences
+        if dream_text.startswith("```"):
+            dream_text = dream_text.split(_nl, 1)[1].rsplit("```", 1)[0].strip()
+        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        await _state_set(agent_id=agent_id, dream_text=dream_text, dream_date=today_str)
+        return dream_text[:80]
+    except Exception as e:
+        return f"error: {e}"
+
+
+async def _nightly_dream_loop() -> None:
+    """Background task: nightly dream generation at ~02:00 UTC.
+
+    - agent-type: L4→L3 consolidation + GitHub Obsidian node
+    - character-type: dream narrative stored in character_state
+    """
+    import datetime as _dt4
+    _now4 = _dt4.datetime.utcnow()
+    _target4 = _now4.replace(hour=2, minute=0, second=0, microsecond=0)
+    if _target4 <= _now4:
+        _target4 += _dt4.timedelta(days=1)
+    await asyncio.sleep((_target4 - _now4).total_seconds())
+
+    while True:
+        try:
+            async with _db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT agent_id, agent_type FROM agent_settings WHERE auto_memory = TRUE"
+                )
+            for r in rows:
+                aid  = r["agent_id"]
+                atyp = r["agent_type"] or "agent"
+                try:
+                    if atyp == "agent":
+                        result = await _agent_dream(aid)
+                        print(f"[dream] agent {aid}: {result}", flush=True)
+                    elif atyp == "character":
+                        result = await _character_dream(aid)
+                        print(f"[dream] character {aid}: {result[:60]}", flush=True)
+                except Exception as ae:
+                    print(f"[dream] {aid} error: {ae}", flush=True)
+        except Exception as e:
+            print(f"[dream loop error] {e}", flush=True)
+        await asyncio.sleep(24 * 3600)
+
+
 async def _auto_backup_loop() -> None:
     await asyncio.sleep(90)          # give startup time to finish
     while True:
@@ -3329,6 +3549,20 @@ async def _process_character_mcp(agent_id: str, messages: list, proxy_cfg: dict)
                         injected.append(ctx)
         except Exception as e:
             print(f"[mcp_proxy] tool={tool.get('name')} err: {e}")
+
+    # ── Dream injection (30% chance, only if a dream exists for today) ─────────
+    try:
+        import random as _rnd
+        if _rnd.random() < 0.30:
+            _st = await _state_get(agent_id)
+            _today = datetime.utcnow().strftime("%Y-%m-%d")
+            _dream = _st.get("dream_text", "")
+            _ddate = _st.get("dream_date", "")
+            if _dream and _ddate == _today:
+                injected.append(f"[今日梦境]\n{_dream}")
+    except Exception as _de:
+        print(f"[mcp_proxy] dream inject err: {_de}")
+
     return chr(10).join(injected)
 
 
@@ -4899,6 +5133,25 @@ async def distill_agent_history(agent_id: str, _=Depends(_require_key)):
         "skipped": skipped,
         "memories_added": processed,  # approximate: one distill call per conv
     }
+
+
+@app.post("/admin/api/agents/{agent_id}/dream")
+async def trigger_agent_dream(agent_id: str, _=Depends(_require_key)):
+    """Manually trigger the dream system for one agent.
+
+    agent-type  → L4→L3 consolidation + GitHub Obsidian node
+    character   → dream narrative stored in character_state
+    """
+    async with _db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT agent_type FROM agent_settings WHERE agent_id=$1", agent_id)
+    agent_type = (row["agent_type"] if row else None) or "agent"
+    if agent_type == "character":
+        result = await _character_dream(agent_id)
+        return {"agent_id": agent_id, "type": "character", "dream": result}
+    else:
+        result = await _agent_dream(agent_id)
+        return {"agent_id": agent_id, "type": "agent", "result": result}
 
 
 @app.get("/admin/api/conversations")

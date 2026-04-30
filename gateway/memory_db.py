@@ -1155,6 +1155,16 @@ async def _ensure_p1_tables(db) -> None:
         await db.commit()
     except Exception:
         pass  # already exists
+    try:
+        await db.execute("ALTER TABLE character_state ADD COLUMN dream_text TEXT DEFAULT ''")
+        await db.commit()
+    except Exception:
+        pass  # already exists
+    try:
+        await db.execute("ALTER TABLE character_state ADD COLUMN dream_date TEXT DEFAULT ''")
+        await db.commit()
+    except Exception:
+        pass  # already exists
     # Seed global events if empty
     cur = await db.execute("SELECT COUNT(*) FROM random_events WHERE agent_id = ''")
     row = await cur.fetchone()
@@ -1201,7 +1211,8 @@ async def state_set(agent_id: str, **kwargs) -> dict:
     """Update one or more state fields. Returns updated state."""
     db = await get_db()
     await _ensure_p1_tables(db)
-    allowed = {"mood_score", "mood_label", "fatigue", "scene", "scene_note", "cooldown_minutes", "cooldown_message"}
+    allowed = {"mood_score", "mood_label", "fatigue", "scene", "scene_note",
+               "cooldown_minutes", "cooldown_message", "dream_text", "dream_date"}
     sets = {k: v for k, v in kwargs.items() if k in allowed}
     if sets:
         cols = ", ".join(f"{k}=?" for k in sets)
