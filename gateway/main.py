@@ -204,18 +204,19 @@ async def _call_llm_simple(prompt: str, agent_id: str = "default") -> str:
     raise RuntimeError("All providers failed")
 
 # Priority-ordered fallback models on NVIDIA NIM API (best per brand)
-# Last verified: 2026-04-28
+# Last verified: 2026-04-30
 _CHEAP_LLM_MODELS = [
     "deepseek-ai/deepseek-v4-pro",                  # DeepSeek V4 Pro ✅ (primary)
-    "moonshotai/kimi-k2.5",                         # Kimi K2.5 ✅ (backup)
     "z-ai/glm-5.1",                                 # GLM-5.1 ✅ (backup)
     "google/gemma-4-31b-it",                        # Gemma-4 31B ✅ (backup)
+    "mistralai/mistral-small-3.1-24b-instruct",     # Mistral Small ✅ (backup)
 ]
+# Note: moonshotai/kimi-k2.5 reached end-of-life 2026-04-30, removed.
 
 async def _call_llm_cheap(prompt: str) -> str:
     """Call NVIDIA NIM LLM for background tasks (distillation, auto-extract).
 
-    Tries models in priority order: deepseek-v4-pro → kimi-k2.5 → glm-5.1 → gemma-4-31b.
+    Tries models in priority order: deepseek-v4-pro → glm-5.1 → gemma-4-31b → mistral-small.
     DISTILL_MODEL env var inserts an override at position 0.
     Only uses the 'nvidia-llm' provider — never falls back to other providers.
     Raises RuntimeError if ALL models fail.
@@ -3227,9 +3228,18 @@ async def _agent_dream(agent_id: str) -> str:
             commit_msg=f"dream: {agent_id} {today_str}",
         )
 
+    # ── Sync project knowledge graph to GitHub ──────────────────────��─────────
+    try:
+        kg_result = await _sync_agent_knowledge_graph(agent_id)
+        print(f"[agent_dream] kg sync {agent_id}: {kg_result}", flush=True)
+    except Exception as _kge:
+        print(f"[agent_dream] kg sync error: {_kge}", flush=True)
+        kg_result = f"kg error: {_kge}"
+
     return (
         f"L3×{written_l3} written"
-        + (f", github={'ok' if gh_ok else 'skip'}" if (dream_narr or clusters) else "")
+        + (f", dream={'ok' if gh_ok else 'skip'}" if (dream_narr or clusters) else "")
+        + f", {kg_result}"
     )
 
 
@@ -3267,6 +3277,152 @@ async def _character_dream(agent_id: str) -> str:
         return dream_text[:80]
     except Exception as e:
         return f"error: {e}"
+
+
+def _safe_filename(name: str) -> str:
+    """Convert a project name to a safe filename (no special chars, max 60 chars)."""
+    import re as _re
+    safe = _re.sub(r'[\\/:*?"<>|]', '-', name).strip().strip('-')
+    return safe[:60] or "unnamed"
+
+
+async def _sync_agent_knowledge_graph(agent_id: str) -> str:
+    """Write project nodes + L2 theme map to GitHub Obsidian.
+
+    File structure in repo:
+      projects/{agent_id}/{project-name}.md  — one per project (active/completed)
+      knowledge-graph/{agent_id}/{date}-themes.md — L2 memory clusters with [[wiki-links]]
+
+    Returns a status string.
+    """
+    if not (os.environ.get("GITHUB_TOKEN") and os.environ.get("GITHUB_OBSIDIAN_REPO")):
+        return "skip (GitHub not configured)"
+
+    _nl    = chr(10)
+    today  = datetime.utcnow().strftime("%Y-%m-%d")
+    written = 0
+
+    # ── 1. Project nodes ───────────────────────────────────────────────────────
+    projects = await _proj_list(agent_id=agent_id, status="all")
+    l2_mems  = await _mem_list(agent_id=agent_id, layer="L2", limit=60)
+    l2_texts = [m["content"] for m in l2_mems if not m.get("archived")]
+
+    for proj in projects:
+        if proj["status"] == "archived":
+            continue  # skip fully archived ones (already in L1)
+        pname    = proj["name"]
+        pgoal    = proj.get("goal", "")
+        pstatus  = proj["status"]
+        psummary = proj.get("summary", "")
+
+        # Find matching L2 memories (keyword overlap)
+        pwords = set(pname.lower().replace("《", "").replace("》", "").split())
+        related = [t for t in l2_texts
+                   if any(w in t.lower() for w in pwords if len(w) > 1)][:8]
+
+        # Ask LLM to extract 3-5 Obsidian wiki-link concepts for this project
+        if related or pgoal:
+            _ctx = (pgoal or pname) + (_nl + _nl.join(f"- {t[:80]}" for t in related[:5]) if related else "")
+            _prompt = (
+                f"Given this project context, extract 3-5 key concept names for Obsidian [[wiki-links]]." + _nl
+                + "Output ONLY a JSON list of short Chinese/English concept names (2-6 chars each)." + _nl
+                + "Example: [\"人类学\",\"田野调查\",\"记忆\"]" + _nl + _nl
+                + "Context:" + _nl + _ctx[:400]
+            )
+            try:
+                raw = await _call_llm_cheap(_prompt)
+                if raw.startswith("```"):
+                    raw = raw.split(_nl, 1)[1].rsplit("```", 1)[0]
+                concepts = json.loads(raw.strip())
+                if not isinstance(concepts, list):
+                    concepts = []
+            except Exception:
+                concepts = []
+        else:
+            concepts = []
+
+        status_icon = {"active": "🟢", "completed": "✅"}.get(pstatus, "⚪")
+        concept_links = " · ".join(f"[[{c}]]" for c in concepts[:6]) if concepts else "—"
+        mem_lines = (_nl.join(f"- {t[:90]}" for t in related) if related else "_暂无相关 L2 记忆_")
+
+        md = (
+            f"---{_nl}date: {today}{_nl}agent: {agent_id}{_nl}"
+            f"project: {pname}{_nl}status: {pstatus}{_nl}"
+            f"tags: [project, knowledge-graph]{_nl}---{_nl}{_nl}"
+            f"# {pname}{_nl}{_nl}"
+            f"> {pgoal}{_nl}{_nl}"
+            f"## 状态{_nl}{status_icon} {pstatus.capitalize()}"
+            + (f" — 完成于 {proj.get('completed_at','')[:10]}" if pstatus == "completed" else "")
+            + _nl + _nl
+            + f"## 核心概念{_nl}{concept_links}{_nl}{_nl}"
+            + f"## 积累认知{_nl}{mem_lines}{_nl}{_nl}"
+            + (f"## 结果摘要{_nl}{psummary}{_nl}{_nl}" if psummary else "")
+            + f"## 关联节点{_nl}[[memory-nodes/{agent_id}/{today}]]{_nl}"
+        )
+        ok = await _github_write_node(
+            path=f"projects/{agent_id}/{_safe_filename(pname)}.md",
+            content=md,
+            commit_msg=f"project: {agent_id}/{pname} ({pstatus}) {today}",
+        )
+        if ok:
+            written += 1
+
+    # ── 2. L2 theme map ────────────────────────────────────────────────────────
+    if len(l2_texts) >= 3:
+        sample = _nl.join(f"- {t[:90]}" for t in l2_texts[:30])
+        _prompt2 = (
+            f"You are building an Obsidian knowledge graph for agent '{agent_id}'." + _nl
+            + "Group the following L2 memories into 3-5 thematic clusters." + _nl
+            + "For each cluster, choose a short [[wiki-link]] concept name." + _nl
+            + "Output ONLY valid JSON:" + _nl
+            + '[{"concept":"概念名","memories":["memory text 1","memory text 2"]}]'
+            + _nl + _nl + "L2 memories:" + _nl + sample
+        )
+        try:
+            raw2 = await _call_llm_cheap(_prompt2)
+            if raw2.startswith("```"):
+                raw2 = raw2.split(_nl, 1)[1].rsplit("```", 1)[0]
+            clusters2 = json.loads(raw2.strip())
+            if not isinstance(clusters2, list):
+                clusters2 = []
+        except Exception:
+            clusters2 = []
+
+        if clusters2:
+            project_links = (
+                "## 关联项目" + _nl
+                + _nl.join(f"- [[projects/{agent_id}/{_safe_filename(p['name'])}|{p['name']}]]"
+                           for p in projects if p["status"] != "archived")
+                + _nl
+            ) if projects else ""
+
+            theme_sections = ""
+            for cl in clusters2[:5]:
+                concept = cl.get("concept", "—")
+                mems    = cl.get("memories") or []
+                theme_sections += (
+                    f"## [[{concept}]]{_nl}"
+                    + _nl.join(f"- {m[:90]}" for m in mems[:5])
+                    + _nl + _nl
+                )
+
+            map_md = (
+                f"---{_nl}date: {today}{_nl}agent: {agent_id}{_nl}"
+                f"type: theme-map{_nl}tags: [knowledge-graph, themes]{_nl}---{_nl}{_nl}"
+                f"# 知识图谱 — {agent_id} ({today}){_nl}{_nl}"
+                + theme_sections
+                + project_links
+                + f"## 关联记忆节点{_nl}[[memory-nodes/{agent_id}/{today}]]{_nl}"
+            )
+            ok2 = await _github_write_node(
+                path=f"knowledge-graph/{agent_id}/{today}-themes.md",
+                content=map_md,
+                commit_msg=f"kg-themes: {agent_id} {today}",
+            )
+            if ok2:
+                written += 1
+
+    return f"wrote {written} node(s) to GitHub"
 
 
 async def _nightly_dream_loop() -> None:
@@ -5133,6 +5289,13 @@ async def distill_agent_history(agent_id: str, _=Depends(_require_key)):
         "skipped": skipped,
         "memories_added": processed,  # approximate: one distill call per conv
     }
+
+
+@app.post("/admin/api/agents/{agent_id}/knowledge-graph")
+async def trigger_knowledge_graph(agent_id: str, _=Depends(_require_key)):
+    """Manually sync project nodes + L2 theme map to GitHub Obsidian."""
+    result = await _sync_agent_knowledge_graph(agent_id)
+    return {"agent_id": agent_id, "result": result}
 
 
 @app.post("/admin/api/agents/{agent_id}/dream")

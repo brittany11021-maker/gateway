@@ -737,7 +737,7 @@ async def memory_cleanup(agent_id: str, dry_run: bool = False) -> dict:
             "INSERT INTO memories "
             "(id, agent_id, layer, type, content, importance, "
             " tags, source, parent_id, created_at, updated_at, last_accessed) "
-            "VALUES (?, 'L2', 'diary', ?, 2, '[]', 'auto_cleanup', '', ?, ?, ?)",
+            "VALUES (?, ?, 'L2', 'diary', ?, 2, '[]', 'auto_cleanup', '', ?, ?, ?)",
             (str(uuid.uuid4()), agent_id,
              f"[周总结待写] 以下短期记忆已过期{extra}，请回顾并写入周总结：" + chr(10) + snippets,
              now, now, now),
@@ -764,7 +764,7 @@ async def memory_cleanup(agent_id: str, dry_run: bool = False) -> dict:
             "INSERT INTO memories "
             "(id, agent_id, layer, type, content, importance, "
             " tags, source, parent_id, created_at, updated_at, last_accessed) "
-            "VALUES (?, 'L2', 'diary', ?, 3, '[]', 'auto_cleanup', '', ?, ?, ?)",
+            "VALUES (?, ?, 'L2', 'diary', ?, 3, '[]', 'auto_cleanup', '', ?, ?, ?)",
             (str(uuid.uuid4()), agent_id,
              f"[月总结待写] 以下中期记忆已过期{extra}，请回顾并写入月总结：" + chr(10) + snippets,
              now, now, now),
