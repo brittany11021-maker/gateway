@@ -3101,6 +3101,10 @@ async def _nightly_character_loop() -> None:
                 except Exception as ae:
                     print(f"[nightly] daily_life_generate({aid}) error: {ae}")
                 try:
+                    await _check_proactive_triggers(aid)
+                except Exception as ae:
+                    print(f"[nightly] proactive_triggers({aid}) error: {ae}")
+                try:
                     await _nightly_l1_consolidate(aid)
                 except Exception as ae:
                     print(f"[nightly] l1_consolidate({aid}) error: {ae}")
@@ -3114,6 +3118,86 @@ async def _nightly_character_loop() -> None:
             print(f"[nightly error] {e}")
         # Sleep 24 h
         await asyncio.sleep(24 * 3600)
+
+
+async def _check_proactive_triggers(agent_id: str) -> None:
+    """Layer 3: 触景生情 — scan today's diary → search related memories → maybe send Telegram.
+
+    Flow:
+      1. Read today's generated daily entry (summary text)
+      2. Split into sentences, search L3/L4 memories for each
+      3. For each match: 30% chance to generate + send a proactive message
+      4. At most ONE message per run; cooldown: proactive_casual (4h default)
+    """
+    import random as _rnd, re as _re4
+
+    # 0. cooldown check first (cheap exit)
+    allowed = await _cd_check(agent_id, "proactive_casual")
+    if not allowed:
+        return
+
+    # 1. Today's daily life entry
+    today_entries = await _daily_read(agent_id=agent_id, days=1)
+    if not today_entries:
+        return
+    summary = today_entries[0].get("summary", "")
+    if not summary or len(summary) < 20:
+        return
+
+    # 2. Split into short sentences (Chinese + Western)
+    sentences = [s.strip() for s in _re4.split(r'[。！？!?\n]', summary) if len(s.strip()) > 10]
+    if not sentences:
+        return
+
+    # 3. For each sentence, search related memories
+    triggers = []
+    for sent in sentences[:6]:  # check at most 6 sentences
+        try:
+            related = await _mem_search(agent_id=agent_id, query=sent, limit=1)
+            if related:
+                triggers.append({
+                    "event":  sent,
+                    "memory": related[0]["content"][:120],
+                })
+        except Exception:
+            continue
+
+    if not triggers:
+        return
+
+    # 4. 30% chance per trigger, send at most 1 message
+    _rnd.shuffle(triggers)
+    for t in triggers:
+        if _rnd.random() >= 0.30:
+            continue
+        # claim cooldown slot atomically
+        if not await _cd_gate(agent_id, "proactive_casual"):
+            return
+        # Generate message
+        try:
+            ev_text  = t['event']
+            mem_text = t['memory']
+            prompt = (
+                f"你是一个AI角色，今天经历了：「{ev_text}」，\n"
+                f"这让你想起了用户曾说过或经历过的：「{mem_text}」。\n"
+                "写一条简短的主动消息发给用户（1-2句，中文口语，自然温暖，不要解释你在想什么）："
+            )
+            msg = (await _call_llm_cheap(prompt)).strip()
+            if not msg:
+                return
+            # Strip possible surrounding quotes
+            msg = msg.strip("\"'")
+        except Exception as _e:
+            print(f"[proactive] LLM error: {_e}", flush=True)
+            return
+        # Send via Telegram
+        try:
+            ok = await _telegram_send(msg)
+            if ok:
+                print(f"[proactive] sent for {agent_id}: {msg[:60]}", flush=True)
+        except Exception as _e:
+            print(f"[proactive] telegram error: {_e}", flush=True)
+        return  # one message max
 
 
 async def _auto_archive_completed_projects(agent_id: str) -> None:
@@ -5412,6 +5496,17 @@ async def trigger_knowledge_graph(agent_id: str, _=Depends(_require_key)):
     """Manually sync project nodes + L2 theme map to GitHub Obsidian."""
     result = await _sync_agent_knowledge_graph(agent_id)
     return {"agent_id": agent_id, "result": result}
+
+
+@app.post("/admin/api/agents/{agent_id}/proactive")
+async def trigger_proactive(agent_id: str, _=Depends(_require_key)):
+    """Manually trigger the Layer 3 proactive messaging check for a character agent.
+
+    Reads today's diary, searches related memories, and may send a Telegram message
+    (subject to the proactive_casual cooldown).
+    """
+    await _check_proactive_triggers(agent_id)
+    return {"agent_id": agent_id, "ok": True, "note": "check complete (message sent only if cooldown clear and 30% roll passes)"}
 
 
 @app.post("/admin/api/agents/{agent_id}/dream")
