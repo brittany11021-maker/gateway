@@ -6641,6 +6641,7 @@ async def palimpsest_api_cleanup(
 # ── Daily Life REST API ──────────────────────────────────────────────────────
 
 @app.get("/admin/api/daily")
+@app.get("/admin/api/daily-life")   # alias used by char detail page
 async def daily_api_list(agent_id: str = "default", limit: int = 30, _=Depends(_require_key)):
     events = await _daily_list(agent_id=agent_id, limit=limit)
     return {"events": events, "count": len(events)}
