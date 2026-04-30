@@ -1852,44 +1852,47 @@ async def daily_life_generate(
 ) -> str:
     """Generate today's daily life entry using AI.
 
-    Pulls the last 3 days of journal + relevant L1/L2 memories as context,
-    then calls the configured LLM to generate a diary entry in character.
-    The result is saved automatically.
+    Pulls weather, last 3 days of journal, carry-over notes, daily skeleton config,
+    and relevant L1/L2 memories as context, then calls the LLM to generate a vivid
+    diary entry. The result is saved automatically.
 
     Args:
         agent_id:     Agent to generate for.
         date:         Target date (YYYY-MM-DD). Defaults to today.
-        extra_prompt: Optional extra guidance for the generator (e.g. "focus on social interactions").
+        extra_prompt: Optional extra guidance (e.g. "focus on social interactions").
     """
-    import os, datetime as _dt, httpx as _httpx, json as _json
+    import datetime as _dt, json as _json, re as _re
     if not date:
         date = _dt.datetime.utcnow().strftime("%Y-%m-%d")
 
-    # 1. Pull last 3 days of journal as context
-    past = await _daily_read(agent_id=agent_id, days=3)
+    # 1. Last 3 days of journal (carry_over from yesterday is inside these entries)
+    past = await _daily_read(agent_id=agent_id, days=4)
     past_ctx = ""
+    yesterday_carry = ""
     for e in past:
         if e["date"] == date:
             continue  # skip today — we're generating it
-        past_ctx += chr(10) + "### " + e["date"] + " [" + e["mood"] + "]" + chr(10) + e["summary"]
+        entry_line = f"\n### {e['date']} [{e['mood']}]\n{e['summary']}"
         if e.get("carry_over"):
-            past_ctx += chr(10) + "Carry-over: " + e["carry_over"]
+            entry_line += f"\nCarry-over: {e['carry_over']}"
+            # Track the most recent carry_over (yesterday's)
+            if not yesterday_carry:
+                yesterday_carry = e["carry_over"]
+        past_ctx += entry_line
 
-    # 2. Pull relevant L1/L2 Palimpsest memories
+    # 2. L1/L2 Palimpsest memories for character consistency
     mem_ctx = ""
     try:
         mems = await _mem_list(agent_id=agent_id, layer="L1", limit=5)
-        mems += await _mem_list(agent_id=agent_id, layer="L2", limit=5)
+        mems += await _mem_list(agent_id=agent_id, layer="L2", limit=3)
         if mems:
-            mem_ctx = chr(10).join(
-                "[" + m["layer"] + " " + m["mem_type"] + "] " + m["content"][:200]
-                for m in mems
+            mem_ctx = "\n".join(
+                f"[{m['layer']} {m['mem_type']}] {m['content'][:200]}" for m in mems
             )
     except Exception:
         pass
 
-    # 3. Build generation prompt
-    # Fetch character state + roll a random event for flavor
+    # 3. Character state + random event
     _char_state = None
     _rand_event = None
     try:
@@ -1900,92 +1903,132 @@ async def daily_life_generate(
         _rand_event = await _event_roll(agent_id=agent_id)
     except Exception:
         pass
+
+    # 4. Today's weather — use configured city (avoids VPN IP drift)
+    _weather_ctx = ""
+    try:
+        async with _db_pool.acquire() as _wconn:
+            _uc_row = await _wconn.fetchrow(
+                "SELECT value FROM user_config WHERE key='user_context'")
+        _uc = dict(_uc_row["value"]) if _uc_row and _uc_row["value"] else {}
+        _city = (_uc.get("location") or {}).get("city", "")
+        _w = await amap_weather(_city)  # empty string → amap uses IP (fallback)
+        if _w and not _w.startswith("Error") and not _w.startswith("Weather error"):
+            _weather_ctx = _w
+    except Exception:
+        pass
+
+    # 5. Daily skeleton config (occupation, habits) from user_config
+    _skeleton_ctx = ""
+    try:
+        async with _db_pool.acquire() as _sc:
+            _sk_row = await _sc.fetchrow(
+                "SELECT value FROM user_config WHERE key='daily_skeleton'")
+        if _sk_row:
+            _sk = dict(_sk_row["value"]) if _sk_row["value"] else {}
+            _parts = []
+            if _sk.get("template"):    _parts.append(f"lifestyle: {_sk['template']}")
+            if _sk.get("work_style"):  _parts.append(f"work style: {_sk['work_style']}")
+            if _sk.get("habits"):      _parts.append(f"habits: {', '.join(_sk['habits'])}")
+            wu = _sk.get("wake_up", {})
+            if wu.get("range"):        _parts.append(f"wake-up: {wu['range'][0]}–{wu['range'][1]} ({wu.get('bias','normal')})")
+            if _parts:
+                _skeleton_ctx = "; ".join(_parts)
+    except Exception:
+        pass
+
+    # 6. Build prompts
+    _nl = "\n"
     sys_prompt = (
         "You are a daily life journal generator for an AI character. "
-        "Write a natural, vivid diary entry for the given date. "
-        "The entry should feel lived-in: mention small moments, emotions, thoughts. "
-        "Keep it to 2-4 paragraphs. End with a 'carry_over' line (one sentence of "
-        "what to remember tomorrow). "
-        "Output ONLY valid JSON: {\"mood\": \"...\", \"summary\": \"...\", \"carry_over\": \"...\", \"time_of_day\": \"...\"}"
+        "Write a natural, vivid first-person diary entry for the given date. "
+        "The entry should feel lived-in: small moments, sensory details, emotions, fleeting thoughts. "
+        "2–4 paragraphs. Write in Chinese (中文). "
+        "End with a short 'carry_over' (one sentence — what to remember tomorrow). "
+        'Output ONLY valid JSON: {"mood": "...", "summary": "...", "carry_over": "...", "time_of_day": "..."}'
     )
-    user_prompt = "Today's date: " + date + chr(10)
+    if _skeleton_ctx:
+        sys_prompt += f"\nCharacter profile: {_skeleton_ctx}."
+
+    user_prompt = f"Today: {date}\n"
+    if _weather_ctx:
+        user_prompt += f"## Today's weather: {_weather_ctx}\n"
+    if yesterday_carry:
+        user_prompt += f"## Carry-over from yesterday: {yesterday_carry}\n"
     if _char_state:
-        user_prompt += (f"## Character state: mood={_char_state['mood_label']}"
-                        f" ({_char_state['mood_score']:+d}), fatigue={_char_state['fatigue']}/100,"
-                        f" scene={_char_state['scene']}"
-                        + (f" ({_char_state['scene_note']})" if _char_state.get("scene_note") else "")
-                        + chr(10))
+        _sc_label = _char_state.get("scene", "daily")
+        user_prompt += (
+            f"## Character state: mood={_char_state['mood_label']} ({_char_state['mood_score']:+d}), "
+            f"fatigue={_char_state['fatigue']}/100, scene={_sc_label}"
+            + (f" ({_char_state['scene_note']})" if _char_state.get("scene_note") else "")
+            + _nl
+        )
     if _rand_event:
-        lvl_emoji = {"green":"🟢","yellow":"🟡","orange":"🟠","red":"🔴"}.get(_rand_event["level"],"⚪")
-        user_prompt += f"## Random event today: {lvl_emoji} {_rand_event['content']}" + chr(10)
-
+        lvl_emoji = {"green": "🟢", "yellow": "🟡", "orange": "🟠", "red": "🔴"}.get(_rand_event["level"], "⚪")
+        user_prompt += f"## Random event: {lvl_emoji} {_rand_event['content']}\n"
     if past_ctx:
-        user_prompt += chr(10) + "## Recent journal entries:" + past_ctx + chr(10)
+        user_prompt += f"\n## Recent journal entries:{past_ctx}\n"
     if mem_ctx:
-        user_prompt += chr(10) + "## Core memories (for character consistency):" + chr(10) + mem_ctx + chr(10)
+        user_prompt += f"\n## Core memories (for consistency):\n{mem_ctx}\n"
     if extra_prompt:
-        user_prompt += chr(10) + "## Extra guidance: " + extra_prompt + chr(10)
-    user_prompt += chr(10) + "Write today's diary entry as JSON."
+        user_prompt += f"\n## Extra guidance: {extra_prompt}\n"
+    user_prompt += "\nWrite today's diary entry as JSON."
 
-    # 4. Call LLM (use existing gateway provider infrastructure)
+    # 7. Call LLM — prefer DAILY_LIFE_MODEL via nvidia-llm provider, fallback to _call_llm_cheap
+    raw = ""
     try:
         async with _db_pool.acquire() as conn:
-            provider = await conn.fetchrow(
-                "SELECT base_url, api_key, name FROM providers WHERE is_embed = FALSE ORDER BY created_at LIMIT 1"
+            _prow = await conn.fetchrow(
+                "SELECT base_url, api_key FROM providers WHERE name='nvidia-llm' LIMIT 1"
             )
-        if not provider:
-            return "Error: No LLM provider configured. Add one via /admin."
-
-        # Use a small/fast model — try to use a cheap model name
-        model = os.getenv("DAILY_LIFE_MODEL", "")
-        # Fallback: pick a small variant if no dedicated model set
-        if not model:
-            pname = (provider["name"] or "").lower()
-            if "kimi" in pname or "moonshot" in pname:
-                model = "moonshot-v1-8k"
-            elif "openai" in pname or "gpt" in pname:
-                model = "gpt-4o-mini"
+        _model = os.getenv("DAILY_LIFE_MODEL", "meta/llama-3.1-8b-instruct")
+        if _prow:
+            async with httpx.AsyncClient(timeout=60) as client:
+                _resp = await client.post(
+                    _prow["base_url"].rstrip("/") + "/chat/completions",
+                    headers={"Authorization": f"Bearer {_prow['api_key']}", "Content-Type": "application/json"},
+                    json={
+                        "model": _model,
+                        "messages": [
+                            {"role": "system", "content": sys_prompt},
+                            {"role": "user",   "content": user_prompt},
+                        ],
+                        "max_tokens": 900,
+                        "temperature": 0.85,
+                    },
+                )
+            if _resp.is_success:
+                raw = _resp.json()["choices"][0]["message"]["content"].strip()
             else:
-                model = os.getenv("LLM_MODEL", "meta/llama-3.1-8b-instruct")
-
-        headers = {
-            "Authorization": "Bearer " + provider["api_key"],
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "max_tokens": 800,
-            "temperature": 0.85,
-        }
-        async with _httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                provider["base_url"].rstrip("/") + "/chat/completions",
-                headers=headers,
-                json=payload,
+                raise RuntimeError(f"HTTP {_resp.status_code}")
+        else:
+            raise RuntimeError("nvidia-llm provider not found")
+    except Exception as _e:
+        print(f"[daily_life] primary LLM failed ({_e}), falling back to _call_llm_cheap", flush=True)
+        try:
+            raw = await _call_llm_cheap(
+                f"{sys_prompt}\n\n{user_prompt}"
             )
-        resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        return "LLM call failed: " + str(e)
+        except Exception as _e2:
+            return f"LLM call failed: {_e2}"
 
-    # 5. Parse JSON response
+    # 8. Parse JSON response (robust: strip fences, then regex fallback)
     try:
-        # Strip markdown code fences if present
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        parsed = _json.loads(raw.strip())
+        _txt = raw
+        if "```" in _txt:
+            _txt = _re.sub(r"```(?:json)?", "", _txt).replace("```", "").strip()
+        # Try direct parse first
+        try:
+            parsed = _json.loads(_txt)
+        except Exception:
+            # Regex: extract first {...} block
+            _m = _re.search(r"\{[\s\S]*\}", _txt)
+            parsed = _json.loads(_m.group()) if _m else {}
         mood      = str(parsed.get("mood", "neutral"))
         summary   = str(parsed.get("summary", raw))
         carry     = str(parsed.get("carry_over", ""))
         time_slot = str(parsed.get("time_of_day", ""))
     except Exception:
-        # Fallback: save raw text as summary
         mood, summary, carry, time_slot = "neutral", raw, "", ""
 
     # 6. Persist
@@ -3634,15 +3677,19 @@ async def _proxy_call_tool(
                     parts.append(npc_summary)
             except Exception:
                 pass
-            # Auto-inject weather if data_sources.weather is enabled
+            # Auto-inject weather — city from user_config (avoids VPN IP drift)
             try:
                 async with _db_pool.acquire() as _wc:
                     _ds_row = await _wc.fetchrow(
                         "SELECT value FROM user_config WHERE key='data_sources'")
+                    _uc_row = await _wc.fetchrow(
+                        "SELECT value FROM user_config WHERE key='user_context'")
                 _ds = dict(_ds_row["value"]) if _ds_row else {}
+                _uc = dict(_uc_row["value"]) if _uc_row else {}
+                _city = (_uc.get("location") or {}).get("city", "")
                 if _ds.get("weather", False):
-                    _weather = await amap_weather()
-                    if not _weather.startswith("Error") and not _weather.startswith("Weather error"):
+                    _weather = await amap_weather(_city)
+                    if _weather and not _weather.startswith("Error") and not _weather.startswith("Weather error"):
                         parts.append(f"🌤 天气：{_weather}")
             except Exception:
                 pass
