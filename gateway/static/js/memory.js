@@ -470,6 +470,10 @@ function switchTab(tab) {
     document.querySelector('.toolbar').style.display = 'none';
     if (typeof loadUserProfileTab === 'function') loadUserProfileTab(); return;
   }
+  if (tab === 'timeline') {
+    document.querySelector('.toolbar').style.display = 'none';
+    if (typeof loadTimelineTab === 'function') loadTimelineTab(); return;
+  }
 
   document.getElementById('area').classList.remove('read-mode');
   agentItems = {}; agentPages = {}; agentLoaded.clear();

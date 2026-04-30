@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Anta&family=Quicksand:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&family=Noto+Sans+TC:wght@400;500;700&family=Noto+Sans+JP:wght@400;500&family=Noto+Sans:wght@400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/static/css/style.css?v=14">
+<link rel="stylesheet" href="/static/css/style.css?v=15">
 </head>
 <body>
 
@@ -55,6 +55,9 @@
   </div>
   <div class="s-tab" id="tab-world" onclick="switchTab('world')">
     <div class="s-num" id="n-world">—</div><div class="s-lbl">World</div>
+  </div>
+  <div class="s-tab" id="tab-timeline" onclick="switchTab('timeline')">
+    <div class="s-num">🕐</div><div class="s-lbl">Timeline</div>
   </div>
 </div>
 
@@ -302,6 +305,31 @@
       </div>
       <div class="bk-meta" id="autoMeta"></div>
     </div>
+
+    <div class="bk-section">
+      <div class="bk-head">☁️ R2 Cloud Backup
+        <span id="r2StatusBadge" style="font-size:11px;font-weight:400;margin-left:10px">…</span>
+      </div>
+      <div class="bk-desc">Cloudflare R2 (S3-compatible). Backups upload automatically on trigger.</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0">
+        <div><label class="form-lbl">Account ID</label>
+          <input class="form-in" id="r2AccountId" placeholder="abc123…" style="width:100%"></div>
+        <div><label class="form-lbl">Bucket name</label>
+          <input class="form-in" id="r2Bucket" placeholder="my-backup-bucket" style="width:100%"></div>
+        <div><label class="form-lbl">Access Key ID</label>
+          <input class="form-in" id="r2AccessKey" placeholder="…" style="width:100%"></div>
+        <div><label class="form-lbl">Secret Access Key</label>
+          <input class="form-in" id="r2SecretKey" type="password" placeholder="…" style="width:100%"></div>
+      </div>
+      <div class="auto-row" style="margin-bottom:10px">
+        <input type="checkbox" id="r2EnabledToggle" style="accent-color:var(--accent)">
+        <label for="r2EnabledToggle" style="font-size:11px;cursor:pointer">Enable R2 uploads</label>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-g" onclick="saveR2Config()">Save</button>
+        <button class="btn btn-g" id="r2TestBtn" onclick="testR2()">Test</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -388,13 +416,14 @@
 <div class="toasts" id="toastWrap"></div>
 
 <script src="/static/js/api.js?v=6"></script>
-<script src="/static/js/memory.js?v=12"></script>
-<script src="/static/js/backup.js?v=2"></script>
+<script src="/static/js/memory.js?v=13"></script>
+<script src="/static/js/backup.js?v=3"></script>
 <script src="/static/js/books.js?v=11"></script>
 <script src="/static/js/providers.js?v=3"></script>
-<script src="/static/js/mcp.js?v=3"></script>
+<script src="/static/js/mcp.js?v=4"></script>
 <script src="/static/js/daily.js?v=3"></script>
 <script src="/static/js/worldbook.js?v=1"></script>
 <script src="/static/js/user.js?v=2"></script>
+<script src="/static/js/timeline.js?v=1"></script>
 </body>
 </html>

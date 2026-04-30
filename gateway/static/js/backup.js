@@ -35,6 +35,7 @@ async function openBackupModal() {
   } catch {}
 
   document.getElementById('backupOv').classList.add('open');
+  loadR2Status();
 }
 
 function closeBackupOv() { document.getElementById('backupOv').classList.remove('open'); }
@@ -213,8 +214,58 @@ async function triggerBackup() {
   toast('Creating backup…');
   try {
     const d = await api('/admin/api/backup/trigger', { method:'POST', body:{} });
-    toast('Saved: ' + d.filename);
+    toast('Saved: ' + d.filename + (d.r2_uploaded ? ' + R2 ✓' : ''));
     document.getElementById('autoMeta').textContent =
       `Last backup: now · Files on server: ${d.backup_count}`;
   } catch(e) { toast('Error: '+e.message); }
+}
+
+// ── R2 cloud backup config ─────────────────────────────────────────────────
+async function loadR2Status() {
+  const el = document.getElementById('r2StatusBadge');
+  if (!el) return;
+  try {
+    const d = await api('/admin/api/backup/r2/status');
+    if (!d.configured) {
+      el.textContent = '⚪ Not configured';
+      el.style.color = 'var(--muted)';
+    } else if (d.enabled) {
+      el.textContent = `🟢 Enabled — ${_besc(d.bucket)}`;
+      el.style.color = 'var(--ok)';
+    } else {
+      el.textContent = `🔴 Disabled — ${_besc(d.bucket)}`;
+      el.style.color = 'var(--danger)';
+    }
+  } catch { if(el) el.textContent = '? unknown'; }
+}
+
+async function saveR2Config() {
+  const body = {
+    r2_account_id: document.getElementById('r2AccountId').value.trim(),
+    r2_access_key: document.getElementById('r2AccessKey').value.trim(),
+    r2_secret_key: document.getElementById('r2SecretKey').value.trim(),
+    r2_bucket:     document.getElementById('r2Bucket').value.trim(),
+    r2_enabled:    document.getElementById('r2EnabledToggle').checked ? 'true' : 'false',
+  };
+  try {
+    await api('/admin/api/backup/r2/config', { method:'POST', body });
+    toast('R2 config saved ✓');
+    loadR2Status();
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+async function testR2() {
+  const btn = document.getElementById('r2TestBtn');
+  if (!btn) return;
+  btn.disabled = true; btn.textContent = 'Testing…';
+  try {
+    const r = await api('/admin/api/backup/r2/test', { method:'POST', body:{} });
+    toast(r.message || 'R2 OK ✓');
+    loadR2Status();
+  } catch(e) { toast('R2 test failed: ' + e.message); }
+  finally { btn.disabled = false; btn.textContent = 'Test'; }
+}
+
+function _besc(s) {
+  return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }

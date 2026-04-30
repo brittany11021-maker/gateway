@@ -1,4 +1,4 @@
-/* mcp.js v2 – MCP tool management + Telegram control panel */
+/* mcp.js v4 – MCP tool management + toggle + Telegram control panel */
 
 const MCP_GROUP_ICONS = {
   'Memory':        '🧠',
@@ -198,21 +198,50 @@ async function switchTelegramAgent(agentId) {
 // ── Group card ────────────────────────────────────────────────────────────────
 
 function buildGroupCard(groupName, icon, tools) {
-  const chips = tools.map(t => `
-    <div class="mcp-tool-chip" title="${esc(t.description)}">
+  const chips = tools.map(t => {
+    const on = t.enabled !== false;
+    return `
+    <div class="mcp-tool-chip${on ? '' : ' mcp-tool-disabled'}" title="${esc(t.description)}">
       <span class="mcp-tool-name">${esc(t.name)}</span>
       <span class="mcp-tool-desc">${esc(t.description)}</span>
-    </div>`).join('');
+      <button class="mcp-tog${on ? ' mcp-tog-on' : ''}"
+              onclick="toggleMcpTool('${esc(t.name)}',this)"
+              title="${on ? 'Disable' : 'Enable'}">
+        ${on ? '●' : '○'}
+      </button>
+    </div>`;
+  }).join('');
 
+  const disabledCount = tools.filter(t => t.enabled === false).length;
   return `
     <div class="mcp-group-card">
       <div class="mcp-group-header">
         <span class="mcp-group-icon">${icon}</span>
         <span class="mcp-group-name">${esc(groupName)}</span>
-        <span class="mcp-group-count">${tools.length}</span>
+        <span class="mcp-group-count">${tools.length - disabledCount}${disabledCount ? `<span style="color:var(--muted)">/${tools.length}</span>` : ''}</span>
       </div>
       <div class="mcp-tool-list">${chips}</div>
     </div>`;
+}
+
+async function toggleMcpTool(name, btn) {
+  try {
+    const r = await apiFetch(`/admin/api/mcp/tools/${encodeURIComponent(name)}/toggle`,
+      { method: 'POST', body: '{}' });
+    const chip = btn.closest('.mcp-tool-chip');
+    if (r.enabled) {
+      chip.classList.remove('mcp-tool-disabled');
+      btn.classList.add('mcp-tog-on');
+      btn.textContent = '●';
+      btn.title = 'Disable';
+    } else {
+      chip.classList.add('mcp-tool-disabled');
+      btn.classList.remove('mcp-tog-on');
+      btn.textContent = '○';
+      btn.title = 'Enable';
+    }
+    showMcpResult(`${name} ${r.enabled ? 'enabled' : 'disabled'}`, 'ok');
+  } catch(e) { showMcpResult('✗ ' + e, 'err'); }
 }
 
 // ── Bark / Intiface ───────────────────────────────────────────────────────────

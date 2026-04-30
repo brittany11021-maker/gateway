@@ -2946,17 +2946,28 @@ def _trim_sqlite_backups() -> None:
 
 async def _save_backup_file() -> str:
     data = await _build_export_data()
-    fname = f"memory_backup_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.json"
-    (BACKUP_DIR / fname).write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    ts    = datetime.utcnow().strftime("%Y%m%d_%H%M")
+    fname = f"memory_backup_{ts}.json"
+    raw   = json.dumps(data, ensure_ascii=False, indent=2)
+    (BACKUP_DIR / fname).write_text(raw, encoding="utf-8")
     _trim_backups()
     # SQLite Palimpsest backup
+    db_fname = ""
     try:
-        db_fname = f"palimpsest_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.db"
+        db_fname = f"palimpsest_{ts}.db"
         await _mem_backup_db(str(BACKUP_DIR / db_fname))
         _trim_sqlite_backups()
     except Exception as _be:
         print(f"[palimpsest-backup error] {_be}")
+    # R2 upload (best-effort)
+    try:
+        date_prefix = datetime.utcnow().strftime("%Y/%m/%d")
+        await _r2_upload(f"daily/{date_prefix}/{fname}", raw.encode("utf-8"), "application/json")
+        if db_fname:
+            db_bytes = (BACKUP_DIR / db_fname).read_bytes()
+            await _r2_upload(f"daily/{date_prefix}/{db_fname}", db_bytes, "application/octet-stream")
+    except Exception as _r2e:
+        print(f"[r2-backup] {_r2e}", flush=True)
     async with _db_pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO backup_settings (key,value) VALUES ('last_backup_at',$1) "
@@ -6709,8 +6720,13 @@ _MCP_GROUPS = {
 
 @app.get("/admin/api/mcp/tools")
 async def admin_mcp_tools(_=Depends(_require_key)):
-    """List all registered MCP tools with group/description metadata."""
-    from mcp.server import FastMCP
+    """List all registered MCP tools with group/description metadata + enabled state."""
+    import json as _j
+    async with _db_pool.acquire() as _dc:
+        _dr = await _dc.fetchrow("SELECT value FROM user_config WHERE key='disabled_mcp_tools'")
+    _dv = _dr["value"] if _dr else None
+    disabled = set(_j.loads(_dv) if isinstance(_dv, str) else list(_dv or []))
+
     tool_list = []
     for name, tool in _mcp._tool_manager._tools.items():
         group, desc_short = _MCP_GROUPS.get(name, ("Other", ""))
@@ -6719,13 +6735,113 @@ async def admin_mcp_tools(_=Depends(_require_key)):
             "name": name,
             "group": group,
             "description": desc_short or doc,
+            "enabled": name not in disabled,
         })
-    # Sort by group then name
     tool_list.sort(key=lambda x: (x["group"], x["name"]))
     groups = {}
     for t in tool_list:
         groups.setdefault(t["group"], []).append(t)
-    return {"ok": True, "count": len(tool_list), "groups": groups}
+    return {"ok": True, "count": len(tool_list), "groups": groups,
+            "disabled": list(disabled)}
+
+
+@app.post("/admin/api/mcp/tools/{name}/toggle")
+async def mcp_tool_toggle(name: str, _=Depends(_require_key)):
+    """Toggle a tool's enabled/disabled state (persisted in user_config)."""
+    import json as _j
+    async with _db_pool.acquire() as _dc:
+        _dr = await _dc.fetchrow("SELECT value FROM user_config WHERE key='disabled_mcp_tools'")
+    _dv = _dr["value"] if _dr else None
+    disabled = list(_j.loads(_dv) if isinstance(_dv, str) else list(_dv or []))
+    if name in disabled:
+        disabled.remove(name)
+        now_enabled = True
+    else:
+        disabled.append(name)
+        now_enabled = False
+    async with _db_pool.acquire() as _dc:
+        await _dc.execute(
+            "INSERT INTO user_config(key,value,updated_at) VALUES('disabled_mcp_tools',$1::jsonb,NOW()) "
+            "ON CONFLICT(key) DO UPDATE SET value=$1::jsonb, updated_at=NOW()",
+            _j.dumps(disabled)
+        )
+    return {"ok": True, "name": name, "enabled": now_enabled, "disabled_count": len(disabled)}
+
+
+# ── R2 cloud backup ────────────────────────────────────────────────────────────
+
+async def _r2_upload(key: str, data: bytes, content_type: str = "application/octet-stream") -> bool:
+    """Upload bytes to Cloudflare R2. Returns True on success."""
+    import json as _j
+    try:
+        async with _db_pool.acquire() as _rc:
+            _rrows = {r["key"]: r["value"] for r in await _rc.fetch(
+                "SELECT key,value FROM gateway_config WHERE key LIKE 'r2_%'")}
+        if _rrows.get("r2_enabled") != "true":
+            return False
+        _acid = _rrows.get("r2_account_id", "")
+        _akey = _rrows.get("r2_access_key", "")
+        _skey = _rrows.get("r2_secret_key", "")
+        _bkt  = _rrows.get("r2_bucket", "")
+        if not all([_acid, _akey, _skey, _bkt]):
+            return False
+        import boto3, asyncio as _aio
+        from botocore.config import Config as _BConf
+        _s3 = boto3.client(
+            service_name="s3",
+            endpoint_url=f"https://{_acid}.r2.cloudflarestorage.com",
+            aws_access_key_id=_akey,
+            aws_secret_access_key=_skey,
+            region_name="auto",
+            config=_BConf(signature_version="s3v4"),
+        )
+        _loop = _aio.get_event_loop()
+        await _loop.run_in_executor(None, lambda: _s3.put_object(
+            Bucket=_bkt, Key=key, Body=data, ContentType=content_type
+        ))
+        print(f"[r2] uploaded {key} ({len(data)} bytes)", flush=True)
+        return True
+    except Exception as _re:
+        print(f"[r2] upload error: {_re}", flush=True)
+        return False
+
+
+@app.get("/admin/api/backup/r2/status")
+async def r2_status(_=Depends(_require_key)):
+    """Return R2 configuration status (no secrets exposed)."""
+    async with _db_pool.acquire() as conn:
+        _rrows = {r["key"]: r["value"] for r in await conn.fetch(
+            "SELECT key,value FROM gateway_config WHERE key LIKE 'r2_%'")}
+    _acid = _rrows.get("r2_account_id", "")
+    configured = all([_acid, _rrows.get("r2_access_key"), _rrows.get("r2_secret_key"), _rrows.get("r2_bucket")])
+    return {
+        "configured": configured,
+        "enabled":    _rrows.get("r2_enabled") == "true",
+        "bucket":     _rrows.get("r2_bucket", ""),
+        "account_id_hint": (_acid[:6] + "…") if _acid else "",
+    }
+
+@app.post("/admin/api/backup/r2/config")
+async def r2_config(body: dict, _=Depends(_require_key)):
+    """Save R2 credentials to gateway_config."""
+    allowed = {"r2_account_id", "r2_access_key", "r2_secret_key", "r2_bucket", "r2_enabled"}
+    async with _db_pool.acquire() as conn:
+        for k, v in body.items():
+            if k in allowed:
+                await conn.execute(
+                    "INSERT INTO gateway_config(key,value) VALUES($1,$2) "
+                    "ON CONFLICT(key) DO UPDATE SET value=$2", k, str(v))
+    return {"ok": True}
+
+@app.post("/admin/api/backup/r2/test")
+async def r2_test(_=Depends(_require_key)):
+    """Upload a small test file to R2 to verify connectivity."""
+    import json as _j
+    data = _j.dumps({"test": True, "ts": datetime.utcnow().isoformat()}).encode()
+    ok = await _r2_upload("_test/ping.json", data, "application/json")
+    if ok:
+        return {"ok": True, "message": "R2 connection successful ✓"}
+    raise HTTPException(500, "R2 upload failed — check credentials or enable flag")
 
 
 @app.get("/admin/api/telegram/status")

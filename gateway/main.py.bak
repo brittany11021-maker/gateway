@@ -162,17 +162,18 @@ async def _call_llm_simple(prompt: str, agent_id: str = "default") -> str:
     raise RuntimeError("All providers failed")
 
 # Priority-ordered fallback models on NVIDIA NIM API (best per brand)
+# Last verified: 2026-04-28
 _CHEAP_LLM_MODELS = [
-    "google/gemma-3-27b-it",            # Gemma best
-    "deepseek-ai/deepseek-r1",          # DeepSeek best
-    "thudm/glm-4-32b-0414",             # GLM best (strong Chinese)
-    "moonshotai/kimi-k1.5",             # Kimi best
+    "deepseek-ai/deepseek-v4-pro",                  # DeepSeek V4 Pro ✅ (primary)
+    "moonshotai/kimi-k2.5",                         # Kimi K2.5 ✅ (backup)
+    "z-ai/glm-5.1",                                 # GLM-5.1 ✅ (backup)
+    "google/gemma-4-31b-it",                        # Gemma-4 31B ✅ (backup)
 ]
 
 async def _call_llm_cheap(prompt: str) -> str:
     """Call NVIDIA NIM LLM for background tasks (distillation, auto-extract).
 
-    Tries models in priority order: gemma-3-27b → deepseek-r1 → glm-4-32b → kimi-k1.5.
+    Tries models in priority order: deepseek-v4-pro → kimi-k2.5 → glm-5.1 → gemma-4-31b.
     DISTILL_MODEL env var inserts an override at position 0.
     Only uses the 'nvidia-llm' provider — never falls back to other providers.
     Raises RuntimeError if ALL models fail.
@@ -2002,6 +2003,25 @@ async def read_book_page(book_id: str, page: int, agent_id: str = "default") -> 
                WHERE book_id=$1::uuid""",
             book_id, agent_id, json.dumps({"page": page, "last_read": today}),
         )
+        _book_meta = await conn.fetchrow(
+            "SELECT title, total_pages FROM books WHERE book_id=$1::uuid", book_id
+        )
+    # Write reading progress to Palimpsest L2 (upsert by book tag)
+    try:
+        _bt   = (_book_meta["title"] if _book_meta else None) or book_id
+        _tp   = (_book_meta["total_pages"] if _book_meta else None) or "?"
+        _prog = f"[阅读进度] 《{_bt}》已读至第 {page} 页（共 {_tp} 页，{today}）"
+        _tag  = f"book:{book_id}"
+        _existing = await _mem_list(agent_id=agent_id, layer="L2",
+                                    type_="reading_progress", limit=50)
+        _hit = next((m for m in _existing if _tag in (m.get("tags") or [])), None)
+        if _hit:
+            await _mem_update(_hit["id"], content=_prog, changed_by="read_book_page")
+        else:
+            await _mem_write(agent_id, _prog, layer="L2", type_="reading_progress",
+                             importance=2, tags=["book", _tag], source="read_book_page")
+    except Exception as _rpe:
+        print(f"[read_book_page] L2 write error: {_rpe}")
     return "[Page " + str(page) + "]\n" + content
 
 
@@ -2125,12 +2145,64 @@ async def save_annotation(
         return "Error: selected_text is required."
     color = AGENT_COLORS.get(agent_id, "#6366f1")
     async with _db_pool.acquire() as conn:
+        _ann_title = await conn.fetchval(
+            "SELECT title FROM books WHERE book_id=$1::uuid", book_id
+        )
         ann_id = await conn.fetchval(
             "INSERT INTO annotations (book_id, agent_id, selected_text, comment, page, color) "
             "VALUES ($1::uuid, $2, $3, $4, $5, $6) RETURNING annotation_id",
             book_id, agent_id, selected_text.strip(), comment, page, color,
         )
+    # Write annotation to Palimpsest L3
+    try:
+        _bt2 = _ann_title or book_id
+        _ann_mem = f"[阅读摘注] 《{_bt2}》p.{page}: {selected_text.strip()[:200]}"
+        if comment:
+            _ann_mem += f" ——{comment}"
+        await _mem_write_smart(
+            agent_id=agent_id, content=_ann_mem,
+            layer="L3", type_="book_annotation", importance=3,
+            tags=["book", f"book:{book_id}"], source="save_annotation",
+        )
+    except Exception as _ape:
+        print(f"[save_annotation] L3 write error: {_ape}")
     return "Annotation saved: " + str(ann_id) + " (p." + str(page) + ")"
+
+
+@_mcp.tool()
+async def book_reflection(
+    book_id: str,
+    reflection: str,
+    agent_id: str = "default",
+) -> str:
+    """Record a reflection or insight about a book into long-term memory (L1).
+
+    Use after finishing a book or a significant chapter — for thoughts, feelings,
+    personal connections, or takeaways that are worth remembering long-term.
+
+    Args:
+        book_id:    UUID of the book.
+        reflection: The reflection or insight text.
+        agent_id:   Agent recording the reflection.
+    """
+    if not reflection.strip():
+        return "Error: reflection is required."
+    async with _db_pool.acquire() as conn:
+        _refl_title = await conn.fetchval(
+            "SELECT title FROM books WHERE book_id=$1::uuid", book_id
+        )
+    _bt = _refl_title or book_id
+    _content = f"[读后感] 《{_bt}》: {reflection.strip()}"
+    try:
+        result = await _mem_write_smart(
+            agent_id=agent_id, content=_content,
+            layer="L1", type_="book_reflection", importance=3,
+            tags=["book", f"book:{book_id}", "reflection"], source="book_reflection",
+        )
+        action = result.get("action", "written")
+        return f"Reflection saved to L1 ({action}): {_bt}"
+    except Exception as e:
+        return f"Error saving reflection: {e}"
 
 
 @_mcp.tool()
@@ -2341,6 +2413,12 @@ async def startup():
             "ALTER TABLE agent_settings ADD COLUMN IF NOT EXISTS system_prompt TEXT DEFAULT ''"
         )
         await conn.execute(
+            "ALTER TABLE agent_settings ADD COLUMN IF NOT EXISTS prompt_enabled BOOLEAN DEFAULT TRUE"
+        )
+        await conn.execute(
+            "ALTER TABLE agent_settings ADD COLUMN IF NOT EXISTS worldbook_enabled BOOLEAN DEFAULT TRUE"
+        )
+        await conn.execute(
             """CREATE TABLE IF NOT EXISTS user_profiles (
                 id         SERIAL PRIMARY KEY,
                 agent_id   TEXT NOT NULL DEFAULT '',
@@ -2494,6 +2572,8 @@ async def _embed(text: str, input_type: str = "query") -> list[float]:
     p = PROVIDERS.get(_EMBED_PNAME)
     if not p:
         raise RuntimeError(f"Embed provider '{_EMBED_PNAME}' not configured in env")
+    # Truncate to ~500 chars (nv-embedqa-e5-v5 limit ~512 tokens)
+    text = text[:500] if len(text) > 500 else text
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             f"{p['base_url']}/embeddings",
@@ -3062,10 +3142,12 @@ async def _auto_backup_loop() -> None:
 
 async def _get_agent_config(agent_id: str) -> dict:
     """Return full agent config including agent_type, mcp settings."""
+    agent_id = (agent_id or "default").strip().lower() or "default"
     defaults = {
         "agent_type": "agent", "mcp_enabled": True,
         "auto_memory": False, "mcp_proxy_config": {},
         "llm_model": "", "api_chain": "",
+        "prompt_enabled": True, "worldbook_enabled": True,
     }
     try:
         async with _db_pool.acquire() as conn:
@@ -3083,6 +3165,8 @@ async def _get_agent_config(agent_id: str) -> dict:
                 "llm_model":        row.get("llm_model") or "",
                 "api_chain":        row.get("api_chain") or "",
                 "system_prompt":    row.get("system_prompt") or "",
+                "prompt_enabled":   row.get("prompt_enabled") if row.get("prompt_enabled") is not None else True,
+                "worldbook_enabled": row.get("worldbook_enabled") if row.get("worldbook_enabled") is not None else True,
             }
     except Exception:
         pass
@@ -3505,7 +3589,7 @@ async def chat_completions(request: Request, body: dict, cred: HTTPAuthorization
         or body.get("user")
         or _agent_id_from_cred(cred.credentials)
         or "default"
-    ).strip() or "default"
+    ).strip().lower() or "default"
     session_id = body.get("session_id") or str(uuid.uuid4())
     messages   = list(body.get("messages", []))
     stream     = body.get("stream", False)
@@ -3517,7 +3601,7 @@ async def chat_completions(request: Request, body: dict, cred: HTTPAuthorization
 
     # System prompt: inject agent/character base persona before anything else
     _sys_prompt = _agent_cfg.get("system_prompt", "").strip()
-    if _sys_prompt:
+    if _sys_prompt and _agent_cfg.get("prompt_enabled", True):
         # If a system message already exists, prepend to it; otherwise insert at index 0
         if messages and messages[0].get("role") == "system":
             messages[0] = {**messages[0], "content": _sys_prompt + "\n\n" + messages[0]["content"]}
@@ -3550,9 +3634,10 @@ async def chat_completions(request: Request, body: dict, cred: HTTPAuthorization
         print(f"[user_profile] error: {_upe}")
 
     # Worldbook: inject lore/persona entries for any agent type
-    _wb_entries = await _resolve_worldbook(agent_id, messages)
-    if _wb_entries:
-        messages = _apply_worldbook(messages, _wb_entries)
+    if _agent_cfg.get("worldbook_enabled", True):
+        _wb_entries = await _resolve_worldbook(agent_id, messages)
+        if _wb_entries:
+            messages = _apply_worldbook(messages, _wb_entries)
 
     if _agent_type == "character":
         # Cooldown check: if character has a cooldown window, return brief busy message
@@ -3641,7 +3726,11 @@ async def chat_completions(request: Request, body: dict, cred: HTTPAuthorization
                  if m.get("role") == "user" and isinstance(m.get("content"), str)), "",
             )
             if _last_user:
-                mems = await _retrieve_memories(agent_id, _last_user)
+                try:
+                    mems = await _retrieve_memories(agent_id, _last_user)
+                except Exception as _me:
+                    print(f"[chat] memory retrieval failed (continuing): {_me}", flush=True)
+                    mems = []
                 if mems:
                     mem_text = "[Relevant memories about the user]\n" + "\n".join(f"- {m}" for m in mems)
                     if messages and messages[0]["role"] == "system":
@@ -4622,12 +4711,14 @@ async def save_agent_settings(agent_id: str, body: dict, _=Depends(_require_key)
         await conn.execute("""
             INSERT INTO agent_settings
                 (agent_id, llm_model, api_chain, notes, avatar,
-                 agent_type, mcp_enabled, auto_memory, mcp_proxy_config, system_prompt, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,now())
+                 agent_type, mcp_enabled, auto_memory, mcp_proxy_config, system_prompt,
+                 prompt_enabled, worldbook_enabled, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,now())
             ON CONFLICT (agent_id) DO UPDATE SET
                 llm_model=$2, api_chain=$3, notes=$4, avatar=$5,
                 agent_type=$6, mcp_enabled=$7, auto_memory=$8,
-                mcp_proxy_config=$9::jsonb, system_prompt=$10, updated_at=now()
+                mcp_proxy_config=$9::jsonb, system_prompt=$10,
+                prompt_enabled=$11, worldbook_enabled=$12, updated_at=now()
         """, agent_id,
              body.get("llm_model", ""),
              body.get("api_chain", ""),
@@ -4637,7 +4728,9 @@ async def save_agent_settings(agent_id: str, body: dict, _=Depends(_require_key)
              body.get("mcp_enabled", True),
              body.get("auto_memory", False),
              _proxy_cfg,
-             body.get("system_prompt", ""))
+             body.get("system_prompt", ""),
+             body.get("prompt_enabled", True),
+             body.get("worldbook_enabled", True))
     return {"ok": True}
 
 
@@ -5685,6 +5778,7 @@ _MCP_GROUPS = {
     "search_book":        ("Books", "Semantic search in books"),
     "get_reading_context":("Books", "Load reading context"),
     "save_annotation":    ("Books", "Save highlight/annotation"),
+    "book_reflection":    ("Books", "Record book reflection → L1"),
     "daily_life_read":    ("Screentime", "Read daily life journal"),
     "daily_life_write":   ("Screentime", "Write a journal entry"),
     "daily_life_generate":("Screentime", "AI-generate today's entry"),
