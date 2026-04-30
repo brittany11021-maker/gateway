@@ -17,12 +17,12 @@
 | Telegram / Bark 推送 | ✅ 已有 | telegram_send / bark_push MCP |
 | 凌晨 nightly loop（00:10 UTC） | ✅ 已有 | _nightly_character_loop |
 | 梦境 30% 注入 | ✅ 已有 | _process_character_mcp |
-| 屏幕时间活动接收 + 注入 | ❌ 缺失 | — |
-| Layer 3 触景生情主动消息 | ❌ 缺失 | — |
-| 分类消息冷却 | ❌ 缺失 | 仅有全局 cooldown_minutes |
-| 用户环境感知配置（路况/位置隐私） | ❌ 缺失 | — |
-| daily_life_generate 当日天气上下文 | ❌ 缺失 | 生成时不含实时天气 |
-| 日常骨架模板（occupation/habits） | ❌ 缺失 | — |
+| 屏幕时间活动接收 + 注入 | ✅ 已有 | /api/activity + memory_surface |
+| Layer 3 触景生情主动消息 | ✅ 已有 | _check_proactive_triggers |
+| 分类消息冷却 | ✅ 已有 | message_cooldown 表 + cooldown_gate |
+| 用户环境感知配置（路况/位置隐私） | ✅ 已有 | user_context + show_location + amap_route |
+| daily_life_generate 当日天气上下文 | ✅ 已有 | user_context.location.city |
+| 日常骨架模板（occupation/habits） | ✅ 已有 | daily_skeleton user_config key |
 
 ---
 
@@ -294,17 +294,17 @@ Yesterday's carry-over: {carry_over}."
 ```
 Week 1 (核心链路):
   [x] M3 分类冷却表 + _cooldown_check_and_set (memory_db.py ~30行)
-  [ ] M1 activity_events 表 + POST /api/activity 端点 (main.py ~60行)
-  [ ] M1 memory_surface 注入活动 (main.py ~20行)
-  [ ] M5 daily_life_generate 加天气 + carry_over 改进
+  [x] M1 activity_events 表 + POST /api/activity 端点 (main.py ~60行)
+  [x] M1 memory_surface 注入活动 (main.py ~20行)
+  [x] M5 daily_life_generate 加天气 + carry_over 改进
 
 Week 2 (主动消息):
-  [ ] M2 _check_proactive_triggers (main.py ~60行)
-  [ ] 接入 nightly loop after daily_life_generate
-  [ ] M1 推送规则引擎 (main.py ~50行)
+  [x] M2 _check_proactive_triggers (main.py ~60行)
+  [x] 接入 nightly loop after daily_life_generate
+  [x] M1 推送规则引擎 (main.py ~50行)
 
 Week 3 (配置化):
-  [ ] M4 user_context config 读取 + 路况注入
+  [x] M4 user_context config 读取 + 路况注入 (show_location + commute routes)
   [ ] Admin UI：activity_rules 编辑、daily_skeleton 配置
   [ ] NPC 自动生成（auto mode，无需手动配置名字）
 ```
