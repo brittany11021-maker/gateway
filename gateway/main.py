@@ -1914,7 +1914,8 @@ async def daily_life_generate(
         async with _db_pool.acquire() as _wconn:
             _uc_row = await _wconn.fetchrow(
                 "SELECT value FROM user_config WHERE key='user_context'")
-        _uc = dict(_uc_row["value"]) if _uc_row and _uc_row["value"] else {}
+        _v = _uc_row["value"] if _uc_row else None
+        _uc = (_v if isinstance(_v, dict) else __import__("json").loads(_v)) if _v else {}
         _city = (_uc.get("location") or {}).get("city", "")
         _w = await amap_weather(_city)  # empty string → amap uses IP (fallback)
         if _w and not _w.startswith("Error") and not _w.startswith("Weather error"):
@@ -1929,7 +1930,8 @@ async def daily_life_generate(
             _sk_row = await _sc.fetchrow(
                 "SELECT value FROM user_config WHERE key='daily_skeleton'")
         if _sk_row:
-            _sk = dict(_sk_row["value"]) if _sk_row["value"] else {}
+            _skv = _sk_row["value"]
+            _sk = (_skv if isinstance(_skv, dict) else __import__("json").loads(_skv)) if _skv else {}
             _parts = []
             if _sk.get("template"):    _parts.append(f"lifestyle: {_sk['template']}")
             if _sk.get("work_style"):  _parts.append(f"work style: {_sk['work_style']}")
@@ -3765,20 +3767,42 @@ async def _proxy_call_tool(
                     parts.append(npc_summary)
             except Exception:
                 pass
-            # Auto-inject weather — city from user_config (avoids VPN IP drift)
+            # Auto-inject weather + traffic — from user_config (M4)
             try:
                 async with _db_pool.acquire() as _wc:
-                    _ds_row = await _wc.fetchrow(
-                        "SELECT value FROM user_config WHERE key='data_sources'")
                     _uc_row = await _wc.fetchrow(
                         "SELECT value FROM user_config WHERE key='user_context'")
-                _ds = dict(_ds_row["value"]) if _ds_row else {}
-                _uc = dict(_uc_row["value"]) if _uc_row else {}
-                _city = (_uc.get("location") or {}).get("city", "")
+                _ucv = _uc_row["value"] if _uc_row else None
+                _uc = (_ucv if isinstance(_ucv, dict) else __import__("json").loads(_ucv)) if _ucv else {}
+                _loc     = _uc.get("location") or {}
+                _city    = _loc.get("city", "")
+                _show_loc = _loc.get("show_location", True)
+                _ds      = _uc.get("data_sources") or {}
+                _commute = _uc.get("commute") or {}
+                # Weather
                 if _ds.get("weather", False):
                     _weather = await amap_weather(_city)
                     if _weather and not _weather.startswith("Error") and not _weather.startswith("Weather error"):
+                        if not _show_loc and " | " in _weather:
+                            # Strip leading "城市名 | " — split on first separator
+                            _weather = _weather.split(" | ", 1)[1]
                         parts.append(f"🌤 天气：{_weather}")
+
+                # Traffic (commute routes)
+                if _ds.get("traffic", False) and _commute.get("enabled") and _commute.get("routes"):
+                    _route_lines = []
+                    for _route_str in _commute["routes"][:3]:  # max 3 routes
+                        _segs = [s.strip() for s in str(_route_str).replace("→", "→").split("→") if s.strip()]
+                        if len(_segs) < 2:
+                            continue
+                        try:
+                            _rt = await amap_route(_segs[0], _segs[1], city=_city)
+                            if _rt and not _rt.startswith("Route error") and not _rt.startswith("Error"):
+                                _route_lines.append(f"  {_rt}")
+                        except Exception:
+                            continue
+                    if _route_lines:
+                        parts.append("🚗 路况：\n" + "\n".join(_route_lines))
             except Exception:
                 pass
             # Activity injection — recent 4h app usage (if any reported)
