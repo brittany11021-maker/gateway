@@ -83,8 +83,7 @@ from memory_db import (
     l5_list as _l5_list, l5_cleanup as _l5_cleanup,
 )
 from memory_db import (
-    l5_write as _l5_write, l5_search as _l5_search,
-    l5_list as _l5_list, l5_cleanup as _l5_cleanup,
+    cooldown_check as _cd_check, cooldown_set as _cd_set, cooldown_gate as _cd_gate,
 )
 
 
@@ -1662,6 +1661,52 @@ async def character_state_set(
     if cooldown_minutes is not None: kwargs["cooldown_minutes"] = max(0, cooldown_minutes)
     s = await _state_set(agent_id, **kwargs)
     return f"State updated for {agent_id}: mood={s['mood_label']} ({s['mood_score']:+d}), fatigue={s['fatigue']}, scene={s['scene']}"
+
+
+@_mcp.tool()
+async def message_cooldown_check(
+    agent_id: str = "default",
+    category: str = "casual",
+    seconds: int = -1,
+) -> str:
+    """Check whether a message category is off cooldown (safe to send).
+
+    Categories and default durations:
+      casual           — 3600s  (1 h)  — general chat, passing thoughts
+      weather          — 86400s (24 h) — weather-related messages
+      game_check       — 7200s  (2 h)  — screen-time / gaming nag
+      late_night       — 28800s (8 h)  — sleep reminder
+      proactive_casual — 14400s (4 h)  — triggered "thinking of you" messages
+      reminder         — 0s            — always allowed (explicit reminders)
+
+    Args:
+        agent_id: Character agent ID.
+        category: Cooldown category (see above).
+        seconds:  Override duration in seconds. -1 = use default for category.
+
+    Returns "ok" if allowed, "cooldown" if still waiting.
+    """
+    secs = None if seconds < 0 else seconds
+    allowed = await _cd_check(agent_id, category, secs)
+    return "ok" if allowed else "cooldown"
+
+
+@_mcp.tool()
+async def message_cooldown_set(
+    agent_id: str = "default",
+    category: str = "casual",
+) -> str:
+    """Record that a message was just sent in *category*, starting its cooldown.
+
+    Call this AFTER sending the message (Telegram or Bark).
+
+    Args:
+        agent_id: Character agent ID.
+        category: Cooldown category (casual | weather | game_check | late_night |
+                  proactive_casual | reminder).
+    """
+    await _cd_set(agent_id, category)
+    return f"Cooldown started for {agent_id}/{category}"
 
 
 @_mcp.tool()

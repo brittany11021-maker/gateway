@@ -1077,6 +1077,23 @@ CREATE TABLE IF NOT EXISTS npcs (
     created_at       TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_npcs_agent ON npcs (agent_id);
+
+CREATE TABLE IF NOT EXISTS message_cooldown (
+    agent_id    TEXT NOT NULL,
+    category    TEXT NOT NULL,   -- casual | weather | game_check | late_night | proactive_casual | ...
+    last_sent   TEXT NOT NULL,   -- ISO8601 UTC
+    PRIMARY KEY (agent_id, category)
+);
+
+CREATE TABLE IF NOT EXISTS activity_events (
+    id               TEXT PRIMARY KEY,
+    agent_id         TEXT NOT NULL,
+    app              TEXT NOT NULL,
+    category         TEXT DEFAULT '',   -- 聊天 | 游戏 | 娱乐 | 工作 | 学习 | 其他
+    duration_minutes INTEGER DEFAULT 0,
+    reported_at      TEXT NOT NULL      -- ISO8601 UTC
+);
+CREATE INDEX IF NOT EXISTS idx_activity_agent ON activity_events(agent_id, reported_at);
 """
 
 _P1_SEED = [
@@ -1183,6 +1200,29 @@ async def _ensure_p1_tables(db) -> None:
                 "INSERT INTO random_events (id, agent_id, scene, content, level, weight) VALUES (?,?,?,?,?,?)",
                 (str(_uuid2.uuid4()), "", scene, content, level, float(weight)),
             )
+    # Ensure message_cooldown + activity_events exist (migration-safe for existing DBs)
+    try:
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS message_cooldown (
+                agent_id  TEXT NOT NULL,
+                category  TEXT NOT NULL,
+                last_sent TEXT NOT NULL,
+                PRIMARY KEY (agent_id, category)
+            );
+            CREATE TABLE IF NOT EXISTS activity_events (
+                id               TEXT PRIMARY KEY,
+                agent_id         TEXT NOT NULL,
+                app              TEXT NOT NULL,
+                category         TEXT DEFAULT '',
+                duration_minutes INTEGER DEFAULT 0,
+                reported_at      TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_activity_agent
+                ON activity_events(agent_id, reported_at);
+        """)
+        await db.commit()
+    except Exception:
+        pass
     await db.commit()
     _p1_initialized = True
 
@@ -1260,6 +1300,75 @@ async def state_cooldown_active(agent_id: str) -> bool:
         return delta < row["cooldown_minutes"]
     except Exception:
         return False
+
+
+# ── Per-category Message Cooldown ────────────────────────────────────────────
+
+# Default cooldown durations in seconds
+_COOLDOWN_DEFAULTS: dict[str, int] = {
+    "casual":           3600,    # 1 hour
+    "weather":          86400,   # 24 hours — one weather push per day
+    "game_check":       7200,    # 2 hours
+    "late_night":       28800,   # 8 hours — don't nag all night
+    "proactive_casual": 14400,   # 4 hours
+    "reminder":         0,       # no cooldown for explicit reminders
+}
+
+
+async def cooldown_check(agent_id: str, category: str,
+                         seconds: int | None = None) -> bool:
+    """Return True if a message in *category* can be sent (cooldown expired or never set).
+
+    Does NOT update last_sent — call cooldown_set() separately if you decide to send.
+    seconds: override the default cooldown duration; None = use _COOLDOWN_DEFAULTS.
+    """
+    if seconds is None:
+        seconds = _COOLDOWN_DEFAULTS.get(category, 3600)
+    if seconds == 0:
+        return True
+    db = await get_db()
+    await _ensure_p1_tables(db)
+    cur = await db.execute(
+        "SELECT last_sent FROM message_cooldown WHERE agent_id=? AND category=?",
+        (agent_id, category),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return True
+    import datetime as _dtc
+    try:
+        last = _dtc.datetime.fromisoformat(row["last_sent"].replace("Z", "+00:00").split("+")[0])
+        elapsed = (_dtc.datetime.utcnow() - last).total_seconds()
+        return elapsed >= seconds
+    except Exception:
+        return True
+
+
+async def cooldown_set(agent_id: str, category: str) -> None:
+    """Record that a message in *category* was just sent (updates last_sent to now)."""
+    db = await get_db()
+    await _ensure_p1_tables(db)
+    now = _now()
+    await db.execute(
+        "INSERT INTO message_cooldown (agent_id, category, last_sent) VALUES (?,?,?) "
+        "ON CONFLICT(agent_id, category) DO UPDATE SET last_sent=excluded.last_sent",
+        (agent_id, category, now),
+    )
+    await db.commit()
+
+
+async def cooldown_gate(agent_id: str, category: str,
+                        seconds: int | None = None) -> bool:
+    """Check and atomically claim the cooldown slot.
+
+    Returns True (and sets last_sent) if the message is allowed.
+    Returns False if still in cooldown — does NOT update last_sent.
+    Combines cooldown_check + cooldown_set in one call for the common pattern.
+    """
+    ok = await cooldown_check(agent_id, category, seconds)
+    if ok:
+        await cooldown_set(agent_id, category)
+    return ok
 
 
 # ── Random Events ────────────────────────────────────────────────────────────
