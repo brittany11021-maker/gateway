@@ -5301,10 +5301,24 @@ async def _evening_push_for_agent(agent_id: str) -> None:
 
     # Scenario B: user likely already asleep → don't send, write diary note
     if sleep_prob >= 0.50 and not same_tz:
-        # 15% chance to mention "想说晚安但没打扰" in tomorrow's morning push
+        # Always write to diary (daily_events) — spec §3.3
+        try:
+            import datetime as _dtsc
+            _diary_text = "今晚想跟你说晚安，但你好像已经睡了，就没打扰。"
+            await _daily_write(
+                agent_id=agent_id,
+                summary=_diary_text,
+                time_of_day="night",
+                mood="tender",
+                source="scene_b",
+                date=_dtsc.datetime.utcnow().strftime("%Y-%m-%d"),
+            )
+        except Exception as _dwe:
+            print(f"[evening_push] diary write error: {_dwe}", flush=True)
+        # 15% chance to mention it in tomorrow's morning push (via scene_note)
         if _rne.random() < 0.15:
             await _state_set(agent_id, scene_note="昨晚想跟你说晚安，看你应该睡了就没打扰")
-        print(f"[evening_push] {agent_id}: user likely asleep (p={sleep_prob:.2f}), skipped", flush=True)
+        print(f"[evening_push] {agent_id}: user likely asleep (p={sleep_prob:.2f}), skipped+diary", flush=True)
         return
 
     # Scenario A/C: send goodnight
