@@ -4858,9 +4858,11 @@ async def _health_mcp_get(path: str) -> dict | None:
     base = _osh.getenv("HEALTH_MCP_URL", "").rstrip("/")
     if not base:
         return None
+    api_key = _osh.getenv("HEALTH_API_KEY", "")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
         async with httpx.AsyncClient(timeout=8) as _cl:
-            resp = await _cl.get(f"{base}{path}")
+            resp = await _cl.get(f"{base}{path}", headers=headers)
         if resp.status_code == 200:
             return resp.json()
     except Exception as _he:
@@ -4878,7 +4880,8 @@ async def _health_monitor_loop() -> None:
                 await asyncio.sleep(3600)
                 continue
             cfg  = await _get_health_config()
-            if not cfg.get("enabled"):
+            # Auto-enable when HEALTH_MCP_URL is set (env overrides DB config)
+            if not cfg.get("enabled") and not _osh2.getenv("HEALTH_MCP_URL"):
                 await asyncio.sleep(1800)
                 continue
             if await _check_quiet_hours():
@@ -4956,6 +4959,106 @@ async def _health_monitor_loop() -> None:
                                 ok = await _push_send(msg, category="health_steps")
                                 await _push_log_write(aid, "health_steps_sedentary",
                                                        "health_monitor", msg, ok)
+
+            # ── Sleep quality check (once daily ~09:00 CST = 01:xx UTC) ────────
+            sleep_cfg = cfg.get("sleep", {})
+            if sleep_cfg.get("enabled"):
+                import datetime as _dthsl
+                import random as _rndsl
+                _hu = _dthsl.datetime.utcnow().hour
+                if 1 <= _hu <= 2 and _rndsl.random() < 0.5:
+                    data = await _health_mcp_get("/metrics/sleep/last_night")
+                    if data and data.get("value") is not None:
+                        hrs = float(data["value"])
+                        poor_thr = sleep_cfg.get("poor_threshold_hours", 5)
+                        if hrs < poor_thr and await _cd_gate(aid, "health_sleep_poor", 86400):
+                            _hs3 = await _get_agent_settings(aid)
+                            _sp3 = (_hs3.get("system_prompt") or "").strip()
+                            _slp_prompt = (
+                                "昨晚睡得很少，用角色口吻说一句关心的话，"
+                                "提醒好好休息（不超过20字，不提具体时长）："
+                            )
+                            if _sp3:
+                                _slp_prompt = f"你是：{_sp3[:200]}\n\n" + _slp_prompt
+                            msg = (await _call_llm_route("proactive_push", _slp_prompt)).strip().strip("\"'")
+                            if msg:
+                                ok = await _push_send(msg, category="health_sleep")
+                                await _push_log_write(aid, "health_sleep_poor",
+                                                       "health_monitor", msg, ok)
+                        # Sleep affects fatigue and mood_valence
+                        from memory_db import accumulate_state as _acc_st
+                        if hrs < poor_thr:
+                            await _acc_st(aid, {"fatigue": 15, "mood_valence": -0.1})
+                        elif hrs >= 7:
+                            await _acc_st(aid, {"fatigue": -10, "mood_valence": 0.05})
+
+            # ── Menstrual cycle check (once daily ~08:00 CST = 00:xx UTC) ────
+            men_cfg = cfg.get("menstrual", {})
+            if men_cfg.get("enabled"):
+                import datetime as _dthm
+                import random as _rndm
+                _hm2 = _dthm.datetime.utcnow().hour
+                if 0 <= _hm2 <= 1 and _rndm.random() < 0.5:
+                    data = await _health_mcp_get("/metrics/menstrual/current")
+                    if data and data.get("phase"):
+                        phase     = data["phase"]
+                        npd       = int(data.get("next_period_days", 99))
+                        remind_bf = men_cfg.get("remind_days_before", 3)
+                        day_in    = int(data.get("day_in_cycle", 0))
+
+                        prompt = None
+                        cd_key = None
+
+                        # Upcoming period reminder (3 days before)
+                        if phase == "luteal" and 1 <= npd <= remind_bf:
+                            if await _cd_gate(aid, f"health_men_remind_{npd}d", 86400):
+                                prompt = (
+                                    f"用户大概{npd}天后来月经，用角色口吻自然地说一句体贴的话"
+                                    "（不提数字，不超过20字）："
+                                )
+                                cd_key = f"health_men_remind_{npd}d"
+
+                        # Period day 1 — first-day care
+                        elif phase == "period" and day_in == 1:
+                            if await _cd_gate(aid, "health_men_day1", 86400):
+                                prompt = (
+                                    "用户今天月经来了，用角色口吻说一句关心的话"
+                                    "（温柔体贴，不超过25字）："
+                                )
+                                cd_key = "health_men_day1"
+
+                        # During period — 30% daily care
+                        elif phase == "period" and day_in > 1 and _rndm.random() < 0.30:
+                            if await _cd_gate(aid, "health_men_daily", 86400):
+                                prompt = (
+                                    "用户正在经期，用角色口吻随口说一句关心的话"
+                                    "（自然，不刻意，不超过20字）："
+                                )
+                                cd_key = "health_men_daily"
+
+                        # Period overdue by 7+ days — cautious mention
+                        elif phase == "luteal" and npd <= 0 and abs(npd) >= 7:
+                            if await _cd_gate(aid, "health_men_overdue", 86400 * 3):
+                                prompt = (
+                                    "用户月经可能推迟了，用角色口吻谨慎关心一句"
+                                    "（轻描淡写，不超过20字）："
+                                )
+                                cd_key = "health_men_overdue"
+
+                        if prompt and cd_key:
+                            _hsm = await _get_agent_settings(aid)
+                            if (_hsm.get("system_prompt") or "").strip():
+                                prompt = f"你是：{_hsm['system_prompt'][:200]}\n\n" + prompt
+                            msg = (await _call_llm_route("proactive_push", prompt)).strip().strip("\"'")
+                            if msg:
+                                ok = await _push_send(msg, category="health_menstrual")
+                                await _push_log_write(aid, cd_key, "health_monitor", msg, ok)
+
+                        # Period affects mood and fatigue
+                        from memory_db import accumulate_state as _acc_stm
+                        if phase == "period":
+                            await _acc_stm(aid, {"fatigue": 3, "mood_valence": -0.05,
+                                                  "extra_patient": 2, "extra_caring": 2})
 
         except Exception as e:
             print(f"[health_monitor_loop] error: {e}", flush=True)

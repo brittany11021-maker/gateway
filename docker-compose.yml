@@ -29,6 +29,7 @@ services:
     environment:
       POSTGRES_DSN: postgresql://memory_user:${POSTGRES_PASSWORD}@postgres:5432/memory_db
       QDRANT_URL:   http://qdrant:6333
+      HEALTH_MCP_URL: http://172.17.0.1:8100   # host systemd health-api service
     volumes:
       - ./backups:/app/backups
       - ./gateway/static:/app/static
