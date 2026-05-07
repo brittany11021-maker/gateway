@@ -2067,6 +2067,8 @@ async def character_state_get(agent_id: str = "default") -> str:
 @_mcp.tool()
 async def character_state_set(
     agent_id: str = "default",
+    mood_valence: float = None,
+    mood_energy: float = None,
     mood_score: int = None,
     mood_label: str = "",
     fatigue: int = None,
@@ -2076,24 +2078,59 @@ async def character_state_set(
 ) -> str:
     """Update character state fields. Only provided fields are changed.
 
+    Mood uses 2-D system (执行文档 §4.1):
+        mood_valence: -1.0 (negative) to +1.0 (positive)
+        mood_energy:  -1.0 (low energy) to +1.0 (high energy)
+    Quadrant labels auto-derived:
+        (+v,+e)=开心兴奋  (-v,+e)=烦躁焦虑  (+v,-e)=平静满足  (-v,-e)=低落疲惫
+    mood_score (legacy -100~+100) still accepted for backward compat.
+
     Args:
         agent_id:          Target agent.
-        mood_score:        -100 (very sad) to 100 (very happy). 0 = neutral.
-        mood_label:        Text label: happy/neutral/sad/excited/tired/anxious/calm.
+        mood_valence:      -1.0 to +1.0 (valence dimension).
+        mood_energy:       -1.0 to +1.0 (energy dimension).
+        mood_score:        Legacy: -100 to +100. Sets valence=score/100 if valence not given.
+        mood_label:        Override label (leave blank to auto-derive from valence+energy).
         fatigue:           0 (fresh) to 100 (exhausted).
         scene:             daily | long_distance | cohabitation
-        scene_note:        Free-text scene context (e.g. "traveling for work").
+        scene_note:        Free-text scene context.
         cooldown_minutes:  Minutes between messages. 0 = no cooldown.
     """
+    from memory_db import _mood_label_from_2d as _mld
     kwargs = {}
-    if mood_score  is not None: kwargs["mood_score"]       = max(-100, min(100, mood_score))
-    if mood_label:              kwargs["mood_label"]        = mood_label
-    if fatigue     is not None: kwargs["fatigue"]           = max(0, min(100, fatigue))
-    if scene:                   kwargs["scene"]             = scene
-    if scene_note is not None:  kwargs["scene_note"]        = scene_note
-    if cooldown_minutes is not None: kwargs["cooldown_minutes"] = max(0, cooldown_minutes)
+    # Resolve valence/energy from either 2D inputs or legacy mood_score
+    if mood_valence is not None:
+        kwargs["mood_valence"] = max(-1.0, min(1.0, float(mood_valence)))
+    elif mood_score is not None:
+        kwargs["mood_valence"] = max(-1.0, min(1.0, mood_score / 100.0))
+    if mood_energy is not None:
+        kwargs["mood_energy"] = max(-1.0, min(1.0, float(mood_energy)))
+
+    # Derive mood_label and mood_score from 2D if not explicitly given
+    v = kwargs.get("mood_valence")
+    e = kwargs.get("mood_energy")
+    if v is not None or e is not None:
+        # Need current state to fill in whichever dimension wasn't provided
+        _st = await _state_get(agent_id)
+        fv = v if v is not None else float(_st.get("mood_valence") or 0.0)
+        fe = e if e is not None else float(_st.get("mood_energy")  or 0.0)
+        kwargs["mood_score"] = int(fv * 100)
+        kwargs["mood_label"] = mood_label or _mld(fv, fe)
+    elif mood_label:
+        kwargs["mood_label"] = mood_label
+    if mood_score is not None and "mood_score" not in kwargs:
+        kwargs["mood_score"] = max(-100, min(100, mood_score))
+
+    if fatigue          is not None: kwargs["fatigue"]           = max(0, min(100, fatigue))
+    if scene:                        kwargs["scene"]             = scene
+    if scene_note       is not None: kwargs["scene_note"]        = scene_note
+    if cooldown_minutes is not None: kwargs["cooldown_minutes"]  = max(0, cooldown_minutes)
     s = await _state_set(agent_id, **kwargs)
-    return f"State updated for {agent_id}: mood={s['mood_label']} ({s['mood_score']:+d}), fatigue={s['fatigue']}, scene={s['scene']}"
+    v_out = s.get("mood_valence") or 0.0
+    e_out = s.get("mood_energy")  or 0.0
+    return (f"State updated for {agent_id}: "
+            f"mood={s['mood_label']} (v={v_out:+.2f} e={e_out:+.2f}), "
+            f"fatigue={s['fatigue']}, scene={s['scene']}")
 
 
 @_mcp.tool()
@@ -6390,86 +6427,12 @@ async def _auto_extract_character_memory(agent_id: str, messages: list) -> None:
         print(f"[auto_extract] {agent_id}: {e}")
 
 
+# B7: _generate_l5_summary deprecated — L5 replaced by conversations Qdrant collection.
+# Keeping function as no-op to avoid call-site churn; will be removed in a later cleanup.
 async def _generate_l5_summary(agent_id: str, session_id: str, messages: list) -> None:
-    """Generate a conversation summary and write it to L5 留底层.
-
-    Uses cheap LLM to produce a 2-3 sentence summary + #关键词 tags.
-    Skips if the conversation has fewer than 2 user turns.
-    """
-    user_turns = [m for m in messages if m.get("role") == "user"
-                  and isinstance(m.get("content"), str)]
-    if len(user_turns) < 2:
-        return
-
-    history = "\n".join(
-        f"{m['role'].upper()}: {m['content']}"
-        for m in messages
-        if isinstance(m.get("content"), str) and m["role"] in ("user", "assistant")
-    )
-    if not history.strip():
-        return
-
-    prompt = (
-        "你是对话摘要助手。请用2-3句话总结以下对话的核心内容，然后列出3-6个关键词标签。\n\n"
-        "输出格式（只输出这两行，不要其他内容）：\n"
-        "摘要：<2-3句话的摘要>\n"
-        "关键词：#标签1 #标签2 #标签3\n\n"
-        f"对话：\n{history[:3000]}"
-    )
-    try:
-        raw = await _call_llm_cheap(prompt)
-        summary = ""
-        keywords = ""
-        for line in raw.splitlines():
-            line = line.strip()
-            if line.startswith("摘要：") or line.startswith("摘要:"):
-                summary = line.split("：", 1)[-1].split(":", 1)[-1].strip()
-            elif line.startswith("关键词：") or line.startswith("关键词:"):
-                keywords = line.split("：", 1)[-1].split(":", 1)[-1].strip()
-        if not summary:
-            # Fallback: use the whole response as summary
-            summary = raw[:300]
-        await _l5_write(agent_id=agent_id, summary=summary,
-                        keywords=keywords, session_id=session_id)
-        print(f"[l5] {agent_id} summary written ({len(summary)}c, kw={keywords!r})")
-    except Exception as e:
-        print(f"[l5] summary generation failed for {agent_id}: {e}")
-
-
-async def _generate_l5_summary(agent_id: str, session_id: str, messages: list) -> None:
-    """Generate a short summary + #keywords for L5 留底层 after each conversation."""
-    history = "\n".join(
-        f"{m['role'].upper()}: {m['content']}"
-        for m in messages
-        if isinstance(m.get("content"), str) and m["role"] in ("user", "assistant")
-    )
-    if not history.strip():
-        return
-    prompt = (
-        "请用2-4句话总结以下对话的核心内容，然后给出3-8个#关键词（中文，用空格分隔）。\n"
-        "格式：\n"
-        "摘要：<2-4句话>\n"
-        "关键词：#词1 #词2 #词3\n\n"
-        f"对话：\n{history[-3000:]}"
-    )
-    try:
-        raw = await _call_llm_cheap(prompt)
-        summary = ""
-        keywords = ""
-        for line in raw.splitlines():
-            line = line.strip()
-            if line.startswith("摘要：") or line.startswith("摘要:"):
-                summary = line.split("：", 1)[-1].split(":", 1)[-1].strip()
-            elif line.startswith("关键词：") or line.startswith("关键词:"):
-                keywords = line.split("：", 1)[-1].split(":", 1)[-1].strip()
-        if not summary:
-            # fallback: use first non-empty line as summary
-            summary = next((l.strip() for l in raw.splitlines() if l.strip()), raw[:200])
-        await _l5_write(agent_id=agent_id, summary=summary,
-                        keywords=keywords, session_id=session_id)
-        print(f"[l5] {agent_id} summary written ({len(summary)}c, kw={keywords!r})", flush=True)
-    except Exception as e:
-        print(f"[l5] summary generation failed for {agent_id}: {e}", flush=True)
+    """DEPRECATED (B7): L5 replaced by Qdrant conversations collection + RAG pipeline.
+    No-op kept to avoid call-site churn."""
+    return
 
 
 # ─────────────────────────────────────────────────────────────────────────────

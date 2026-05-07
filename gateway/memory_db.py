@@ -1565,7 +1565,21 @@ async def accumulate_state(agent_id: str, delta: dict) -> dict:
             f"WHERE agent_id=?", vals
         )
         await db.commit()
-    return await state_get(agent_id)
+    st = await state_get(agent_id)
+    # If mood_valence or mood_energy changed, re-derive mood_label + mood_score
+    if "mood_valence" in delta or "mood_energy" in delta:
+        new_v = float(st.get("mood_valence") or 0.0)
+        new_e = float(st.get("mood_energy")  or 0.0)
+        new_label = _mood_label_from_2d(new_v, new_e)
+        new_ms    = int(new_v * 100)
+        await db.execute(
+            "UPDATE character_state SET mood_label=?, mood_score=? WHERE agent_id=?",
+            (new_label, new_ms, agent_id),
+        )
+        await db.commit()
+        st["mood_label"] = new_label
+        st["mood_score"] = new_ms
+    return st
 
 
 async def push_log_write(
@@ -1764,29 +1778,75 @@ async def event_roll(agent_id: str = "", level_bias: str = "",
     return _random.choices(rows, weights=weights, k=1)[0]
 
 
-async def state_mood_drift(agent_id: str, event_level: str) -> dict:
-    """Apply mood drift based on event level, return new state.
+def _mood_label_from_2d(valence: float, energy: float) -> str:
+    """Map 2-D valence/energy to a mood label by quadrant.
 
-    green:  +random(5,15)   fatigue +random(0,5)
-    yellow: -random(5,10)   fatigue +random(5,10)
-    orange: -random(15,25)  fatigue +random(10,15)
-    red:    -random(30,40)  fatigue +random(15,20)
+    Quadrant mapping (执行文档 §4.1):
+      (+v, +e) 开心兴奋   (-v, +e) 烦躁焦虑
+      (+v, -e) 平静满足   (-v, -e) 低落疲惫
+    """
+    if valence >= 0 and energy >= 0:
+        return "开心兴奋" if energy > 0.4 else "愉快"
+    if valence < 0  and energy >= 0:
+        return "烦躁焦虑" if energy > 0.4 else "有点烦"
+    if valence >= 0 and energy < 0:
+        return "平静满足" if valence > 0.3 else "有点累"
+    return "低落疲惫" if energy < -0.4 else "有些低落"
+
+
+_MOOD_MOMENTUM = 0.7   # inertia factor: new = momentum*old + (1-momentum)*target
+
+
+async def state_mood_drift(agent_id: str, event_level: str) -> dict:
+    """Apply 2-D mood drift (valence + energy) based on event level.
+
+    Event → (valence_target_delta, energy_target_delta, fatigue_delta):
+      green:  valence +0.15 ~ +0.25  energy +0.05 ~ +0.15  fatigue +0 ~ +5
+      yellow: valence -0.10 ~ -0.20  energy +0.10 ~ +0.20  fatigue +5 ~ +10
+      orange: valence -0.20 ~ -0.35  energy -0.05 ~ -0.15  fatigue +10 ~ +15
+      red:    valence -0.40 ~ -0.60  energy -0.15 ~ -0.30  fatigue +15 ~ +20
+
+    Momentum 0.7 applied: new_v = 0.7*old_v + 0.3*target_v
+    mood_score kept in sync (valence*100) for backward compatibility.
     """
     import random as _r
+    # (valence_delta_lo, valence_delta_hi, energy_delta_lo, energy_delta_hi, fat_lo, fat_hi)
     drift_map = {
-        "green":  (+_r.randint(5,15),  +_r.randint(0,5)),
-        "yellow": (-_r.randint(5,10),  +_r.randint(5,10)),
-        "orange": (-_r.randint(15,25), +_r.randint(10,15)),
-        "red":    (-_r.randint(30,40), +_r.randint(15,20)),
+        "green":  ( 0.15,  0.25,  0.05,  0.15,  0, 5),
+        "yellow": (-0.20, -0.10,  0.10,  0.20,  5, 10),
+        "orange": (-0.35, -0.20, -0.15, -0.05, 10, 15),
+        "red":    (-0.60, -0.40, -0.30, -0.15, 15, 20),
     }
-    mood_d, fat_d = drift_map.get(event_level, (0, 0))
+    params = drift_map.get(event_level, (0, 0, 0, 0, 0, 0))
+    v_lo, v_hi, e_lo, e_hi, f_lo, f_hi = params
+    dv = _r.uniform(v_lo, v_hi)
+    de = _r.uniform(e_lo, e_hi)
+    fat_d = _r.randint(f_lo, f_hi)
+
     st = await state_get(agent_id)
-    new_mood = max(-100, min(100, st["mood_score"] + mood_d))
-    new_fat  = max(0,    min(100, st["fatigue"] + fat_d))
-    # Derive label from score
-    label = ("very_sad" if new_mood < -60 else "sad" if new_mood < -20
-             else "neutral" if new_mood < 20 else "happy" if new_mood < 60 else "very_happy")
-    return await state_set(agent_id, mood_score=new_mood, mood_label=label, fatigue=new_fat)
+    old_v = float(st.get("mood_valence") or 0.0)
+    old_e = float(st.get("mood_energy")  or 0.0)
+    old_fat = int(st.get("fatigue") or 0)
+
+    # Target is current + delta, then apply momentum inertia
+    target_v = max(-1.0, min(1.0, old_v + dv))
+    target_e = max(-1.0, min(1.0, old_e + de))
+    new_v = round(_MOOD_MOMENTUM * old_v + (1 - _MOOD_MOMENTUM) * target_v, 4)
+    new_e = round(_MOOD_MOMENTUM * old_e + (1 - _MOOD_MOMENTUM) * target_e, 4)
+    new_fat = max(0, min(100, old_fat + fat_d))
+
+    label = _mood_label_from_2d(new_v, new_e)
+    # Keep mood_score in sync as valence*100 for backward compat
+    new_mood_score = int(new_v * 100)
+
+    return await state_set(
+        agent_id,
+        mood_valence=new_v,
+        mood_energy=new_e,
+        mood_score=new_mood_score,
+        mood_label=label,
+        fatigue=new_fat,
+    )
 
 
 async def event_list(agent_id: str = "", limit: int = 200) -> list[dict]:
