@@ -803,20 +803,21 @@ async def memory_write_smart(
     tags: Optional[list[str]] = None,
     source: str = "",
     parent_id: str = "",
+    vector_match: Optional[dict] = None,
 ) -> dict:
     """Write memory with automatic similarity-based dedup, rewrite, and L1 protection.
 
-    Similarity thresholds (Jaccard over tokens + CJK bigrams):
-      ≥ 0.85 → very likely duplicate: queue to pending_dedup, do NOT write
-      ≥ 0.55 + L2/L3 → REWRITE: update existing memory in-place, save old content
-                        to previous_content, mark status='updated'
-      ≥ 0.55 + other layers → write with confirmed=0, status='potential_duplicate'
-      ≥ 0.25 → related: write with status='related', related_ids=[similar_id]
-      < 0.25 → new: plain write
+    When vector_match is provided (from Qdrant cosine search), cosine thresholds are used:
+      ≥ 0.95 → very likely duplicate: queue to pending_dedup, do NOT write
+      ≥ 0.80 + L2/L3 → REWRITE: update existing memory in-place
+      ≥ 0.80 + other layers → write with confirmed=0, status='potential_duplicate'
+      ≥ 0.55 → related: write with status='related'
+      < 0.55 → new: plain write
+
+    Without vector_match, falls back to Jaccard (Jaccard thresholds: 0.85/0.55/0.25).
 
     L1 protection:
       Any write to L1 (or importance=5) is stored with confirmed=0.
-      The memory is written but NOT returned in normal reads until confirmed.
       Use memory_confirm_l1() to approve.
 
     anchor/treasure types always bypass similarity check (permanent, never skip).
@@ -826,19 +827,36 @@ async def memory_write_smart(
         return await memory_write(agent_id, content, layer, type_, importance, tags, source, parent_id)
 
     db = await get_db()
-    similar = await _find_similar(db, agent_id, content, limit=5)
 
-    best_ratio = 0.0
-    best_id = ""
-    best_content = ""
-    for s in similar:
-        r = _overlap_ratio(content, s["content"])
-        if r > best_ratio:
-            best_ratio = r
-            best_id = s["id"]
-            best_content = s["content"]
+    # ── Determine best_ratio, best_id, best_content ─────────────────────────
+    if vector_match and vector_match.get("score") is not None:
+        # Use Qdrant cosine similarity (preferred)
+        best_ratio  = float(vector_match["score"])
+        best_id     = vector_match.get("id", "")
+        best_content= vector_match.get("content", "")
+        hint_prefix = "cosine"
+        # Cosine thresholds
+        thr_queue  = 0.95   # very similar → queue for review
+        thr_rewrite= 0.80   # likely same topic → rewrite/potential_dup
+        thr_related= 0.55   # related topic
+    else:
+        # Fallback: FTS5 + Jaccard
+        similar = await _find_similar(db, agent_id, content, limit=5)
+        best_ratio   = 0.0
+        best_id      = ""
+        best_content = ""
+        for s in similar:
+            r = _overlap_ratio(content, s["content"])
+            if r > best_ratio:
+                best_ratio   = r
+                best_id      = s["id"]
+                best_content = s["content"]
+        hint_prefix = "jaccard"
+        thr_queue   = 0.85
+        thr_rewrite = 0.55
+        thr_related = 0.25
 
-    if best_ratio >= 0.85:
+    if best_ratio >= thr_queue:
         # Very likely duplicate — queue for review, don't write
         pending_id = str(uuid.uuid4())
         now = _now()
@@ -851,14 +869,14 @@ async def memory_write_smart(
             (pending_id, agent_id, content, layer, type_, importance,
              json.dumps(tags or [], ensure_ascii=False),
              source, parent_id, best_id, best_content,
-             f"jaccard={best_ratio:.2f}", now),
+             f"{hint_prefix}={best_ratio:.3f}", now),
         )
         await db.commit()
         return {"action": "queued", "id": pending_id,
                 "similar_id": best_id, "ratio": best_ratio}
 
     # ── L2/L3 Rewrite: update existing memory in-place ──────────────────────
-    if best_ratio >= 0.55 and layer in ("L2", "L3") and best_id:
+    if best_ratio >= thr_rewrite and layer in ("L2", "L3") and best_id:
         now = _now()
         await _snapshot_version(db, best_id, changed_by="rewrite")
         await db.execute(
@@ -881,7 +899,7 @@ async def memory_write_smart(
         mem = await memory_write(agent_id, content, layer, type_, importance, tags, source, parent_id)
         mem_id = mem["id"]
         # Find existing confirmed L1 memory with similar content to link as predecessor
-        related = [best_id] if best_id and best_ratio >= 0.25 else []
+        related = [best_id] if best_id and best_ratio >= thr_related else []
         await db.execute(
             "UPDATE memories SET confirmed=0, status='pending_l1', related_ids=? WHERE id=?",
             (json.dumps(related, ensure_ascii=False), mem_id),
@@ -894,14 +912,14 @@ async def memory_write_smart(
     mem = await memory_write(agent_id, content, layer, type_, importance, tags, source, parent_id)
     mem_id = mem["id"]
 
-    if best_ratio >= 0.55:
+    if best_ratio >= thr_rewrite:
         await db.execute(
             "UPDATE memories SET status='potential_duplicate', related_ids=?, confirmed=0 WHERE id=?",
             (json.dumps([best_id], ensure_ascii=False), mem_id),
         )
         await db.commit()
         mem.update({"status": "potential_duplicate", "related_ids": [best_id], "confirmed": 0})
-    elif best_ratio >= 0.25:
+    elif best_ratio >= thr_related:
         await db.execute(
             "UPDATE memories SET status='related', related_ids=? WHERE id=?",
             (json.dumps([best_id], ensure_ascii=False), mem_id),

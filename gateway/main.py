@@ -1504,8 +1504,9 @@ async def palimpsest_search(
             vec = await _embed_mem(query)
             if vec:
                 must_filters = [
-                    FieldCondition("agent_id", MatchValue(value=agent_id)),
-                    FieldCondition("archived",  MatchValue(value=0)),
+                    FieldCondition("agent_id",  MatchValue(value=agent_id)),
+                    FieldCondition("archived",   MatchValue(value=0)),
+                    FieldCondition("confirmed",  MatchValue(value=1)),
                 ]
                 if layer:
                     must_filters.append(FieldCondition("layer", MatchValue(value=layer)))
@@ -2737,7 +2738,7 @@ async def save_annotation(
         _ann_mem = f"[阅读摘注] 《{_bt2}》p.{page}: {selected_text.strip()[:200]}"
         if comment:
             _ann_mem += f" ——{comment}"
-        await _mem_write_smart(
+        await _mem_write_smart_vec(
             agent_id=agent_id, content=_ann_mem,
             layer="L3", type_="book_annotation", importance=3,
             tags=["book", f"book:{book_id}"], source="save_annotation",
@@ -2772,7 +2773,7 @@ async def book_reflection(
     _bt = _refl_title or book_id
     _content = f"[读后感] 《{_bt}》: {reflection.strip()}"
     try:
-        result = await _mem_write_smart(
+        result = await _mem_write_smart_vec(
             agent_id=agent_id, content=_content,
             layer="L1", type_="book_reflection", importance=3,
             tags=["book", f"book:{book_id}", "reflection"], source="book_reflection",
@@ -3386,6 +3387,60 @@ async def _ingest_conv_to_qdrant(
             print(f"[conv_ingest] {_ce}")
 
 
+async def _mem_write_smart_vec(
+    agent_id: str,
+    content: str,
+    layer: str = "L4",
+    type_: str = "diary",
+    importance: int = 3,
+    tags: list | None = None,
+    source: str = "",
+    parent_id: str = "",
+) -> dict:
+    """Wrapper around _mem_write_smart that pre-fetches Qdrant cosine match for dedup."""
+    vm = await _qdrant_dedup_match(content, agent_id)
+    return await _mem_write_smart(
+        agent_id=agent_id, content=content, layer=layer,
+        type_=type_, importance=importance, tags=tags,
+        source=source, parent_id=parent_id,
+        vector_match=vm,
+    )
+
+
+async def _qdrant_dedup_match(content: str, agent_id: str) -> dict | None:
+    """Cosine nearest-neighbor lookup for dedup.
+    Returns {id, content, score} of the closest confirmed, non-archived memory, or None.
+    """
+    if not _qdrant:
+        return None
+    try:
+        vec = await _embed_mem(content)
+        if not vec:
+            return None
+        hits = _qdrant.search(
+            collection_name=QDRANT_MEM_COLLECTION,
+            query_vector=vec,
+            limit=1,
+            with_payload=True,
+            query_filter=Filter(must=[
+                FieldCondition(key="agent_id",  match=MatchValue(value=agent_id)),
+                FieldCondition(key="confirmed", match=MatchValue(value=1)),
+                FieldCondition(key="archived",  match=MatchValue(value=0)),
+            ]),
+        )
+        if not hits:
+            return None
+        h = hits[0]
+        return {
+            "id":      h.payload.get("mem_id", ""),
+            "content": h.payload.get("original_text", ""),
+            "score":   h.score,
+        }
+    except Exception as _qde:
+        print(f"[qdrant_dedup] {_qde}")
+        return None
+
+
 async def _build_rag_context(user_query: str, agent_id: str) -> str:
     """Semantic search over memories + conversation history.
     Returns formatted context string, or '' if nothing relevant / Qdrant unavailable.
@@ -3568,7 +3623,7 @@ async def _distill_and_store(agent_id: str, session_id: str, messages: list,
                     if v_note:
                         print(f"[distill] L1 downgrade: {v_note} | {text[:60]}")
                     mem_type = "project" if (v_layer == "L2" and _track in ("practical", "mixed")) else "diary"
-                    _written = await _mem_write_smart(
+                    _written = await _mem_write_smart_vec(
                         agent_id=agent_id, content=text,
                         layer=v_layer, type_=mem_type, importance=v_imp,
                         tags=["distilled"], source="distill",
@@ -5552,7 +5607,7 @@ async def _agent_dream(agent_id: str) -> str:
             continue
         imp = max(2, min(4, int(cl.get("importance", 3))))
         try:
-            await _mem_write_smart(
+            await _mem_write_smart_vec(
                 agent_id=agent_id, content=text,
                 layer="L3", type_="diary", importance=imp,
                 tags=["dream_consolidated"], source="agent_dream",
@@ -6322,7 +6377,7 @@ async def _auto_extract_character_memory(agent_id: str, messages: list) -> None:
             )
             # Promote milestone+ moments to Palimpsest L1 (character main memory)
             if imp >= 4:
-                await _mem_write_smart(
+                await _mem_write_smart_vec(
                     agent_id=agent_id,
                     content=summary,
                     layer="L1",
@@ -7531,6 +7586,15 @@ async def trash_empty(agent_id: str, _=Depends(_require_key)):
     return {"ok": True, "deleted": len(ids)}
 
 
+# ── L1 pending confirmation (must be BEFORE {memory_id} catchall) ────────────
+
+@app.get("/api/admin/memories/pending-l1")
+async def pal_pending_l1(agent_id: str, _=Depends(_require_key)):
+    """List all unconfirmed L1 memories (confirmed=0) for an agent."""
+    rows = await _mem_pending_l1(agent_id)
+    return {"items": [_pal_row(r) for r in rows], "total": len(rows)}
+
+
 @app.get("/api/admin/memories/{memory_id}")
 async def pal_get(memory_id: str, _=Depends(_require_key)):
     """Get a single Palimpsest memory including version history."""
@@ -7608,15 +7672,6 @@ async def pal_rollback(memory_id: str, body: dict, _=Depends(_require_key)):
     if not mem:
         raise HTTPException(404, "Memory or version not found")
     return _pal_row(mem)
-
-
-# ── L1 pending confirmation ──────────────────────────────────────────────────
-
-@app.get("/api/admin/memories/pending-l1")
-async def pal_pending_l1(agent_id: str, _=Depends(_require_key)):
-    """List all unconfirmed L1 memories (confirmed=0) for an agent."""
-    rows = await _mem_pending_l1(agent_id)
-    return {"items": [_pal_row(r) for r in rows], "total": len(rows)}
 
 
 @app.post("/api/admin/memories/{memory_id}/confirm-l1")
