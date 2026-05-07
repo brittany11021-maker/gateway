@@ -3115,6 +3115,7 @@ async def startup():
     asyncio.create_task(_chain_event_loop())         # Chain event queue processor (5 min)
     asyncio.create_task(_silence_tracker_loop())     # 2h miss_you accumulator
     asyncio.create_task(_news_daily_loop())          # Daily RSS news fetch & cache
+    asyncio.create_task(_news_standalone_push_loop())  # 10% standalone news share (§13.2)
     asyncio.create_task(_health_monitor_loop())      # Health metrics monitor
     asyncio.create_task(_register_telegram_webhook())  # Telegram bot webhook
     asyncio.create_task(_heartbeat_loop())           # 24h LLM liveness watchdog
@@ -4575,6 +4576,8 @@ _NEWS_RSS_DEFAULTS = [
     {"name": "澎湃要闻",       "url": "https://rsshub.app/thepaper/newsDetail/25",             "category": "china", "skip_first": 1},
     {"name": "联合早报",       "url": "https://rsshub.app/zaobao/realtime/china",              "category": "china"},
     {"name": "Dezeen",        "url": "https://www.dezeen.com/feed/",                          "category": "art_design"},
+    {"name": "It's Nice That","url": "https://www.itsnicethat.com/rss",                       "category": "art_design"},
+    {"name": "Designboom",    "url": "https://www.designboom.com/feed/",                      "category": "art_design"},
     {"name": "Colossal",      "url": "https://www.thisiscolossal.com/feed/",                  "category": "art_design"},
     {"name": "小红书热门",     "url": "https://rsshub.app/xiaohongshu/explore",                "category": "lifestyle", "enabled": False},
     {"name": "36Kr",          "url": "https://36kr.com/feed",                                 "category": "tech"},
@@ -4802,6 +4805,63 @@ async def _news_daily_loop() -> None:
         except Exception as e:
             print(f"[news_daily_loop] error: {e}", flush=True)
         await asyncio.sleep(3600)  # fallback: retry in 1h
+
+
+async def _news_standalone_push_loop() -> None:
+    """Proactively share one news item per day (10% chance per 4h check). Spec §13.2."""
+    import datetime as _dtnsp, random as _rnsp
+    await asyncio.sleep(600)  # startup delay
+    while True:
+        try:
+            cfg = await _get_news_config()
+            push_prob = float(cfg.get("push_prob", 0.10))
+            if cfg.get("enabled", True) and _rnsp.random() < push_prob:
+                # Only during daytime in char timezone (09:00–21:00)
+                import os as _os_nsp
+                char_tz = _os_nsp.getenv("CHARACTER_TIMEZONE", "Asia/Shanghai")
+                now_utc = _dtnsp.datetime.utcnow().replace(tzinfo=_dtnsp.timezone.utc)
+                try:
+                    from zoneinfo import ZoneInfo as _ZI_nsp
+                    now_local = now_utc.astimezone(_ZI_nsp(char_tz))
+                except Exception:
+                    now_local = now_utc
+                if 9 <= now_local.hour <= 21:
+                    # Pick agent for push
+                    async with _db_pool.acquire() as _hcn:
+                        _rn = await _hcn.fetch(
+                            "SELECT agent_id FROM agent_settings "
+                            "WHERE agent_type='character' AND auto_memory=TRUE LIMIT 1"
+                        )
+                    if _rn:
+                        _aid_ns = _rn[0]["agent_id"]
+                        # Max 1 standalone news push per day
+                        if await _cd_gate(_aid_ns, "news_standalone_push", 86400):
+                            headlines = await _get_today_news(max_items=3, exclude_pushed=False)
+                            if headlines:
+                                item = _rnsp.choice(headlines)
+                                title = item.get("title", "")
+                                summary = item.get("summary", "")[:150]
+                                if title:
+                                    _hs_ns = await _get_agent_settings(_aid_ns)
+                                    _sp_ns = (_hs_ns.get("system_prompt") or "").strip()
+                                    _ns_prompt = (
+                                        f"你刚看到一条新闻：「{title}」"
+                                        + (f"（{summary}）" if summary else "")
+                                        + "用角色口吻自然地分享这条新闻，不超过30字，"
+                                        "语气随意像发现有趣的事一样，不要说'看到新闻'："
+                                    )
+                                    if _sp_ns:
+                                        _ns_prompt = f"你是：{_sp_ns[:200]}\n\n" + _ns_prompt
+                                    msg = (await _call_llm_route("proactive_push", _ns_prompt)).strip().strip("\"'")
+                                    if msg:
+                                        ok = await _push_send(msg, category="news_share")
+                                        await _push_log_write(
+                                            agent_id=_aid_ns, category="news_standalone",
+                                            trigger_src="news_push_loop", message=msg, sent=ok,
+                                        )
+        except Exception as _ens:
+            print(f"[news_standalone_push] error: {_ens}", flush=True)
+        await asyncio.sleep(4 * 3600)  # check every 4 hours
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6187,16 +6247,56 @@ async def _proxy_call_tool(
                 if _health != "healthy":
                     state_lines.append(f"健康状态：{_health}")
                 try:
-                    import json as _jst
+                    import json as _jst, datetime as _dtit, random as _rnit
                     items_list = _jst.loads(_items) if isinstance(_items, str) else (_items or [])
-                    if items_list:
-                        state_lines.append("物品：" + "、".join(str(x) for x in items_list[:5]))
+                    _now_it = _dtit.datetime.utcnow()
+                    _FOOD_KW = ["水果","蛋糕","咖啡","饼干","零食","外卖","饭","面","菜","鸡蛋",
+                                "牛奶","苹果","巧克力","糖","饮料","茶","奶茶","果汁","冰淇淋"]
+                    # Auto-expire: food items 7d, others 30d
+                    valid_items = []
+                    for _it in items_list:
+                        _added = _it.get("added_at","")
+                        if not _added:
+                            valid_items.append(_it)
+                            continue
+                        try:
+                            _age = (_now_it - _dtit.datetime.fromisoformat(_added.split("+")[0].replace("Z",""))).days
+                            _is_food = any(kw in _it.get("name","") + _it.get("desc","") for kw in _FOOD_KW)
+                            if (_is_food and _age <= 7) or (not _is_food and _age <= 30):
+                                valid_items.append(_it)
+                        except Exception:
+                            valid_items.append(_it)
+                    if valid_items != items_list:
+                        # Write back expired items removed
+                        await _state_set(agent_id, items=_jst.dumps(valid_items, ensure_ascii=False))
+                    if valid_items:
+                        _item_names = "、".join(x.get("name","?") for x in valid_items[:5])
+                        state_lines.append("持有物品：" + _item_names)
+                        # 15% probability: nudge a natural casual mention
+                        if _rnit.random() < 0.15:
+                            _pick = _rnit.choice(valid_items)
+                            state_lines.append(
+                                f"（今天可以自然提起「{_pick['name']}」，不超过一句，不刻意）"
+                            )
                 except Exception:
                     pass
                 try:
+                    import datetime as _dtpr2
                     prom_list = __import__("json").loads(_promises) if isinstance(_promises, str) else (_promises or [])
                     if prom_list:
-                        state_lines.append("未兑现承诺：" + "；".join(str(p) for p in prom_list[:3]))
+                        _prom_strs = []
+                        for _pr in prom_list[:3]:
+                            _pc = _pr.get("content","")
+                            _pm = _pr.get("made_at","")
+                            if _pc:
+                                try:
+                                    _days_ago = (_dtpr2.datetime.utcnow() - _dtpr2.datetime.fromisoformat(
+                                        _pm.split("+")[0].replace("Z",""))).days if _pm else 0
+                                    _prom_strs.append(f"{_pc}（{_days_ago}天前）")
+                                except Exception:
+                                    _prom_strs.append(_pc)
+                        if _prom_strs:
+                            state_lines.append("未兑现承诺：" + "；".join(_prom_strs))
                 except Exception:
                     pass
                 state_lines.append("")
@@ -6452,18 +6552,21 @@ async def _process_character_mcp(agent_id: str, messages: list, proxy_cfg: dict)
         {
             "name": "weather",
             "trigger_mode": "keyword",
+            "intent_check": True,   # §12.2: skip casual weather mentions
             "triggers": ["天气", "下雨", "下雪", "热", "冷", "出门", "穿什么",
                          "外面", "温度", "天晴", "阴天", "刮风", "晴天"],
         },
         {
             "name": "news",
             "trigger_mode": "keyword",
+            "intent_check": True,   # §12.2: skip casual news mentions
             "triggers": ["新闻", "最近发生", "今天发生", "热点", "时事", "有什么大事",
                          "最新消息", "今日", "社会", "国际", "国内", "发生了什么"],
         },
         {
             "name": "calendar",
             "trigger_mode": "keyword",
+            "intent_check": True,   # §12.2: skip casual time references
             "triggers": ["日程", "安排", "计划", "提醒", "明天", "后天", "下周",
                          "会议", "约", "几点", "什么时候", "记一下", "加一个"],
         },
@@ -6498,6 +6601,26 @@ async def _process_character_mcp(agent_id: str, messages: list, proxy_cfg: dict)
                 if not matched and tool.get("regex"):
                     matched = bool(_re.search(tool["regex"], recent))
                 if matched:
+                    # ── Intent classification layer (§12.2 layer 2) ──────────
+                    # If intent_check=True, ask the analyzer model whether the user
+                    # genuinely needs this tool or is just casually mentioning the keyword.
+                    if tool.get("intent_check"):
+                        tool_label = {"weather": "天气信息", "news": "新闻/时事",
+                                      "calendar": "日程/提醒"}.get(tool["name"], tool["name"])
+                        _ic_prompt = (
+                            f"用户最近说：「{recent[:200]}」\n"
+                            f"问题：用户是否真的需要查询「{tool_label}」？"
+                            "如果只是随口提到相关词语、表达情绪或背景描述，回答 NO。"
+                            "如果用户明确想要信息或帮助，回答 YES。"
+                            "只回答 YES 或 NO，不要解释。"
+                        )
+                        try:
+                            _ic_ans = (await _call_llm_route("analyzer", _ic_prompt)).strip().upper()
+                            if not _ic_ans.startswith("Y"):
+                                continue  # not a genuine intent → skip tool
+                        except Exception as _ice:
+                            print(f"[mcp_proxy] intent_check err ({tool['name']}): {_ice}")
+                            # On error, fall through and run the tool anyway
                     ctx = await _proxy_call_tool(tool["name"], agent_id,
                                                  messages=messages, tool_cfg=tool)
                     if ctx:
