@@ -4870,6 +4870,24 @@ async def _health_mcp_get(path: str) -> dict | None:
     return None
 
 
+async def _count_today_health_pushes(agent_id: str) -> int:
+    """Count push_log entries with health_ category sent today (UTC)."""
+    try:
+        from memory_db import get_db as _gdb_hp
+        import datetime as _dtchp
+        db  = await _gdb_hp()
+        today = _dtchp.datetime.utcnow().strftime("%Y-%m-%d")
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM push_log WHERE agent_id=? AND sent=1 "
+            "AND category LIKE 'health_%' AND created_at >= ?",
+            (agent_id, today + " 00:00:00"),
+        )
+        row = await cur.fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
 async def _health_monitor_loop() -> None:
     """Background task: poll Health MCP and send alerts. Runs every 15 min when enabled."""
     import os as _osh2
@@ -4899,6 +4917,9 @@ async def _health_monitor_loop() -> None:
                 continue
             aid = _hr[0]["agent_id"]
 
+            # Global daily health push cap
+            _max_hp = cfg.get("max_health_pushes_daily", 3)
+
             # ── Heart rate ──────────────────────────────────────────────────
             hr_cfg = cfg.get("heart_rate", {})
             if hr_cfg.get("enabled"):
@@ -4906,23 +4927,21 @@ async def _health_monitor_loop() -> None:
                 if data and data.get("value"):
                     bpm = float(data["value"])
                     threshold_hi = hr_cfg.get("resting_high_threshold", 100)
-                    threshold_lo = hr_cfg.get("resting_low_threshold", 50)
+                    threshold_lo = hr_cfg.get("resting_low_threshold", 50)  # noqa: F841
 
                     from memory_db import get_db as _gdb_h
-                    db = await _gdb_h()
-                    await db.execute(
+                    _dbh = await _gdb_h()
+                    await _dbh.execute(
                         "INSERT INTO health_snapshots (metric, value, unit) VALUES (?,?,?)",
                         ("heart_rate", bpm, "bpm")
                     )
-                    await db.commit()
+                    await _dbh.commit()
 
-                    if bpm > threshold_hi:
-                        if not await _cd_gate(aid, "health_hr_high", 3600):
-                            pass
-                        else:
+                    if bpm > threshold_hi and await _count_today_health_pushes(aid) < _max_hp:
+                        if await _cd_gate(aid, "health_hr_high", 3600):
                             _hr_prompt = (
-                                f"心跳有点快诶（{bpm:.0f}bpm），是不是紧张了？"
-                                "用角色口吻自然地说一句关心的话（不超过20字，不提具体数字）："
+                                "心跳有点快，是不是紧张了或者运动了？"
+                                "用角色口吻自然说一句关心的话（不超过20字，不提具体数字）："
                             )
                             _hs = await _get_agent_settings(aid)
                             _sp = (_hs.get("system_prompt") or "").strip()
@@ -4931,34 +4950,52 @@ async def _health_monitor_loop() -> None:
                             msg = (await _call_llm_route("proactive_push", _hr_prompt)).strip().strip("\"'")
                             if msg:
                                 ok = await _push_send(msg, category="health_heart_rate")
-                                await _push_log_write(aid, "health_hr_high",
-                                                       "health_monitor", msg, ok)
+                                await _push_log_write(
+                                    agent_id=aid, category="health_hr_high",
+                                    trigger_src="health_monitor", message=msg, sent=ok,
+                                )
 
-            # ── Steps sedentary check ────────────────────────────────────────
+            # ── Steps sedentary + high-activity check ───────────────────────
             steps_cfg = cfg.get("steps", {})
             if steps_cfg.get("enabled"):
                 import datetime as _dths
                 import random as _rnds
-                check_time = steps_cfg.get("sedentary_check_time", "15:00")
-                now_h, now_m = _dths.datetime.utcnow().hour, _dths.datetime.utcnow().minute
-                # Roughly 15:00 local time (CST ~= UTC+8 → UTC 07:xx)
-                if 6 <= now_h <= 8 and _rnds.random() < 0.4:
+                _now_h = _dths.datetime.utcnow().hour
+                # Sedentary check ~15:00 CST (UTC 07:xx), 40% probability
+                if 6 <= _now_h <= 8 and _rnds.random() < 0.4:
                     data = await _health_mcp_get("/metrics/steps/today")
                     if data and data.get("value") is not None:
                         steps = int(data["value"])
-                        threshold = steps_cfg.get("sedentary_threshold", 2000)
-                        if steps < threshold and await _cd_gate(aid, "health_steps_sedentary", 86400):
-                            _s_prompt = (
-                                "今天是不是一直坐着？用角色口吻催一句起来走走（不超过20字）："
-                            )
-                            _hs2 = await _get_agent_settings(aid)
-                            if (_hs2.get("system_prompt") or "").strip():
-                                _s_prompt = f"你是：{_hs2['system_prompt'][:200]}\n\n" + _s_prompt
-                            msg = (await _call_llm_route("proactive_push", _s_prompt)).strip().strip("\"'")
-                            if msg:
-                                ok = await _push_send(msg, category="health_steps")
-                                await _push_log_write(aid, "health_steps_sedentary",
-                                                       "health_monitor", msg, ok)
+                        sed_thr  = steps_cfg.get("sedentary_threshold", 2000)
+                        high_thr = steps_cfg.get("high_activity_threshold", 15000)
+
+                        if steps < sed_thr and await _count_today_health_pushes(aid) < _max_hp:
+                            if await _cd_gate(aid, "health_steps_sedentary", 86400):
+                                _s_prompt = "今天是不是一直坐着？用角色口吻催一句起来走走（不超过20字）："
+                                _hs2 = await _get_agent_settings(aid)
+                                if (_hs2.get("system_prompt") or "").strip():
+                                    _s_prompt = f"你是：{_hs2['system_prompt'][:200]}\n\n" + _s_prompt
+                                msg = (await _call_llm_route("proactive_push", _s_prompt)).strip().strip("\"'")
+                                if msg:
+                                    ok = await _push_send(msg, category="health_steps")
+                                    await _push_log_write(
+                                        agent_id=aid, category="health_steps_sedentary",
+                                        trigger_src="health_monitor", message=msg, sent=ok,
+                                    )
+
+                        elif steps >= high_thr and await _count_today_health_pushes(aid) < _max_hp:
+                            if await _cd_gate(aid, "health_steps_high", 86400):
+                                _sh_prompt = "今天走了好多步，辛苦啦！用角色口吻夸一句（不超过20字）："
+                                _hs2b = await _get_agent_settings(aid)
+                                if (_hs2b.get("system_prompt") or "").strip():
+                                    _sh_prompt = f"你是：{_hs2b['system_prompt'][:200]}\n\n" + _sh_prompt
+                                msg = (await _call_llm_route("proactive_push", _sh_prompt)).strip().strip("\"'")
+                                if msg:
+                                    ok = await _push_send(msg, category="health_steps")
+                                    await _push_log_write(
+                                        agent_id=aid, category="health_steps_high",
+                                        trigger_src="health_monitor", message=msg, sent=ok,
+                                    )
 
             # ── Sleep quality check (once daily ~09:00 CST = 01:xx UTC) ────────
             sleep_cfg = cfg.get("sleep", {})
@@ -4971,21 +5008,24 @@ async def _health_monitor_loop() -> None:
                     if data and data.get("value") is not None:
                         hrs = float(data["value"])
                         poor_thr = sleep_cfg.get("poor_threshold_hours", 5)
-                        if hrs < poor_thr and await _cd_gate(aid, "health_sleep_poor", 86400):
-                            _hs3 = await _get_agent_settings(aid)
-                            _sp3 = (_hs3.get("system_prompt") or "").strip()
-                            _slp_prompt = (
-                                "昨晚睡得很少，用角色口吻说一句关心的话，"
-                                "提醒好好休息（不超过20字，不提具体时长）："
-                            )
-                            if _sp3:
-                                _slp_prompt = f"你是：{_sp3[:200]}\n\n" + _slp_prompt
-                            msg = (await _call_llm_route("proactive_push", _slp_prompt)).strip().strip("\"'")
-                            if msg:
-                                ok = await _push_send(msg, category="health_sleep")
-                                await _push_log_write(aid, "health_sleep_poor",
-                                                       "health_monitor", msg, ok)
-                        # Sleep affects fatigue and mood_valence
+                        if hrs < poor_thr and await _count_today_health_pushes(aid) < _max_hp:
+                            if await _cd_gate(aid, "health_sleep_poor", 86400):
+                                _hs3 = await _get_agent_settings(aid)
+                                _sp3 = (_hs3.get("system_prompt") or "").strip()
+                                _slp_prompt = (
+                                    "昨晚睡得很少，用角色口吻说一句关心的话，"
+                                    "提醒好好休息（不超过20字，不提具体时长）："
+                                )
+                                if _sp3:
+                                    _slp_prompt = f"你是：{_sp3[:200]}\n\n" + _slp_prompt
+                                msg = (await _call_llm_route("proactive_push", _slp_prompt)).strip().strip("\"'")
+                                if msg:
+                                    ok = await _push_send(msg, category="health_sleep")
+                                    await _push_log_write(
+                                        agent_id=aid, category="health_sleep_poor",
+                                        trigger_src="health_monitor", message=msg, sent=ok,
+                                    )
+                        # Sleep affects fatigue and mood_valence regardless of push
                         from memory_db import accumulate_state as _acc_st
                         if hrs < poor_thr:
                             await _acc_st(aid, {"fatigue": 15, "mood_valence": -0.1})
@@ -5045,14 +5085,17 @@ async def _health_monitor_loop() -> None:
                                 )
                                 cd_key = "health_men_overdue"
 
-                        if prompt and cd_key:
+                        if prompt and cd_key and await _count_today_health_pushes(aid) < _max_hp:
                             _hsm = await _get_agent_settings(aid)
                             if (_hsm.get("system_prompt") or "").strip():
                                 prompt = f"你是：{_hsm['system_prompt'][:200]}\n\n" + prompt
                             msg = (await _call_llm_route("proactive_push", prompt)).strip().strip("\"'")
                             if msg:
                                 ok = await _push_send(msg, category="health_menstrual")
-                                await _push_log_write(aid, cd_key, "health_monitor", msg, ok)
+                                await _push_log_write(
+                                    agent_id=aid, category=cd_key,
+                                    trigger_src="health_monitor", message=msg, sent=ok,
+                                )
 
                         # Period affects mood and fatigue
                         from memory_db import accumulate_state as _acc_stm
@@ -5076,7 +5119,7 @@ async def _estimate_user_sleep_probability(agent_id: str, messages_recent: list 
     - no_message_45min:          weight 0.30
     - screen_locked (reported):  weight 0.40  (via activity_events category='locked')
     - said_goodnight_keyword:    weight 0.80  (from recent messages)
-    - past_avg_sleep_time:       weight 0.20  (hardcoded heuristic: 23:00-01:00 UTC+8)
+    - past_avg_sleep_time:       weight 0.30  (hardcoded heuristic: 23:00-01:00 UTC+8)
     Returns float 0.0-1.0.
     """
     import datetime as _dtusp
@@ -5116,9 +5159,10 @@ async def _estimate_user_sleep_probability(agent_id: str, messages_recent: list 
     # Signal 3b: check last conversation text in L5 summaries (skip for now)
 
     # Signal 4: time heuristic — past typical sleep time (23:00-01:00 UTC+8 = 15:00-17:00 UTC)
+    # Weight 0.30 per spec §3.2 (was 0.20)
     h_utc = _dtusp.datetime.utcnow().hour
     if 15 <= h_utc <= 17:  # ~23:00-01:00 CST
-        score += 0.20
+        score += 0.30
 
     return min(1.0, score)
 
