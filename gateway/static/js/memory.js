@@ -23,6 +23,10 @@ function renderPage() {
   _agentPageAid = null;
   _setToolbarMode('list');
 
+  // Custom tabs manage their own content — don't overwrite them
+  const _CUSTOM_TABS = ['books','mcp','daily','world','user','timeline','engine'];
+  if (_CUSTOM_TABS.includes(S.tab)) return;
+
   if (!allAgents.length) {
     setArea('<div class="page-empty"><div class="page-empty-ico">◌</div>'
           + '<div class="page-empty-lbl">No agents yet — click + New to create</div></div>');
@@ -111,6 +115,7 @@ const TIER_CFG = {
         desc:'对话摘要·留底层' },
   history: { col:null, label:'History', icon:'⟳', cls:'type-memory', desc:'原始对话' },
   daily:   { col:null, label:'Daily',   icon:'✦', cls:'type-memory', desc:'日记事件' },
+  trash:   { col:null, label:'Trash',   icon:'🗑', cls:'type-memory', desc:'已删除·回收站' },
 };
 
 async function openAgentPage(aid) {
@@ -123,8 +128,8 @@ async function openAgentPage(aid) {
 
   const atype = agentTypes[aid] || 'agent';
   const tabs = S.tab === 'project'
-    ? ['l1', 'l2project', 'l3', 'l4', 'l5', 'history']
-    : ['l1', 'l2', 'l3', 'l4', 'l5', 'history'];
+    ? ['l1', 'l2project', 'l3', 'l4', 'l5', 'history', 'trash']
+    : ['l1', 'l2', 'l3', 'l4', 'l5', 'history', 'trash'];
   if (atype === 'character') tabs.splice(5, 0, 'daily');
 
   const tabsHtml = tabs.map(t => {
@@ -213,6 +218,7 @@ async function loadDetailTab(tab) {
   if (tab === 'history') { await loadDetailHistory(aid); return; }
   if (tab === 'daily')   { await loadDetailDaily(aid);   return; }
   if (tab === 'l5')      { await loadDetailL5(aid);      return; }
+  if (tab === 'trash')   { await loadDetailTrash(aid);   return; }
 
   const cfg = TIER_CFG[tab];
   try {
@@ -404,14 +410,79 @@ async function delL5Summary(id) {
 }
 
 async function delMemoryDetail(id) {
-  if (!confirm('Delete this memory?')) return;
+  if (!confirm('Move to trash?')) return;
   try {
     await api(`/api/admin/memories/${id}`, { method:'DELETE' });
-    toast('Deleted');
+    toast('Moved to Trash 🗑');
     loadGlobalStats();
     delete _agentDetailItems[_agentDetailTab];
     await loadDetailTab(_agentDetailTab);
   } catch(e) { toast('Error: '+e.message); }
+}
+
+// ── Trash / Recycle-bin ───────────────────────────────────────────────────────
+
+async function loadDetailTrash(aid) {
+  const body = document.getElementById('detail-body');
+  try {
+    const d = await api(`/api/admin/memories/trash?agent_id=${enc(aid)}&limit=200`);
+    const items = d.items || [];
+    const countHtml = `<div style="font-size:10px;color:var(--muted);margin-bottom:12px;padding:0 2px;
+      display:flex;align-items:center;gap:8px">
+      <span>🗑 回收站 · ${items.length} 条</span>
+      ${items.length > 0 ? `<button onclick="emptyTrash('${enc(aid)}')"
+        style="margin-left:auto;font-size:11px;background:rgba(255,80,80,.15);color:#e05;
+        border:1px solid rgba(255,80,80,.3);border-radius:4px;padding:2px 10px;cursor:pointer">
+        清空回收站</button>` : ''}
+    </div>`;
+    if (!items.length) {
+      body.innerHTML = countHtml + '<div class="u-empty">回收站为空</div>';
+      return;
+    }
+    const cards = items.map(it => `
+      <div class="mem-card type-memory" onclick="toggleCardExpand(this)">
+        <div class="mc-acts" onclick="event.stopPropagation()">
+          <button class="mc-act ok" title="还原" onclick="restoreMemory('${it.id}','${enc(aid)}')">↩</button>
+          <button class="mc-act del" title="彻底删除" onclick="hardDeleteMemory('${it.id}','${enc(aid)}')">✕</button>
+        </div>
+        <div class="mc-label" style="opacity:.6">${it.layer||'?'} · ${it.type||''}</div>
+        <div class="mc-text">${esc(it.content || '')}</div>
+        <div class="mc-footer">
+          <span class="mc-icon">🗑</span>
+          <span class="mc-date">${fmtTs(it.updated_at||it.created_at)}</span>
+        </div>
+      </div>`).join('');
+    body.innerHTML = countHtml + `<div class="mem-grid">${cards}</div>`;
+  } catch(e) {
+    body.innerHTML = `<div class="u-empty">Error: ${e.message}</div>`;
+  }
+}
+
+async function restoreMemory(id, aid) {
+  try {
+    await api(`/api/admin/memories/trash/${id}/restore`, { method:'POST' });
+    toast('已还原 ↩');
+    await loadDetailTrash(aid);
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+async function hardDeleteMemory(id, aid) {
+  if (!confirm('彻底删除？此操作不可逆。')) return;
+  try {
+    await api(`/api/admin/memories/${id}?hard=true`, { method:'DELETE' });
+    toast('已彻底删除');
+    await loadDetailTrash(aid);
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+async function emptyTrash(aid) {
+  if (!confirm('清空回收站？所有已删除记忆将被永久删除。')) return;
+  try {
+    await api(`/api/admin/memories/trash?agent_id=${enc(aid)}`, { method:'DELETE' });
+    toast('回收站已清空 🗑');
+    loadGlobalStats();
+    await loadDetailTrash(aid);
+  } catch(e) { toast('Error: ' + e.message); }
 }
 
 function toggleCardExpand(el) { el.classList.toggle('expanded'); }
@@ -473,6 +544,10 @@ function switchTab(tab) {
   if (tab === 'timeline') {
     document.querySelector('.toolbar').style.display = 'none';
     if (typeof loadTimelineTab === 'function') loadTimelineTab(); return;
+  }
+  if (tab === 'engine') {
+    document.querySelector('.toolbar').style.display = 'none';
+    if (typeof loadEngineTab === 'function') loadEngineTab(); return;
   }
 
   document.getElementById('area').classList.remove('read-mode');

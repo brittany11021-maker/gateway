@@ -26,7 +26,7 @@ from mcp.server.fastmcp import FastMCP
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, FieldCondition, Filter, MatchValue,
-    PointStruct, VectorParams, PayloadSchemaType,
+    PointIdsList, PointStruct, VectorParams, PayloadSchemaType,
 )
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -1618,9 +1618,22 @@ async def palimpsest_delete(
     found = await _mem_delete(memory_id=memory_id, hard=hard_delete)
     if not found:
         return "Memory not found: " + memory_id
+    # Sync Qdrant
+    if _qdrant:
+        try:
+            _qid = _mem_id_to_qdrant(memory_id)
+            if hard_delete:
+                _qdrant.delete(QDRANT_MEM_COLLECTION,
+                               points_selector=PointIdsList(points=[_qid]))
+            else:
+                _qdrant.set_payload(QDRANT_MEM_COLLECTION,
+                                    payload={"archived": 1},
+                                    points_selector=PointIdsList(points=[_qid]))
+        except Exception as _qde:
+            print(f"[qdrant_del] {_qde}")
     if hard_delete:
         return "Permanently deleted: " + memory_id[:8]
-    return "Archived (soft-deleted): " + memory_id[:8]
+    return "Archived → Trash: " + memory_id[:8]
 
 
 @_mcp.tool()
@@ -7449,6 +7462,75 @@ async def pal_batch_update(body: dict, _=Depends(_require_key)):
     return {"updated": done, "total": len(ids)}
 
 
+# ── Trash / Recycle-bin endpoints ────────────────────────────────────────────
+# IMPORTANT: must stay ABOVE the /{memory_id} catchall routes.
+
+@app.get("/api/admin/memories/trash")
+async def trash_list(agent_id: str, limit: int = 200, _=Depends(_require_key)):
+    """List all archived (soft-deleted) memories for an agent."""
+    from memory_db import get_db as _gdb_tr
+    db = await _gdb_tr()
+    cur = await db.execute(
+        "SELECT * FROM memories WHERE agent_id=? AND archived=1 "
+        "ORDER BY updated_at DESC LIMIT ?",
+        (agent_id, limit),
+    )
+    rows = await cur.fetchall()
+    from memory_db import _row_to_dict as _rtd
+    return {"items": [_rtd(r) for r in rows], "total": len(rows)}
+
+
+@app.post("/api/admin/memories/trash/{memory_id}/restore")
+async def trash_restore(memory_id: str, _=Depends(_require_key)):
+    """Restore a soft-deleted memory (set archived=0 and re-sync Qdrant)."""
+    from memory_db import get_db as _gdb_tr2
+    db = await _gdb_tr2()
+    from memory_db import _now as _mnow, _row_to_dict as _rtd2
+    cur = await db.execute(
+        "SELECT * FROM memories WHERE id=? AND archived=1", (memory_id,)
+    )
+    row = await cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Memory not found in trash")
+    await db.execute(
+        "UPDATE memories SET archived=0, updated_at=? WHERE id=?",
+        (_mnow(), memory_id),
+    )
+    await db.commit()
+    cur2 = await db.execute("SELECT * FROM memories WHERE id=?", (memory_id,))
+    mem = _rtd2(await cur2.fetchone())
+    # Re-sync Qdrant
+    asyncio.create_task(_sync_memory_to_qdrant(mem))
+    return {"ok": True, "restored": memory_id}
+
+
+@app.delete("/api/admin/memories/trash")
+async def trash_empty(agent_id: str, _=Depends(_require_key)):
+    """Hard-delete ALL archived memories for an agent (empty trash)."""
+    from memory_db import get_db as _gdb_tr3
+    db = await _gdb_tr3()
+    cur = await db.execute(
+        "SELECT id FROM memories WHERE agent_id=? AND archived=1", (agent_id,)
+    )
+    rows = await cur.fetchall()
+    ids = [r[0] for r in rows]
+    if not ids:
+        return {"ok": True, "deleted": 0}
+    await db.execute(
+        "DELETE FROM memories WHERE agent_id=? AND archived=1", (agent_id,)
+    )
+    await db.commit()
+    # Purge from Qdrant
+    if _qdrant:
+        try:
+            qids = [_mem_id_to_qdrant(mid) for mid in ids]
+            _qdrant.delete(QDRANT_MEM_COLLECTION,
+                           points_selector=PointIdsList(points=qids))
+        except Exception as _qe:
+            print(f"[trash_empty_qdrant] {_qe}")
+    return {"ok": True, "deleted": len(ids)}
+
+
 @app.get("/api/admin/memories/{memory_id}")
 async def pal_get(memory_id: str, _=Depends(_require_key)):
     """Get a single Palimpsest memory including version history."""
@@ -7483,6 +7565,18 @@ async def pal_delete(memory_id: str, hard: bool = False, _=Depends(_require_key)
     ok = await _mem_delete(memory_id, hard=hard)
     if not ok:
         raise HTTPException(404, "Memory not found")
+    if _qdrant:
+        try:
+            _qid = _mem_id_to_qdrant(memory_id)
+            if hard:
+                _qdrant.delete(QDRANT_MEM_COLLECTION,
+                               points_selector=PointIdsList(points=[_qid]))
+            else:
+                _qdrant.set_payload(QDRANT_MEM_COLLECTION,
+                                    payload={"archived": 1},
+                                    points_selector=PointIdsList(points=[_qid]))
+        except Exception as _qde:
+            print(f"[qdrant_pal_del] {_qde}")
     return {"ok": True, "hard": hard, "id": memory_id}
 
 

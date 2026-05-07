@@ -18,14 +18,14 @@ memory-gateway/
 ├── docker-compose.yml        # gateway / postgres / qdrant / screentime / sillytavern
 ├── .env                      # 所有密钥和环境变量
 └── gateway/
-    ├── main.py               # FastAPI 主程序，~6181 行，所有路由 + 后台任务
+    ├── main.py               # FastAPI 主程序，~10100 行，所有路由 + 后台任务
     ├── memory_db.py          # SQLite 记忆系统（L1-L5 + projects/npcs/daily），~1783 行
     ├── requirements.txt
     └── static/
         ├── admin.html        # 前端入口（单页应用）
         └── js/
             ├── api.js        # 共享：S{key,tab}、api()、allAgents、toast()
-            ├── memory.js     # 记忆 tab UI
+            ├── memory.js     # 记忆 tab UI（含回收站）
             ├── books.js      # 读书 tab UI
             ├── worldbook.js  # 世界书 tab
             ├── daily.js      # 日常生活 tab
@@ -98,17 +98,77 @@ L5 是独立的 `conversation_summaries` 表，不在主 `memories` 表里，用
 id, agent_id, content, layer(L1-L4), importance(1-5), type
 access_count    -- >= 5 时免自动清理（touch 机制）
 read_by_agent   -- 0=未读，1=已读
-archived        -- 1=软删除
+archived        -- 1=软删除（进入回收站）
+confirmed       -- 0=L1待确认，1=已确认（默认）
+status          -- new / pending_l1 / updated / related / potential_duplicate
 ```
 
 ### Qdrant（向量 DB）
 
-一个 collection：`book_chunks`（书籍语义搜索，按 book_id/page 分片）。
-`memory_profile` / `memory_project` / `memory_recent` 已删除，Palimpsest SQLite 是唯一记忆存储。
+**3个 Collection**：
+
+| Collection | 用途 | 维度 |
+|---|---|---|
+| `book_chunks` | 书籍语义搜索，按 book_id/page 分片 | 1024 |
+| `memories` | 记忆向量索引，和 SQLite memories 表双写 | 1024 |
+| `conversations` | 对话 exchange-pair 向量，用于 RAG 历史检索 | 1024 |
+
+**Payload schema**（memories collection）：
+- `agent_id` (keyword), `layer` (keyword), `confirmed` (integer), `archived` (integer)
+
+**Payload schema**（conversations collection）：
+- `agent_id` (keyword), `conversation_id` (keyword), `role` (keyword)
+
+**Embed 模型**：`nvidia/nv-embedqa-e5-v5`（1024 dims），通过 NVIDIA NIM API，由 `_embed_mem()` 调用。
 
 ---
 
-## 四、LLM 模型架构（A/B/C 三层）
+## 四、向量搜索 & RAG 架构（新增）
+
+### Helper 函数（main.py）
+
+```python
+_embed_mem(text)           # 调 _embed() 用 EMBED_PROVIDER，返回 1024-dim float list
+_mem_id_to_qdrant(mem_id)  # UUID → str（UUID hex，去掉 '-'，前36字符）
+_sync_memory_to_qdrant(mem)  # 写/更新 memories Qdrant collection 单条记忆
+_validate_memory_layer(content, layer, importance)  # B6: L1 误分类防御
+_chunk_exchange_pairs(messages)  # 对话切分为 user/assistant exchange pairs
+_ingest_conv_to_qdrant(agent_id, messages, conversation_id)  # 对话向量化写入
+_build_rag_context(user_query, agent_id)  # 语义检索，返回注入字符串
+```
+
+### B6：L1 误分类三层防御
+
+**问题**：蒸馏时 LLM 把时效性记忆（"最近在玩XX游戏"）错误分类为 L1 永久层。
+
+**防御机制**：
+1. **Prompt 约束**：蒸馏 prompt RULE 3 明确禁止含时间词/状态词的记忆写入 L1
+2. **代码校验**（`_validate_memory_layer`）：检测以下模式，强制降级到 L2：
+   - 时间词：`\d{1,2}月\d{1,2}[日号]`、`最近`、`目前`、`正在`、`这几天`、`上周/这周/下周`、`昨天/今天/明天`、`上个月/这个月`
+   - 状态词：`正处于`、`正在经历`、`正在进行`、`需要处理`、`尚未解决`、`持续中`
+3. **confirmed=0 待确认队列**：所有 L1 记忆写入时先设 `confirmed=0`，需在前端确认后生效
+
+### RAG 注入流程
+
+每次对话前（仅 agent 类型），在 wakeup 记忆注入之后，执行：
+1. 在 `memories` collection 向量搜索（score_threshold=0.40，top-5，过滤 `confirmed=1 AND archived=0`）
+2. 在 `conversations` collection 向量搜索（score_threshold=0.40，top-3）
+3. 结果合并去重，格式化后注入为 `[语义检索]` 系统消息
+
+### 对话向量化（`_ingest_conv_to_qdrant`）
+
+`_post_conversation_tasks()` 完成后，将对话切分为 exchange pairs（user+assistant），每对作为一个 Qdrant point 写入 `conversations` collection。
+
+### 现有记忆回填
+
+已对 SQLite 73 条记忆执行过一次 Qdrant 回填（2025年5月），用以下脚本：
+```python
+# /tmp/backfill.py —— 仅首次需要，已执行
+```
+
+---
+
+## 五、LLM 模型架构（A/B/C 三层）
 
 ### A 层：网关模型（后台蒸馏/自动任务用）
 
@@ -145,7 +205,7 @@ A3: （留空）
 
 ---
 
-## 五、核心流程：`POST /v1/chat/completions`
+## 六、核心流程：`POST /v1/chat/completions`
 
 ```
 1. 解析 X-Agent-ID header（优先）→ body.agent_id → "default"
@@ -154,9 +214,13 @@ A3: （留空）
 4. 注入用户信息（user_profiles 表）
 5. 解析世界书（_resolve_worldbook，keyword/vector/constant 触发模式）
 6. 若 character：调 _process_character_mcp() 获取角色上下文（含 character_state/daily_events/npcs）
-7. 若 agent：memory_wakeup() 拿 L1-L4 记忆 + L5 关键词搜索；无数据则 Qdrant fallback
+7. 若 agent：
+   a. memory_wakeup() 拿 L1-L4 记忆 + L5 关键词搜索
+   b. 【新】_build_rag_context() 语义检索 memories+conversations → 注入 [语义检索] 系统消息
 8. 按 api_chain 调 LLM（stream=true：event_stream SSE；stream=false：直接返回）
-9. 后台 asyncio.create_task：_post_conversation_tasks() → 蒸馏 → 写记忆 → dedup_check
+9. 后台 asyncio.create_task：_post_conversation_tasks()
+   → 蒸馏 → _validate_memory_layer → 写记忆 → dedup_check → _sync_memory_to_qdrant
+   → _ingest_conv_to_qdrant（对话向量化）
 ```
 
 **流式超时**：`httpx.Timeout(connect=8.0, read=60.0, write=10.0, pool=5.0)`
@@ -167,7 +231,7 @@ A3: （留空）
 
 ---
 
-## 六、记忆系统关键函数（memory_db.py）
+## 七、记忆系统关键函数（memory_db.py）
 
 ```python
 memory_write(agent_id, content, layer, importance, type_)  # 直接写
@@ -200,7 +264,33 @@ event_roll / event_list / event_add / event_delete
 
 ---
 
-## 七、记忆写入规范
+## 八、回收站（Trash）系统
+
+记忆删除是**软删除**（`archived=1`），可通过回收站还原或彻底删除。
+
+### REST API
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/admin/memories/trash?agent_id=X` | 列出已删除记忆 |
+| `POST` | `/api/admin/memories/trash/{id}/restore` | 还原记忆（archived→0，重新同步 Qdrant） |
+| `DELETE` | `/api/admin/memories/trash?agent_id=X` | 清空回收站（彻底删除 SQLite + Qdrant） |
+| `DELETE` | `/api/admin/memories/{id}?hard=true` | 彻底删除单条（从回收站界面调用） |
+
+> **⚠️ 路由顺序**：trash 路由必须注册在 `/{memory_id}` catchall 之前（FastAPI 按顺序匹配）。
+
+### 前端（memory.js）
+
+- 新增 **Trash** tab 在 agent detail 页面（所有 agent/character 都有）
+- 删除键（✕）→ 软删除，toast "Moved to Trash 🗑"
+- Trash tab 显示回收站列表：
+  - ↩ 还原按钮 → `restoreMemory(id, aid)`
+  - ✕ 彻底删除 → `hardDeleteMemory(id, aid)`
+  - "清空回收站"按钮 → `emptyTrash(aid)`
+
+---
+
+## 九、记忆写入规范
 
 ### 人称规则
 ```
@@ -210,7 +300,7 @@ event_roll / event_list / event_add / event_delete
 ```
 
 ### 层级判断
-- 一年后还重要吗？→ L1
+- 一年后还重要吗？→ L1（但含时间词/状态词会被 B6 自动降级到 L2）
 - 三个月后还重要吗？→ L2（Events）
 - 一个月后还重要吗？→ L3
 - 三天后可能就忘了 → L4
@@ -226,7 +316,7 @@ event_roll / event_list / event_add / event_delete
 
 ---
 
-## 八、Telegram 集成
+## 十、Telegram 集成
 
 - Webhook：`POST /telegram/webhook`（secret header 验证）
 - 会话：`_tg_agents` dict + `_tg_sessions` dict（内存，重启清空）
@@ -236,7 +326,7 @@ event_roll / event_list / event_add / event_delete
 
 ---
 
-## 九、读书系统
+## 十一、读书系统
 
 - 书：`books` 表，页：`book_pages` 表，`default_agent` 存在 `books` 表
 - 前端：`books.js`，`sendBookChat()` 调 `/v1/chat/completions`（SSE 流式）
@@ -245,7 +335,7 @@ event_roll / event_list / event_add / event_delete
 
 ---
 
-## 十、前端架构
+## 十二、前端架构
 
 单页应用，vanilla JS，无框架。
 
@@ -254,47 +344,47 @@ event_roll / event_list / event_add / event_delete
 - **Tab 列表**：user / agent / character / **memory** / **project** / conversations / books / mcp / daily / world
   - `memory` tab：agent 类型记忆（原 `tab-recent`）
   - `project` tab：project 类型记忆（含 L2 Events）
-- **agent detail 子 tab**：L1(Profile) / L2(Events) / L3(Recent) / L4(Atomic) / L5(Archive) / History / Daily(character专用)
+- **agent detail 子 tab**：L1(Profile) / L2(Events) / L3(Recent) / L4(Atomic) / L5(Archive) / History / Daily(character专用) / **Trash(回收站)**
 - 版本号：admin.html 里 `?v=N`，改了 JS 需手动 +1 强制刷新
 
 ---
 
-## 十一、⚠️ 已知代码问题（待修）
+## 十三、⚠️ 已知代码问题（待修）
 
 1. **memory_db.py L5 代码重复**：`l5_write/search/list` 等函数在文件里出现了两遍（约第 1537 行和第 1648 行），需删掉前一份
 2. **main.py 重复导入**：`memory_confirm_l1` 和 `memory_list_pending_l1` 在 70-73 行和第 74 行各导入一次
+3. **pending-l1 路由顺序**：`/api/admin/memories/pending-l1` 在 `/{memory_id}` catchall 之后注册（已有，UI 用 list+filter 绕过），需移前（低优先级）
 
 ---
 
-## 十二、待实现功能（按优先级）
+## 十四、待实现功能（按优先级）
 
-### 记忆架构扩展
-1. **memories 表加字段**：`status`(new/updated/related/potential_duplicate), `related_ids`(JSON), `previous_content`(rewrite前旧内容), `confirmed`(L1保护用)
-2. **Rewrite 机制**：L2/L3 更新时保留旧版本进 `previous_content`；L1 更新需 `confirmed=0` 待确认
-3. **前端**：Memory tab 和 Project tab 的 agent detail 界面做差异化
+### 记忆架构
 
-### Daily Life 系统（第7节，character 用）
-4. **每日骨架生成器**：凌晨 cron，便宜模型生成 `daily_events` + 写 `character_state`
-5. **天气/Todoist 数据注入**：角色 wakeup 时注入当日天气/用户日程
-6. **主动发消息引擎**：触景生情 + 冷却控制，via Telegram
+- **B4 余弦相似度去重**：用向量相似度替换 `_mem_dedup_check` 里的 Jaccard 算法（Qdrant nearest-neighbor 查询）
+- **B7 L5 弃用**：L5 的对话摘要功能由 `conversations` Qdrant collection + RAG 替代，可逐步停用 `l5_write`
+- **A4 历史对话导入**：将用户提供的历史对话 JSON 批量写入 `conversations` collection
 
-### 梦系统（第15节）✅
-7. ✅ **Agent 梦**：每日 02:00 UTC，L4碎片→LLM归类→L3记忆 + GitHub Obsidian markdown节点
-8. ✅ **Character 梦**：daily_events→梦境叙述→character_state.dream_text，30% 概率注入对话
-   - 手动触发：`POST /admin/api/agents/{id}/dream`
+### Daily Life 系统（character 用）
 
-### 知识图谱（第14节）✅
-9. ✅ **GitHub Obsidian 集成**：`GITHUB_TOKEN` + `GITHUB_OBSIDIAN_REPO=brittany11021-maker/obsidian`
-   - 节点路径：`memory-nodes/{agent_id}/{YYYY-MM-DD}.md`（含 frontmatter + 梦境叙述 + L3 cluster）
+- **每日骨架生成器**：凌晨 cron，便宜模型生成 `daily_events` + 写 `character_state`
+- **天气/Todoist 数据注入**：角色 wakeup 时注入当日天气/用户日程
+- **主动发消息引擎**：触景生情 + 冷却控制，via Telegram
 
-### 模型/Provider 改进
-10. API 面板显示 gateway 标注（A 层）+ 手动切换
-11. 聊天记录显示线路-模型名
-12. 网关 >24h 无响应时自动报警
+### 梦系统 ✅
+
+- ✅ **Agent 梦**：每日 02:00 UTC，L4碎片→LLM归类→L3记忆 + GitHub Obsidian markdown节点
+- ✅ **Character 梦**：daily_events→梦境叙述→character_state.dream_text，30% 概率注入对话
+  - 手动触发：`POST /admin/api/agents/{id}/dream`
+
+### 知识图谱 ✅
+
+- ✅ **GitHub Obsidian 集成**：`GITHUB_TOKEN` + `GITHUB_OBSIDIAN_REPO=brittany11021-maker/obsidian`
+  - 节点路径：`memory-nodes/{agent_id}/{YYYY-MM-DD}.md`（含 frontmatter + 梦境叙述 + L3 cluster）
 
 ---
 
-## 十三、环境变量速查（.env）
+## 十五、环境变量速查（.env）
 
 ```
 GATEWAY_API_KEY=mgw-h3Lbg0HtBcTEdKsfG6hVk6i1ta
@@ -307,11 +397,12 @@ GATEWAY_PUBLIC_URL=https://memory.513129.xyz
 DISTILL_MODEL=google/gemma-4-31b-it
 GITHUB_TOKEN=github_pat_xxxx   # 服务器 .env 里已配置，不要提交到 git
 GITHUB_OBSIDIAN_REPO=brittany11021-maker/obsidian
+EMBED_PROVIDER=nvidia            # 控制 _embed_mem() 用哪个 provider
 ```
 
 ---
 
-## 十四、常用命令
+## 十六、常用命令
 
 ```bash
 # 改了 Python 文件后重新构建
@@ -336,4 +427,10 @@ scp gateway/static/admin.html   root@43.159.56.67:~/memory-gateway/gateway/stati
 # 推 Python 文件并 rebuild
 scp gateway/main.py root@43.159.56.67:~/memory-gateway/gateway/main.py
 ssh root@43.159.56.67 "cd ~/memory-gateway && docker compose build gateway && docker compose up -d gateway"
+
+# 查看 Qdrant 状态
+curl http://43.159.56.67:6333/collections
+
+# 回填现有记忆到 Qdrant（仅首次）
+# 见 /tmp/backfill.py（已于2025-05执行过，73条）
 ```
