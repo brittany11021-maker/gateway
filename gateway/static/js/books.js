@@ -102,6 +102,8 @@ function bookCard(b) {
         <div class="book-author">${esc(b.author || '—')}</div>
         <span class="badge-${b.status}">${STATUS_LABEL[b.status]}</span>
         <div class="book-progress">${progBars}</div>
+        <button class="btn-icon book-card-del" title="Delete book"
+          onclick="event.stopPropagation();confirmDeleteBook('${b.book_id}')">🗑</button>
       </div>
     </div>`;
 }

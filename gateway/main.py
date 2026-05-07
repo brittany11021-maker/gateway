@@ -13,7 +13,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 import asyncpg
 import httpx
@@ -52,8 +52,13 @@ from memory_db import (
     state_get as _state_get, state_set as _state_set,
     state_touch as _state_touch, state_cooldown_active as _cooldown_active,
     state_mood_drift as _mood_drift,
+    accumulate_state as _accumulate_state,
+    push_log_write as _push_log_write,
+    chain_event_schedule as _chain_schedule,
+    chain_events_due as _chain_events_due,
+    chain_event_mark_fired as _chain_mark_fired,
     event_roll as _event_roll, event_list as _event_list,
-    event_add as _event_add, event_delete as _event_delete,
+    event_add as _event_add, event_delete as _event_delete, event_update as _event_update,
     npc_list as _npc_list, npc_get as _npc_get,
     npc_upsert as _npc_upsert, npc_delete as _npc_delete,
 )
@@ -73,6 +78,7 @@ from memory_db import (
 )
 from memory_db import daily_write as _daily_write, daily_read as _daily_read
 from memory_db import daily_list as _daily_list, daily_delete as _daily_delete
+from memory_db import daily_update as _daily_update
 from memory_db import (
     activity_write as _act_write, activity_recent as _act_recent,
     activity_today_totals as _act_totals,
@@ -258,6 +264,361 @@ async def _call_llm_cheap(prompt: str) -> str:
             last_err = f"{model}: {type(_e).__name__}: {_e}"
             print(f"[cheap_llm] {last_err} — trying next model", flush=True)
     raise RuntimeError(f"[cheap_llm] All models failed. Last error: {last_err}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P0.1  API Route Separation (Notion spec §0)
+# Three independent LLM routes: conversation / proactive_push / analyzer
+# Stored in user_config key 'api_routes' as JSON
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DEFAULT_API_ROUTES: dict[str, dict] = {
+    "proactive_push": {
+        "purpose": "主动推送消息生成（早安/触景生情/屏幕时间吐槽等）",
+        "provider": "nvidia-llm",
+        "model": "",          # empty = use _CHEAP_LLM_MODELS[0]
+        "fallback_chain": [],
+    },
+    "analyzer": {
+        "purpose": "后台分析任务（状态分析/日程捕获/重要性判断/反向识别）",
+        "provider": "nvidia-llm",
+        "model": "",
+        "fallback_chain": [],
+    },
+}
+
+
+async def _call_llm_route(route_name: str, prompt: str, sys_prompt: str = "") -> str:
+    """Call LLM using a named API route (proactive_push / analyzer).
+
+    Route config is read from user_config['api_routes']. Falls back to
+    _call_llm_cheap() if route not configured or call fails.
+    """
+    try:
+        async with _db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM user_config WHERE key='api_routes'")
+        routes = {}
+        if row and row["value"]:
+            rv = row["value"]
+            routes = rv if isinstance(rv, dict) else __import__("json").loads(rv)
+    except Exception:
+        routes = {}
+
+    route = routes.get(route_name) or _DEFAULT_API_ROUTES.get(route_name, {})
+    provider_name = route.get("provider", "nvidia-llm")
+    model_override = route.get("model", "").strip()
+
+    # Build message list
+    msgs: list[dict] = []
+    if sys_prompt:
+        msgs.append({"role": "system", "content": sys_prompt})
+    msgs.append({"role": "user", "content": prompt})
+
+    try:
+        async with _db_pool.acquire() as conn:
+            prow = await conn.fetchrow(
+                "SELECT base_url, api_key FROM providers WHERE name=$1 LIMIT 1",
+                provider_name,
+            )
+        if not prow:
+            return await _call_llm_cheap(prompt)
+
+        base = prow["base_url"].rstrip("/")
+        hdrs = {"Authorization": "Bearer " + prow["api_key"], "Content-Type": "application/json"}
+
+        models_to_try = (
+            [model_override] + (route.get("fallback_chain") or [])
+            if model_override else (_CHEAP_LLM_MODELS[:])
+        )
+        for model in models_to_try:
+            try:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    resp = await client.post(
+                        base + "/chat/completions",
+                        headers=hdrs,
+                        json={"model": model, "messages": msgs, "max_tokens": 300, "temperature": 0.8},
+                    )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data["choices"][0]["message"]["content"].strip()
+            except Exception:
+                continue
+        # fallback
+        return await _call_llm_cheap(prompt)
+    except Exception:
+        return await _call_llm_cheap(prompt)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P0.2  Timezone Injection (Notion spec §1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def build_time_context(agent_id: str = "") -> str:
+    """Return [时间信息] block with user+char current times and timezone.
+
+    Reads TIMEZONE_CONFIG from user_context in user_config.
+    Falls back to Asia/Shanghai (user) if not configured.
+    """
+    import datetime as _dttz
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        try:
+            from backports.zoneinfo import ZoneInfo  # type: ignore
+        except ImportError:
+            ZoneInfo = None
+
+    try:
+        async with _db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM user_config WHERE key='user_context'")
+        ucv = row["value"] if row else None
+        uc  = (ucv if isinstance(ucv, dict) else __import__("json").loads(ucv)) if ucv else {}
+    except Exception:
+        uc = {}
+
+    tz_cfg   = uc.get("timezone") or {}
+    user_tz  = tz_cfg.get("user", {}).get("default", "Asia/Shanghai") if isinstance(tz_cfg.get("user"), dict) else str(tz_cfg.get("user", "Asia/Shanghai"))
+    char_tz  = tz_cfg.get("character", {}).get("default", "Asia/Shanghai") if isinstance(tz_cfg.get("character"), dict) else str(tz_cfg.get("character", "Asia/Shanghai"))
+
+    # Apply character travel override
+    char_tz_cfg = tz_cfg.get("character", {}) if isinstance(tz_cfg.get("character"), dict) else {}
+    travel_override = (char_tz_cfg.get("travel_mode") or {}).get("current_override") or ""
+    if travel_override:
+        char_tz = travel_override
+
+    def _now_in(tz_name: str) -> _dttz.datetime:
+        now_utc = _dttz.datetime.utcnow().replace(tzinfo=_dttz.timezone.utc)
+        if ZoneInfo:
+            try:
+                return now_utc.astimezone(ZoneInfo(tz_name))
+            except Exception:
+                pass
+        # fallback: crude UTC offset guessing for common zones
+        _offsets = {"Asia/Shanghai": 8, "Asia/Tokyo": 9, "America/Los_Angeles": -7,
+                    "America/New_York": -4, "Europe/London": 1, "UTC": 0}
+        offset_h = _offsets.get(tz_name, 0)
+        return now_utc + _dttz.timedelta(hours=offset_h)
+
+    user_now = _now_in(user_tz)
+    char_now = _now_in(char_tz)
+
+    # Compute hour diff (approximate)
+    _uo = {"Asia/Shanghai": 8, "Asia/Tokyo": 9, "America/Los_Angeles": -7,
+           "America/New_York": -4, "Europe/London": 1, "UTC": 0}
+    diff_h = _uo.get(user_tz, 8) - _uo.get(char_tz, 8)
+    same_city = (user_tz == char_tz)
+    relation_mode = "同城/同居" if same_city else "异地"
+
+    lines = [
+        "[时间信息]",
+        f"你的当前时间：{char_now.strftime('%Y-%m-%d %H:%M')}（{char_tz}）",
+        f"用户的当前时间：{user_now.strftime('%Y-%m-%d %H:%M')}（{user_tz}）",
+    ]
+    if diff_h != 0:
+        direction = "快" if diff_h > 0 else "慢"
+        lines.append(f"时差：用户比你{direction}{abs(diff_h):.0f}小时")
+    lines.append(f"关系模式：{relation_mode}")
+    return chr(10).join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P0.3  Accumulator Helpers (Notion spec §4.3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Thresholds that trigger a proactive message
+_ACCUMULATOR_THRESHOLDS: dict[str, float] = {
+    "miss_you":  10.0,
+    "low_mood":   8.0,
+}
+# After-trigger reset values
+_ACCUMULATOR_RESET: dict[str, float] = {
+    "miss_you": 0.0,
+    "low_mood": 3.0,   # low_mood doesn't fully clear
+}
+# After-trigger cooldown (seconds)
+_ACCUMULATOR_COOLDOWN: dict[str, str] = {
+    "miss_you": "miss_you_trigger",
+    "low_mood": "low_mood_trigger",
+}
+
+# Global push control defaults (Notion spec §8.2)
+_PUSH_CONTROL_DEFAULTS: dict = {
+    "max_daily_proactive_messages": 3,
+    "quiet_hours": ["01:00", "07:30"],   # user timezone
+    "user_busy_override": True,
+    "user_busy_timeout": 7200,
+    "trigger_check_interval": 7200,    # changed to 2h
+    "channels": {
+        "default_channels": ["telegram", "bark"],
+        "category_overrides": {
+            "medication": ["bark"],    # medication reminders → bark only
+        },
+    },
+}
+
+
+async def _get_push_control() -> dict:
+    """Read push_control from user_config, with defaults."""
+    try:
+        async with _db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM user_config WHERE key='push_control'")
+        if row and row["value"]:
+            rv = row["value"]
+            cfg = rv if isinstance(rv, dict) else __import__("json").loads(rv)
+            return {**_PUSH_CONTROL_DEFAULTS, **cfg}
+    except Exception:
+        pass
+    return dict(_PUSH_CONTROL_DEFAULTS)
+
+
+async def _check_quiet_hours(agent_id: str = "") -> bool:
+    """Return True if we're inside the user's quiet hours (should NOT push).
+
+    Uses user timezone from user_context; compares current time to quiet_hours window.
+    """
+    import datetime as _dtqh
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+    except ImportError:
+        try:
+            from backports.zoneinfo import ZoneInfo as _ZI  # type: ignore
+        except ImportError:
+            _ZI = None
+
+    ctrl = await _get_push_control()
+    quiet = ctrl.get("quiet_hours", ["01:00", "07:30"])
+    if not quiet or len(quiet) < 2:
+        return False
+
+    try:
+        async with _db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM user_config WHERE key='user_context'")
+        ucv = row["value"] if row else None
+        uc  = (ucv if isinstance(ucv, dict) else __import__("json").loads(ucv)) if ucv else {}
+        tz_cfg  = uc.get("timezone") or {}
+        user_tz = (tz_cfg.get("user", {}).get("default", "Asia/Shanghai")
+                   if isinstance(tz_cfg.get("user"), dict)
+                   else str(tz_cfg.get("user", "Asia/Shanghai")))
+    except Exception:
+        user_tz = "Asia/Shanghai"
+
+    now_utc = _dtqh.datetime.utcnow().replace(tzinfo=_dtqh.timezone.utc)
+    if _ZI:
+        try:
+            now_local = now_utc.astimezone(_ZI(user_tz))
+        except Exception:
+            now_local = now_utc
+    else:
+        _offsets = {"Asia/Shanghai": 8, "Asia/Tokyo": 9, "America/Los_Angeles": -7,
+                    "America/New_York": -4, "Europe/London": 1, "UTC": 0}
+        now_local = now_utc + _dtqh.timedelta(hours=_offsets.get(user_tz, 8))
+
+    def _parse_hm(s: str) -> _dtqh.time:
+        h, m = s.split(":")
+        return _dtqh.time(int(h), int(m))
+
+    start = _parse_hm(quiet[0])
+    end   = _parse_hm(quiet[1])
+    t     = now_local.time().replace(second=0, microsecond=0)
+
+    if start <= end:
+        return start <= t <= end
+    else:  # wraps midnight
+        return t >= start or t <= end
+
+
+async def _check_daily_push_limit(agent_id: str) -> bool:
+    """Return True if today's proactive message count is under the configured limit.
+
+    Counts entries in push_log for today (UTC) with sent=1.
+    """
+    from memory_db import get_db as _get_db2
+    ctrl = await _get_push_control()
+    limit = ctrl.get("max_daily_proactive_messages", 3)
+    if limit <= 0:
+        return True
+    try:
+        db = await _get_db2()
+        import datetime as _dtdl
+        today = _dtdl.datetime.utcnow().strftime("%Y-%m-%d")
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM push_log WHERE agent_id=? AND sent=1 AND created_at >= ?",
+            (agent_id, today + " 00:00:00")
+        )
+        row = await cur.fetchone()
+        count = row[0] if row else 0
+        return count < limit
+    except Exception:
+        return True
+
+
+async def _push_send(
+    msg: str,
+    category: str = "default",
+    title: str = "",
+    parse_mode: str = "",
+) -> bool:
+    """Route a proactive push to the channels configured for `category`.
+
+    Reads push_control.channels:
+      default_channels     → ["telegram","bark"] (both by default)
+      category_overrides   → {"medication": ["bark"], ...}
+
+    bark also_telegram is always False here to avoid double telegram sends.
+    Returns True if at least one channel succeeded.
+    """
+    import os as _osps
+    ctrl = await _get_push_control()
+    ch_cfg     = ctrl.get("channels", {})
+    overrides  = ch_cfg.get("category_overrides", {})
+    channels   = overrides.get(category) or ch_cfg.get("default_channels", ["telegram", "bark"])
+
+    ok = False
+    if "telegram" in channels:
+        ok = await _telegram_send(msg, parse_mode=parse_mode) or ok
+    if "bark" in channels and _osps.getenv("BARK_URL"):
+        try:
+            await bark_push(title or "通知", msg, also_telegram=False)
+            ok = True
+        except Exception as _bpe:
+            print(f"[push_send] bark error ({category}): {_bpe}", flush=True)
+    return ok
+
+
+async def _check_user_outgoing_yesterday(agent_id: str) -> bool:
+    """Return True if yesterday's conversations/activity mention '出门' (going out).
+
+    Searches the last 36 h of palimpsest memories and recent activity events
+    for outgoing-trip keywords.  Used to force weather push probability to 1.0.
+    """
+    import datetime as _dtou
+    _GO_OUT_KW = ["出门", "要出去", "出去一下", "需要出门", "早点出门", "出行",
+                  "外出", "要去", "去一趟", "要上班", "上班去", "有事出去"]
+    try:
+        # Check last 36 h of memories
+        cutoff = (_dtou.datetime.utcnow() - _dtou.timedelta(hours=36)).isoformat()
+        from memory_db import get_db as _gdb_ou
+        db = await _gdb_ou()
+        cur = await db.execute(
+            "SELECT content FROM memories WHERE agent_id=? AND created_at >= ? "
+            "ORDER BY created_at DESC LIMIT 30",
+            (agent_id, cutoff)
+        )
+        rows = await cur.fetchall()
+        combined = " ".join(r[0] or "" for r in rows)
+        if any(kw in combined for kw in _GO_OUT_KW):
+            return True
+    except Exception:
+        pass
+    try:
+        # Also check activity_events
+        acts = await _act_recent(agent_id, hours=36)
+        acts_text = " ".join(str(a.get("note","")) + " " + str(a.get("category","")) for a in acts)
+        if any(kw in acts_text for kw in _GO_OUT_KW):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 RECENT_DAYS     = 30
@@ -1744,6 +2105,17 @@ async def random_event_roll(
             source="random_event",
         )
         result += " (saved to journal)"
+    # Apply event mood/accumulator effects and schedule chain if defined
+    try:
+        import json as _jevt
+        mood_eff = _jevt.loads(evt.get("mood_effect") or "{}") if isinstance(evt.get("mood_effect"), str) else (evt.get("mood_effect") or {})
+        acc_eff  = _jevt.loads(evt.get("accumulator_effect") or "{}") if isinstance(evt.get("accumulator_effect"), str) else (evt.get("accumulator_effect") or {})
+        if mood_eff or acc_eff:
+            await _accumulate_state(agent_id, {**mood_eff, **acc_eff})
+            await _check_accumulator_thresholds(agent_id)
+        await _maybe_schedule_chain(agent_id, evt)
+    except Exception as _evte:
+        print(f"[event_roll] effects/chain err: {_evte}")
     return result
 
 
@@ -1923,12 +2295,16 @@ async def daily_life_generate(
     except Exception:
         pass
 
-    # 5. Daily skeleton config (occupation, habits) from user_config
+    # 5. Daily skeleton config (occupation, habits) from user_config — agent-specific, fallback global
     _skeleton_ctx = ""
     try:
         async with _db_pool.acquire() as _sc:
             _sk_row = await _sc.fetchrow(
-                "SELECT value FROM user_config WHERE key='daily_skeleton'")
+                "SELECT value FROM user_config WHERE key=$1",
+                f"daily_skeleton:{agent_id}")
+            if not _sk_row:
+                _sk_row = await _sc.fetchrow(
+                    "SELECT value FROM user_config WHERE key='daily_skeleton'")
         if _sk_row:
             _skv = _sk_row["value"]
             _sk = (_skv if isinstance(_skv, dict) else __import__("json").loads(_skv)) if _skv else {}
@@ -2625,10 +3001,16 @@ async def startup():
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     COVERS_DIR.mkdir(parents=True, exist_ok=True)
     asyncio.create_task(_auto_backup_loop())
-    asyncio.create_task(_auto_cleanup_loop())  # Palimpsest auto-cleanup
-    asyncio.create_task(_nightly_character_loop())  # Nightly daily-life gen
-    asyncio.create_task(_nightly_agent_loop())      # Nightly agent project maintenance
-    asyncio.create_task(_nightly_dream_loop())      # Nightly dream: L4→L3 + GitHub Obsidian
+    asyncio.create_task(_auto_cleanup_loop())        # Palimpsest auto-cleanup
+    asyncio.create_task(_nightly_character_loop())   # Nightly daily-life gen
+    asyncio.create_task(_nightly_agent_loop())       # Nightly agent project maintenance
+    asyncio.create_task(_nightly_dream_loop())       # Nightly dream: L4→L3 + GitHub Obsidian
+    asyncio.create_task(_morning_push_loop())        # Morning push (char tz 08:15-08:30)
+    asyncio.create_task(_evening_push_loop())        # Evening goodnight (char tz 22:30-23:30)
+    asyncio.create_task(_chain_event_loop())         # Chain event queue processor (5 min)
+    asyncio.create_task(_silence_tracker_loop())     # 2h miss_you accumulator
+    asyncio.create_task(_news_daily_loop())          # Daily RSS news fetch & cache
+    asyncio.create_task(_health_monitor_loop())      # Health metrics monitor
     asyncio.create_task(_register_telegram_webhook())  # Telegram bot webhook
     asyncio.create_task(_heartbeat_loop())           # 24h LLM liveness watchdog
 
@@ -3127,6 +3509,11 @@ async def _nightly_character_loop() -> None:
                         print(f"[nightly] cleanup({aid}): expired {_cr['total']} memories")
                 except Exception as ae:
                     print(f"[nightly] cleanup({aid}) error: {ae}")
+                # P2.3 Promise reminders (sets scene_note for morning push context)
+                try:
+                    await _check_promise_reminders(aid)
+                except Exception as ae:
+                    print(f"[nightly] promise_reminders({aid}) error: {ae}")
         except Exception as e:
             print(f"[nightly error] {e}")
         # Sleep 24 h
@@ -3195,7 +3582,7 @@ async def _check_proactive_triggers(agent_id: str) -> None:
                 f"这让你想起了用户曾说过或经历过的：「{mem_text}」。\n"
                 "写一条简短的主动消息发给用户（1-2句，中文口语，自然温暖，不要解释你在想什么）："
             )
-            msg = (await _call_llm_cheap(prompt)).strip()
+            msg = (await _call_llm_route("proactive_push", prompt)).strip()
             if not msg:
                 return
             # Strip possible surrounding quotes
@@ -3203,14 +3590,1464 @@ async def _check_proactive_triggers(agent_id: str) -> None:
         except Exception as _e:
             print(f"[proactive] LLM error: {_e}", flush=True)
             return
+        # Check quiet hours + daily limit
+        if await _check_quiet_hours():
+            return
+        if not await _check_daily_push_limit(agent_id):
+            return
         # Send via Telegram
         try:
             ok = await _telegram_send(msg)
+            await _push_log_write(
+                agent_id=agent_id, category="proactive_casual",
+                trigger_src="daily_event", message=msg, sent=ok,
+            )
             if ok:
                 print(f"[proactive] sent for {agent_id}: {msg[:60]}", flush=True)
         except Exception as _e:
             print(f"[proactive] telegram error: {_e}", flush=True)
         return  # one message max
+
+
+async def _morning_push_for_agent(agent_id: str) -> None:
+    """Send a char-voice morning greeting (Notion spec §2).
+
+    Container + probability injection:
+    - greeting: always (100%)
+    - weather: 20% normal / 80% severe
+    - schedule: 100% important / 45% normal
+    - random event: if enabled
+
+    Guard conditions:
+    - cooldown 'morning_weather' not active
+    - not in quiet hours
+    - daily push limit not exceeded
+    """
+    import random as _rnm, datetime as _dtm2
+
+    # Cooldown + global guards
+    if not await _cd_gate(agent_id, "morning_weather", 86400):
+        return
+    if await _check_quiet_hours():
+        return
+    if not await _check_daily_push_limit(agent_id):
+        return
+
+    try:
+        # Read user_context config
+        async with _db_pool.acquire() as _mc:
+            _ucr = await _mc.fetchrow("SELECT value FROM user_config WHERE key='user_context'")
+        _ucv = _ucr["value"] if _ucr else None
+        _uc  = (_ucv if isinstance(_ucv, dict) else __import__("json").loads(_ucv)) if _ucv else {}
+        _ds  = _uc.get("data_sources") or {}
+        _city = (_uc.get("location") or {}).get("city", "")
+
+        # Read morning push config from user_config (Notion spec §2.1)
+        async with _db_pool.acquire() as _mc2:
+            _mpr = await _mc2.fetchrow("SELECT value FROM user_config WHERE key='morning_push_config'")
+        _mpcv = _mpr["value"] if _mpr else None
+        _mpc  = (_mpcv if isinstance(_mpcv, dict) else __import__("json").loads(_mpcv)) if _mpcv else {}
+        weather_normal_prob  = float(_mpc.get("weather_normal_probability",  0.20))
+        weather_severe_prob  = float(_mpc.get("weather_severe_probability",  0.80))
+        schedule_normal_prob = float(_mpc.get("schedule_normal_probability", 0.45))
+        random_event_enabled = bool(_mpc.get("random_event_enabled", True))
+
+        # ── 出门关键词覆写：前一天提到要出门则100%推送天气 ──────────────────
+        _user_going_out = False
+        try:
+            _user_going_out = await _check_user_outgoing_yesterday(agent_id)
+            if _user_going_out:
+                weather_normal_prob = 1.0
+                weather_severe_prob = 1.0
+        except Exception:
+            pass
+
+        # ── Weather module ────────────────────────────────────────────────────
+        weather_str = ""
+        weather_module_info = "skipped"
+        _wds = _ds.get("weather")
+        weather_allowed = True
+        if isinstance(_wds, dict):
+            weather_allowed = _wds.get("enabled", True)
+        elif _wds is False:
+            weather_allowed = False
+
+        if weather_allowed and _city:
+            try:
+                _w = await amap_weather(_city)
+                if _w and not _w.startswith("Error") and not _w.startswith("Weather error"):
+                    # Detect severe weather
+                    _SEVERE_KEYWORDS = ["大雨", "暴雨", "雷雨", "冰雹", "台风", "暴雪", "大风",
+                                        "35", "36", "37", "38", "39", "40", "0°", "-"]
+                    is_severe = any(kw in _w for kw in _SEVERE_KEYWORDS)
+                    prob = weather_severe_prob if is_severe else weather_normal_prob
+                    if _rnm.random() < prob:
+                        weather_str = _w
+                        weather_module_info = f"injected (severe={is_severe}, go_out={_user_going_out})"
+                    else:
+                        weather_module_info = f"prob miss (severe={is_severe}, p={prob:.0%})"
+            except Exception:
+                pass
+
+        # ── Schedule module ───────────────────────────────────────────────────
+        schedule_str = ""
+        schedule_module_info = "skipped"
+        try:
+            _tasks = await todoist_get_tasks_raw(limit=5)  # helper defined below
+            if _tasks:
+                import datetime as _dtsch
+                today_str = _dtsch.date.today().isoformat()
+                important = [t for t in _tasks if t.get("priority", 1) >= 3]
+                normal = [t for t in _tasks if t.get("priority", 1) < 3]
+                schedule_parts = []
+                if important:
+                    schedule_parts += [f"【重要】{t['content']}" for t in important[:2]]
+                    schedule_module_info = f"injected {len(important)} important"
+                for t in normal[:2]:
+                    if _rnm.random() < schedule_normal_prob:
+                        schedule_parts.append(t["content"])
+                if schedule_parts:
+                    schedule_str = "、".join(schedule_parts[:3])
+        except Exception:
+            pass
+
+        # ── Random event module ───────────────────────────────────────────────
+        event_str = ""
+        if random_event_enabled:
+            try:
+                _st = await _state_get(agent_id)
+                _ctx_mp = {
+                    "time_period": "morning",
+                    "weather": _parse_weather_code(weather_str) if weather_str else "clear",
+                    "mode": _st.get("scene", "daily"),
+                    "fatigue": int(_st.get("fatigue") or 0),
+                }
+                _evt = await _event_roll_with_context(agent_id, _ctx_mp)
+                if _evt:
+                    event_str = _evt.get("content", "")
+            except Exception:
+                pass
+
+        # ── News module ───────────────────────────────────────────────────────
+        news_str = ""
+        _news_cfg = await _get_news_config()
+        _news_push_prob = float(_news_cfg.get("morning_inject_prob", 0.30))
+        if _news_cfg.get("enabled", True) and _rnm.random() < _news_push_prob:
+            try:
+                _headlines = await _get_today_news(max_items=2)
+                if _headlines:
+                    news_str = "、".join(
+                        f"{h['title']}（{h.get('source','?')}）" for h in _headlines
+                    )
+                    await _mark_news_pushed([h["id"] for h in _headlines])
+            except Exception:
+                pass
+
+        # ── Build prompt ──────────────────────────────────────────────────────
+        _as = await _get_agent_settings(agent_id)
+        _sp = (_as.get("system_prompt") or "").strip()
+        ctx_parts = []
+        if weather_str:
+            ctx_parts.append(f"今天天气：{weather_str}")
+        if schedule_str:
+            ctx_parts.append(f"用户今天可能有：{schedule_str}")
+        if event_str:
+            ctx_parts.append(f"你早上发生了：{event_str}")
+        if news_str:
+            ctx_parts.append(f"今日新闻：{news_str}")
+
+        ctx_block = "；".join(ctx_parts) if ctx_parts else ""
+
+        if _sp:
+            _prompt = (
+                f"你是以下角色：\n{_sp[:350]}\n\n"
+                + (f"背景信息：{ctx_block}\n\n" if ctx_block else "")
+                + "写一条早晨问候消息发给用户（1-2句，中文口语，自然温暖"
+                + ("，顺带提一下天气" if weather_str else "")
+                + "，不要解释）："
+            )
+        else:
+            _prompt = (
+                (f"背景信息：{ctx_block}\n\n" if ctx_block else "")
+                + "写一条早晨问候消息发给用户（1-2句，中文口语，自然温暖）："
+            )
+
+        msg = (await _call_llm_route("proactive_push", _prompt)).strip().strip("\"'")
+        if not msg:
+            return
+
+        ok = await _push_send(msg, category="morning_push")
+        modules_log = {
+            "weather": weather_module_info,
+            "schedule": schedule_module_info if schedule_str else "skipped",
+            "random_event": event_str[:30] if event_str else "skipped",
+            "news": news_str[:60] if news_str else "skipped",
+        }
+        await _push_log_write(
+            agent_id=agent_id, category="morning_weather",
+            trigger_src="morning_push_loop", message=msg,
+            sent=ok, modules=modules_log,
+        )
+        if ok:
+            print(f"[morning_push] sent for {agent_id}: {msg[:60]}", flush=True)
+    except Exception as _e:
+        print(f"[morning_push] error for {agent_id}: {_e}", flush=True)
+
+
+async def todoist_get_tasks_raw(limit: int = 5) -> list[dict]:
+    """Fetch today's Todoist tasks directly. Returns [] if not configured."""
+    import os as _os_td
+    import httpx as _hx_td
+    _tok = _os_td.getenv("TODOIST_API_KEY", "")
+    if not _tok:
+        return []
+    try:
+        async with _hx_td.AsyncClient(timeout=10) as cl:
+            r = await cl.get(
+                "https://api.todoist.com/rest/v2/tasks",
+                headers={"Authorization": f"Bearer {_tok}"},
+                params={"filter": "today|overdue"},
+            )
+        if r.status_code == 200:
+            return r.json()[:limit]
+    except Exception:
+        pass
+    return []
+
+
+def _parse_weather_code(weather_str: str) -> str:
+    """Extract a simple weather code from amap weather string for event filtering."""
+    _MAP = {
+        "晴": "sunny", "多云": "cloudy", "阴": "overcast",
+        "小雨": "light_rain", "中雨": "rain", "大雨": "heavy_rain",
+        "暴雨": "heavy_rain", "雷": "thunderstorm",
+        "雪": "snow", "雾": "fog", "冰雹": "hail",
+    }
+    for ch, code in _MAP.items():
+        if ch in weather_str:
+            return code
+    return "clear"
+
+
+def _current_time_period() -> str:
+    """Return time-of-day category based on UTC+8."""
+    import datetime as _dttp
+    h = (_dttp.datetime.utcnow().hour + 8) % 24
+    if 6 <= h < 12:   return "morning"
+    if 12 <= h < 18:  return "afternoon"
+    if 18 <= h < 22:  return "evening"
+    if 22 <= h or h < 1: return "night"
+    return "late_night"
+
+
+def _current_day_type() -> str:
+    """Return workday/weekend."""
+    import datetime as _dtdt
+    return "weekend" if _dtdt.date.today().weekday() >= 5 else "workday"
+
+
+def _current_season() -> str:
+    """Return current season (Northern Hemisphere)."""
+    import datetime as _dtss
+    m = _dtss.date.today().month
+    if m in (3, 4, 5):   return "spring"
+    if m in (6, 7, 8):   return "summer"
+    if m in (9, 10, 11): return "autumn"
+    return "winter"
+
+
+async def _event_roll_with_context(agent_id: str, ctx: dict) -> dict | None:
+    """Roll a random event filtered by condition tags (Notion spec §5.1-5.2).
+
+    ctx keys: weather, time_period, day_type, mode, season, fatigue
+    Events without conditions are always eligible (global pool behaviour).
+    """
+    import random as _rnec
+    from memory_db import get_db as _gdb_ec
+    db = await _gdb_ec()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM random_events WHERE (agent_id=? OR agent_id='')",
+        (agent_id,)
+    )
+    if not rows:
+        return None
+    rows = [dict(r) for r in rows]
+
+    # Apply condition filter (Notion spec §5.2)
+    eligible = []
+    for ev in rows:
+        conds_raw = ev.get("conditions") or "{}"
+        try:
+            conds = __import__("json").loads(conds_raw) if isinstance(conds_raw, str) else conds_raw
+        except Exception:
+            conds = {}
+        if not conds:
+            eligible.append(ev)
+            continue
+        # Check each condition
+        ok = True
+        if "weather" in conds and ctx.get("weather") not in conds["weather"]:
+            ok = False
+        if ok and "time_of_day" in conds and ctx.get("time_period") not in conds["time_of_day"]:
+            ok = False
+        if ok and "day_type" in conds and ctx.get("day_type") not in conds["day_type"]:
+            ok = False
+        if ok and "mode" in conds and ctx.get("mode") not in conds["mode"]:
+            ok = False
+        if ok and "season" in conds and ctx.get("season") not in conds["season"]:
+            ok = False
+        if ok and "fatigue_above" in conds:
+            if int(ctx.get("fatigue") or 0) < int(conds["fatigue_above"]):
+                ok = False
+        if ok:
+            eligible.append(ev)
+
+    if not eligible:
+        return None
+
+    # Weighted roll, then check base_prob (send_probability)
+    weights = [float(r.get("weight") or 1.0) for r in eligible]
+    selected = _rnec.choices(eligible, weights=weights, k=min(4, len(eligible)))
+
+    for ev in selected:
+        base_prob = float(ev.get("send_probability") or 0.4)
+        if _rnec.random() < base_prob:
+            return ev
+    return None
+
+
+async def _morning_push_loop() -> None:
+    """Background task: daily morning push for character agents (Notion spec §2.1).
+
+    Each day, computes a random trigger time within the configured window
+    [08:15, 08:30] in the CHARACTER's timezone. Waits until that UTC time,
+    then calls _morning_push_for_agent() for each eligible char agent.
+    """
+    import datetime as _dtm, random as _rnml
+
+    async def _compute_next_trigger() -> float:
+        """Return seconds to sleep until next trigger in char timezone window."""
+        # Read char timezone
+        try:
+            async with _db_pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT value FROM user_config WHERE key='user_context'")
+            ucv = row["value"] if row else None
+            uc  = (ucv if isinstance(ucv, dict) else __import__("json").loads(ucv)) if ucv else {}
+            tz_cfg   = uc.get("timezone") or {}
+            _char_tz = tz_cfg.get("character", {}).get("default", "Asia/Shanghai") if isinstance(tz_cfg.get("character"), dict) else str(tz_cfg.get("character", "Asia/Shanghai"))
+            # Read push config time window
+            async with _db_pool.acquire() as conn2:
+                mpr = await conn2.fetchrow("SELECT value FROM user_config WHERE key='morning_push_config'")
+            mpcv = mpr["value"] if mpr else None
+            mpc  = (mpcv if isinstance(mpcv, dict) else __import__("json").loads(mpcv)) if mpcv else {}
+            window = mpc.get("time_window", ["08:15", "08:30"])
+        except Exception:
+            _char_tz = "Asia/Shanghai"
+            window = ["08:15", "08:30"]
+
+        _OFFSETS = {"Asia/Shanghai": 8, "Asia/Tokyo": 9, "America/Los_Angeles": -7,
+                    "America/New_York": -4, "Europe/London": 1, "UTC": 0}
+        offset_h = _OFFSETS.get(_char_tz, 8)
+
+        # Parse window
+        def _hm(s):
+            h, m = s.split(":")
+            return int(h) * 60 + int(m)
+
+        wstart_min = _hm(window[0])  # minutes from midnight in char tz
+        wend_min   = _hm(window[1])
+        rand_min   = _rnml.uniform(wstart_min, wend_min)
+
+        # Convert to UTC minutes from midnight
+        utc_min = (rand_min - offset_h * 60) % (24 * 60)
+
+        now_utc = _dtm.datetime.utcnow()
+        today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        trigger_utc = today_start + _dtm.timedelta(minutes=utc_min)
+        if trigger_utc <= now_utc:
+            trigger_utc += _dtm.timedelta(days=1)
+        return (trigger_utc - now_utc).total_seconds()
+
+    while True:
+        wait = await _compute_next_trigger()
+        await asyncio.sleep(wait)
+        try:
+            async with _db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT agent_id FROM agent_settings "
+                    "WHERE agent_type = 'character' AND auto_memory = TRUE"
+                )
+            for r in rows:
+                try:
+                    await _morning_push_for_agent(r["agent_id"])
+                except Exception as _ae:
+                    print(f"[morning_push] loop error for {r['agent_id']}: {_ae}")
+        except Exception as e:
+            print(f"[morning_push] loop error: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P0.3  Accumulator threshold checker + silence tracker (Notion spec §4.3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _check_accumulator_thresholds(agent_id: str) -> None:
+    """Check miss_you / low_mood thresholds and send a proactive message if triggered.
+
+    Called: periodically by _silence_tracker_loop + after event injection.
+    """
+    import random as _rnda
+    if await _check_quiet_hours():
+        return
+    if not await _check_daily_push_limit(agent_id):
+        return
+
+    st = await _state_get(agent_id)
+
+    for acc, threshold in _ACCUMULATOR_THRESHOLDS.items():
+        cur_val = float(st.get(acc) or 0.0)
+        if cur_val < threshold:
+            continue
+
+        cd_cat = _ACCUMULATOR_COOLDOWN.get(acc, acc + "_trigger")
+        if not await _cd_gate(agent_id, cd_cat):
+            continue
+
+        # Build char-voice message
+        try:
+            _as = await _get_agent_settings(agent_id)
+            _sp = (_as.get("system_prompt") or "").strip()
+
+            if acc == "miss_you":
+                variety = _rnda.choices(
+                    ["direct", "excuse", "share_moment"],
+                    weights=[0.20, 0.50, 0.30], k=1
+                )[0]
+                variety_hint = {
+                    "direct": "直接说想念对方",
+                    "excuse": "找个借口联系（比如分享了某件小事）",
+                    "share_moment": "分享自己正在做的事，顺带提到对方",
+                }.get(variety, "自然地联系对方")
+                push_prompt = (
+                    f"你是以下角色：\n{_sp[:300]}\n\n"
+                    f"你非常想念用户，思念值已满。\n"
+                    f"请用「{variety_hint}」的方式写一条主动联系消息（1-2句，中文口语）："
+                ) if _sp else f"用自然口语写一条「{variety_hint}」类型的思念消息（1-2句中文）："
+
+            elif acc == "low_mood":
+                variety = _rnda.choices(
+                    ["subtle_hint", "seek_comfort", "clingy", "share_bad_day"],
+                    weights=[0.30, 0.25, 0.25, 0.20], k=1
+                )[0]
+                variety_hint = {
+                    "subtle_hint": "发低落状态但不明说原因",
+                    "seek_comfort": "直接说心情不好",
+                    "clingy": "撒娇/粘人",
+                    "share_bad_day": "讲今天的一件不顺心的事",
+                }.get(variety, "表达低落情绪")
+                push_prompt = (
+                    f"你是以下角色：\n{_sp[:300]}\n\n"
+                    f"你今天心情比较低落，想联系用户。\n"
+                    f"请用「{variety_hint}」的方式写一条消息（1-2句，中文口语）："
+                ) if _sp else f"用自然口语写一条「{variety_hint}」类型的低落消息（1-2句中文）："
+            else:
+                continue
+
+            msg = (await _call_llm_route("proactive_push", push_prompt)).strip().strip("\"'")
+            if not msg:
+                continue
+
+            # Reset accumulator after trigger
+            reset_val = _ACCUMULATOR_RESET.get(acc, 0.0)
+            await _state_set(agent_id, **{acc: reset_val})
+
+            ok = await _push_send(msg, category=acc + "_trigger")
+            await _push_log_write(
+                agent_id=agent_id, category=acc + "_trigger",
+                trigger_src="accumulator", message=msg, sent=ok,
+            )
+            if ok:
+                print(f"[accumulator] {acc} triggered for {agent_id}: {msg[:50]}", flush=True)
+        except Exception as _ae:
+            print(f"[accumulator] error for {agent_id}/{acc}: {_ae}", flush=True)
+
+
+async def _silence_tracker_loop() -> None:
+    """Background task: track user silence and accumulate miss_you every 2 h.
+
+    Runs every 2 hours. Skips entirely during quiet/sleep hours (晚安-早安).
+    For each char agent with auto_memory=True:
+    - Reads last_user_msg from character_state
+    - Computes silence duration → accumulate miss_you
+    - Calls _check_accumulator_thresholds after each accumulation
+    """
+    import datetime as _dts
+    # Stagger startup by 5 min to avoid pile-up with other loops
+    await asyncio.sleep(300)
+
+    while True:
+        # Skip entire iteration during sleep hours (入睡时段不检查)
+        try:
+            if await _check_quiet_hours():
+                await asyncio.sleep(7200)
+                continue
+        except Exception:
+            pass
+
+        try:
+            async with _db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT agent_id FROM agent_settings "
+                    "WHERE agent_type='character' AND auto_memory=TRUE"
+                )
+            for r in rows:
+                aid = r["agent_id"]
+                try:
+                    st = await _state_get(aid)
+                    last_msg_str = st.get("last_user_msg") or st.get("last_active", "")
+                    if not last_msg_str:
+                        continue
+                    try:
+                        last_msg_dt = _dts.datetime.fromisoformat(
+                            str(last_msg_str).replace("Z", "").split("+")[0]
+                        )
+                    except Exception:
+                        continue
+                    silence_hours = (
+                        _dts.datetime.utcnow() - last_msg_dt
+                    ).total_seconds() / 3600.0
+
+                    # Accumulate miss_you based on silence (Notion spec §4.3)
+                    if silence_hours >= 6:
+                        inc = 1.5
+                    elif silence_hours >= 3:
+                        inc = 1.0
+                    elif silence_hours >= 1:
+                        inc = 0.5
+                    else:
+                        inc = 0.0
+
+                    # Bonus: night time 22:00-02:00
+                    hour_utc = _dts.datetime.utcnow().hour
+                    if inc > 0 and (hour_utc >= 14 or hour_utc <= 18):  # ~22-02 CST
+                        inc += 0.3
+
+                    if inc > 0:
+                        await _accumulate_state(aid, {"miss_you": inc})
+                        await _check_accumulator_thresholds(aid)
+                except Exception as _ae:
+                    print(f"[silence_tracker] error for {aid}: {_ae}")
+        except Exception as e:
+            print(f"[silence_tracker] loop error: {e}")
+        await asyncio.sleep(7200)  # 2 h
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §13  新闻系统  (Notion spec §13)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Default RSS feeds — flat list, each item: {name, url, category?, skip_first?, take_count?, enabled?}
+_NEWS_RSS_DEFAULTS = [
+    {"name": "Reuters World", "url": "https://feeds.reuters.com/Reuters/worldNews",          "category": "world"},
+    {"name": "BBC World",     "url": "https://feeds.bbci.co.uk/news/world/rss.xml",           "category": "world"},
+    {"name": "澎湃要闻",       "url": "https://rsshub.app/thepaper/newsDetail/25",             "category": "china", "skip_first": 1},
+    {"name": "联合早报",       "url": "https://rsshub.app/zaobao/realtime/china",              "category": "china"},
+    {"name": "Dezeen",        "url": "https://www.dezeen.com/feed/",                          "category": "art_design"},
+    {"name": "Colossal",      "url": "https://www.thisiscolossal.com/feed/",                  "category": "art_design"},
+    {"name": "小红书热门",     "url": "https://rsshub.app/xiaohongshu/explore",                "category": "lifestyle", "enabled": False},
+    {"name": "36Kr",          "url": "https://36kr.com/feed",                                 "category": "tech"},
+    {"name": "少数派",         "url": "https://sspai.com/feed",                               "category": "tech"},
+]
+
+_NEWS_HARD_BLOCK = [
+    "选举","总统","国会","议会","制裁","外交部","国防部","军演","导弹","核武","政党",
+    "总书记","寄语","学习贯彻","两会","党委","常委会","中央纪委","反腐","意识形态",
+    "election","congress","sanctions","military","missile","nuclear",
+]
+
+_news_default_cfg = {
+    "enabled": True,
+    "fetch_time": "07:00",        # char timezone
+    "feeds": _NEWS_RSS_DEFAULTS,  # list of {name, url, category?, enabled?, skip_first?, take_count?}
+    "max_items_per_feed": 3,
+    "max_items": 10,
+    "inject_conversation_prob": 0.15,
+    "push_prob":  0.10,
+    "morning_prob": 0.10,
+    "morning_inject_prob": 0.30,  # alias used by morning push
+    "push_cooldown": 86400,
+    "interest_keywords": [],
+}
+
+
+async def _get_news_config() -> dict:
+    try:
+        async with _db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM user_config WHERE key='news_config'")
+        if row and row["value"]:
+            v = row["value"]
+            cfg = v if isinstance(v, dict) else __import__("json").loads(v)
+            return {**_news_default_cfg, **cfg}
+    except Exception:
+        pass
+    return dict(_news_default_cfg)
+
+
+async def _news_fetch_once() -> int:
+    """Fetch RSS feeds for all configured categories and store in news_cache.
+    Returns count of new items stored."""
+    import xml.etree.ElementTree as _ET
+    import hashlib as _hs
+    import datetime as _dtnf
+
+    cfg  = await _get_news_config()
+    if not cfg.get("enabled"):
+        return 0
+
+    feeds  = cfg.get("feeds") or _NEWS_RSS_DEFAULTS
+    max_pf = cfg.get("max_items_per_feed", 3)
+    stored = 0
+
+    from memory_db import get_db as _gdb_n
+    db = await _gdb_n()
+
+    async def _fetch_feed(url: str, skip_first: int = 0, take: int = 6) -> list[dict]:
+        """Fetch RSS/Atom feed → list of {title, summary, url, published}"""
+        try:
+            async with httpx.AsyncClient(timeout=12, follow_redirects=True,
+                                          headers={"User-Agent": "Mozilla/5.0"}) as _cl:
+                resp = await _cl.get(url)
+            if resp.status_code != 200:
+                return []
+            root = _ET.fromstring(resp.text)
+            ns = {"atom": "http://www.w3.org/2005/Atom"}
+            items = []
+
+            # RSS 2.0
+            for item in root.findall(".//item"):
+                title   = (item.findtext("title") or "").strip()
+                link    = (item.findtext("link")  or item.findtext("guid") or "").strip()
+                desc    = (item.findtext("description") or "").strip()[:300]
+                pubdate = (item.findtext("pubDate") or "").strip()
+                if title:
+                    items.append({"title": title, "url": link, "summary": desc, "published": pubdate})
+
+            # Atom
+            if not items:
+                for entry in root.findall("atom:entry", ns):
+                    title = (entry.findtext("atom:title", namespaces=ns) or "").strip()
+                    link_el = entry.find("atom:link", ns)
+                    link  = (link_el.get("href", "") if link_el is not None else "").strip()
+                    summary = (entry.findtext("atom:summary", namespaces=ns) or "").strip()[:300]
+                    pub = (entry.findtext("atom:published", namespaces=ns) or "").strip()
+                    if title:
+                        items.append({"title": title, "url": link, "summary": summary, "published": pub})
+
+            # Apply skip_first + take
+            items = items[skip_first: skip_first + take]
+            return items
+        except Exception as _fe:
+            print(f"[news_fetch] feed error {url}: {_fe}", flush=True)
+            return []
+
+    for feed in feeds:
+        if not feed.get("enabled", True):
+            continue
+        url  = feed.get("url", "")
+        cat  = feed.get("category", "general")
+        name = feed.get("name", url)
+        if not url:
+            continue
+        raw_items = await _fetch_feed(
+            url,
+            skip_first=feed.get("skip_first", 0),
+            take=feed.get("take_count", max_pf + 2)
+        )
+        count_this_feed = 0
+        for it in raw_items:
+            if count_this_feed >= max_pf:
+                break
+            title = it["title"]
+            # Hard-block political content
+            if any(kw.lower() in title.lower() for kw in _NEWS_HARD_BLOCK):
+                continue
+            # Dedup by content hash
+            uid = _hs.md5((name + title).encode()).hexdigest()
+            try:
+                cur = await db.execute("SELECT id FROM news_cache WHERE id=?", (uid,))
+                if await cur.fetchone():
+                    continue
+                await db.execute(
+                    "INSERT INTO news_cache (id,category,title,summary,source,url,published) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (uid, cat, title, it.get("summary",""), name,
+                     it.get("url",""), it.get("published",""))
+                )
+                count_this_feed += 1
+                stored += 1
+            except Exception:
+                pass
+    await db.commit()
+
+    # Prune old items (keep 7 days)
+    try:
+        cutoff = (_dtnf.datetime.utcnow() - _dtnf.timedelta(days=7)).isoformat()
+        await db.execute("DELETE FROM news_cache WHERE fetched_at < ?", (cutoff,))
+        await db.commit()
+    except Exception:
+        pass
+
+    print(f"[news_fetch] stored {stored} new items", flush=True)
+    return stored
+
+
+async def _get_today_news(category: str = "", max_items: int = 2, exclude_pushed: bool = True) -> list[dict]:
+    """Return today's cached news items, optionally filtered by category."""
+    import datetime as _dtnr
+    from memory_db import get_db as _gdb_nr
+    db = await _gdb_nr()
+    try:
+        today = _dtnr.datetime.utcnow().strftime("%Y-%m-%d")
+        if category:
+            cur = await db.execute(
+                "SELECT id,category,title,summary,source FROM news_cache "
+                "WHERE category=? AND fetched_at>=? AND pushed=0 "
+                "ORDER BY RANDOM() LIMIT ?",
+                (category, today, max_items)
+            )
+        else:
+            cur = await db.execute(
+                "SELECT id,category,title,summary,source FROM news_cache "
+                "WHERE fetched_at>=? AND pushed=0 "
+                "ORDER BY RANDOM() LIMIT ?",
+                (today, max_items)
+            )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+    except Exception as _e:
+        print(f"[news] get_today_news error: {_e}")
+        return []
+
+
+async def _mark_news_pushed(news_ids: list[str], field: str = "pushed") -> None:
+    from memory_db import get_db as _gdb_nm
+    db = await _gdb_nm()
+    try:
+        for nid in news_ids:
+            await db.execute(f"UPDATE news_cache SET {field}=1 WHERE id=?", (nid,))
+        await db.commit()
+    except Exception:
+        pass
+
+
+async def _news_daily_loop() -> None:
+    """Background task: fetch news once per day, timed to char tz 07:00."""
+    import datetime as _dtnd
+    await asyncio.sleep(120)  # brief startup delay
+    while True:
+        try:
+            cfg = await _get_news_config()
+            if not cfg.get("enabled"):
+                await asyncio.sleep(3600)
+                continue
+            fetch_time = cfg.get("fetch_time", "07:00")
+            # Compute seconds until next fetch_time in char timezone
+            try:
+                from zoneinfo import ZoneInfo as _ZI_nd
+            except ImportError:
+                try:
+                    from backports.zoneinfo import ZoneInfo as _ZI_nd
+                except ImportError:
+                    _ZI_nd = None
+
+            import os as _os_nd
+            char_tz_str = _os_nd.getenv("CHARACTER_TIMEZONE", "America/Los_Angeles")
+            now_utc = _dtnd.datetime.utcnow().replace(tzinfo=_dtnd.timezone.utc)
+            if _ZI_nd:
+                try:
+                    now_local = now_utc.astimezone(_ZI_nd(char_tz_str))
+                except Exception:
+                    now_local = now_utc
+            else:
+                now_local = now_utc
+            h, m = fetch_time.split(":")
+            target = now_local.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+            if target <= now_local:
+                target += _dtnd.timedelta(days=1)
+            wait_sec = (target - now_local).total_seconds()
+            await asyncio.sleep(max(wait_sec, 60))
+            await _news_fetch_once()
+        except Exception as e:
+            print(f"[news_daily_loop] error: {e}", flush=True)
+        await asyncio.sleep(3600)  # fallback: retry in 1h
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §15  Health MCP 健康监测系统  (Notion spec §15)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_health_default_cfg = {
+    "enabled": False,             # Activates when HEALTH_MCP_URL is set
+    "max_health_pushes_daily": 3,
+    "heart_rate": {
+        "enabled": True,
+        "fetch_interval": 900,
+        "resting_high_threshold": 100,
+        "resting_high_minutes": 10,
+        "resting_low_threshold": 50,
+        "sudden_spike_delta": 40,
+        "injection_prob": 0.10,
+    },
+    "steps": {
+        "enabled": True,
+        "daily_goal": 8000,
+        "sedentary_check_time": "15:00",
+        "sedentary_threshold": 2000,
+    },
+    "sleep": {
+        "enabled": True,
+        "poor_threshold_hours": 5,
+        "fetch_time": "09:00",
+    },
+    "menstrual": {
+        "enabled": True,
+        "remind_days_before": 3,
+        "mention_style": "natural",
+    },
+}
+
+
+async def _get_health_config() -> dict:
+    try:
+        async with _db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM user_config WHERE key='health_config'")
+        if row and row["value"]:
+            v = row["value"]
+            cfg = v if isinstance(v, dict) else __import__("json").loads(v)
+            return {**_health_default_cfg, **cfg}
+    except Exception:
+        pass
+    return dict(_health_default_cfg)
+
+
+async def _health_mcp_get(path: str) -> dict | None:
+    """Call Health MCP REST API (HEALTH_MCP_URL base). Returns JSON or None."""
+    import os as _osh
+    base = _osh.getenv("HEALTH_MCP_URL", "").rstrip("/")
+    if not base:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=8) as _cl:
+            resp = await _cl.get(f"{base}{path}")
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as _he:
+        print(f"[health_mcp] GET {path} error: {_he}", flush=True)
+    return None
+
+
+async def _health_monitor_loop() -> None:
+    """Background task: poll Health MCP and send alerts. Runs every 15 min when enabled."""
+    import os as _osh2
+    await asyncio.sleep(180)   # startup delay
+    while True:
+        try:
+            if not _osh2.getenv("HEALTH_MCP_URL"):
+                await asyncio.sleep(3600)
+                continue
+            cfg  = await _get_health_config()
+            if not cfg.get("enabled"):
+                await asyncio.sleep(1800)
+                continue
+            if await _check_quiet_hours():
+                await asyncio.sleep(900)
+                continue
+
+            # Determine active char agent for push
+            async with _db_pool.acquire() as _hc:
+                _hr = await _hc.fetch(
+                    "SELECT agent_id FROM agent_settings "
+                    "WHERE agent_type='character' AND auto_memory=TRUE LIMIT 1"
+                )
+            if not _hr:
+                await asyncio.sleep(900)
+                continue
+            aid = _hr[0]["agent_id"]
+
+            # ── Heart rate ──────────────────────────────────────────────────
+            hr_cfg = cfg.get("heart_rate", {})
+            if hr_cfg.get("enabled"):
+                data = await _health_mcp_get("/metrics/heart_rate/latest")
+                if data and data.get("value"):
+                    bpm = float(data["value"])
+                    threshold_hi = hr_cfg.get("resting_high_threshold", 100)
+                    threshold_lo = hr_cfg.get("resting_low_threshold", 50)
+
+                    from memory_db import get_db as _gdb_h
+                    db = await _gdb_h()
+                    await db.execute(
+                        "INSERT INTO health_snapshots (metric, value, unit) VALUES (?,?,?)",
+                        ("heart_rate", bpm, "bpm")
+                    )
+                    await db.commit()
+
+                    if bpm > threshold_hi:
+                        if not await _cd_gate(aid, "health_hr_high", 3600):
+                            pass
+                        else:
+                            _hr_prompt = (
+                                f"心跳有点快诶（{bpm:.0f}bpm），是不是紧张了？"
+                                "用角色口吻自然地说一句关心的话（不超过20字，不提具体数字）："
+                            )
+                            _hs = await _get_agent_settings(aid)
+                            _sp = (_hs.get("system_prompt") or "").strip()
+                            if _sp:
+                                _hr_prompt = f"你是：{_sp[:200]}\n\n" + _hr_prompt
+                            msg = (await _call_llm_route("proactive_push", _hr_prompt)).strip().strip("\"'")
+                            if msg:
+                                ok = await _push_send(msg, category="health_heart_rate")
+                                await _push_log_write(aid, "health_hr_high",
+                                                       "health_monitor", msg, ok)
+
+            # ── Steps sedentary check ────────────────────────────────────────
+            steps_cfg = cfg.get("steps", {})
+            if steps_cfg.get("enabled"):
+                import datetime as _dths
+                import random as _rnds
+                check_time = steps_cfg.get("sedentary_check_time", "15:00")
+                now_h, now_m = _dths.datetime.utcnow().hour, _dths.datetime.utcnow().minute
+                # Roughly 15:00 local time (CST ~= UTC+8 → UTC 07:xx)
+                if 6 <= now_h <= 8 and _rnds.random() < 0.4:
+                    data = await _health_mcp_get("/metrics/steps/today")
+                    if data and data.get("value") is not None:
+                        steps = int(data["value"])
+                        threshold = steps_cfg.get("sedentary_threshold", 2000)
+                        if steps < threshold and await _cd_gate(aid, "health_steps_sedentary", 86400):
+                            _s_prompt = (
+                                "今天是不是一直坐着？用角色口吻催一句起来走走（不超过20字）："
+                            )
+                            _hs2 = await _get_agent_settings(aid)
+                            if (_hs2.get("system_prompt") or "").strip():
+                                _s_prompt = f"你是：{_hs2['system_prompt'][:200]}\n\n" + _s_prompt
+                            msg = (await _call_llm_route("proactive_push", _s_prompt)).strip().strip("\"'")
+                            if msg:
+                                ok = await _push_send(msg, category="health_steps")
+                                await _push_log_write(aid, "health_steps_sedentary",
+                                                       "health_monitor", msg, ok)
+
+        except Exception as e:
+            print(f"[health_monitor_loop] error: {e}", flush=True)
+        await asyncio.sleep(900)   # every 15 min
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P2.1  Evening Push — 时差感知晚安 (Notion spec §3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _estimate_user_sleep_probability(agent_id: str, messages_recent: list = None) -> float:
+    """Multi-signal user sleep probability estimate (Notion spec §3.2).
+
+    Signals (weighted):
+    - no_message_45min:          weight 0.30
+    - screen_locked (reported):  weight 0.40  (via activity_events category='locked')
+    - said_goodnight_keyword:    weight 0.80  (from recent messages)
+    - past_avg_sleep_time:       weight 0.20  (hardcoded heuristic: 23:00-01:00 UTC+8)
+    Returns float 0.0-1.0.
+    """
+    import datetime as _dtusp
+    score = 0.0
+
+    # Signal 1: no message in last 45 min
+    try:
+        st = await _state_get(agent_id)
+        last_msg_str = st.get("last_user_msg") or st.get("last_active", "")
+        if last_msg_str:
+            last_dt = _dtusp.datetime.fromisoformat(
+                str(last_msg_str).replace("Z","").split("+")[0]
+            )
+            silent_min = (_dtusp.datetime.utcnow() - last_dt).total_seconds() / 60
+            if silent_min >= 45:
+                score += 0.30
+    except Exception:
+        pass
+
+    # Signal 2: screen locked recently (activity_events category='locked')
+    try:
+        recent_acts = await _act_recent(agent_id, hours=1)
+        if any(a.get("category") == "locked" for a in recent_acts):
+            score += 0.40
+    except Exception:
+        pass
+
+    # Signal 3: goodnight keyword in recent messages
+    if messages_recent:
+        _GN_KW = ["晚安", "睡了", "睡觉了", "去睡", "要睡了", "好梦", "拜拜"]
+        user_recent = " ".join(
+            m.get("content","") for m in messages_recent[-4:]
+            if m.get("role") == "user" and isinstance(m.get("content"), str)
+        )
+        if any(kw in user_recent for kw in _GN_KW):
+            score += 0.80
+    # Signal 3b: check last conversation text in L5 summaries (skip for now)
+
+    # Signal 4: time heuristic — past typical sleep time (23:00-01:00 UTC+8 = 15:00-17:00 UTC)
+    h_utc = _dtusp.datetime.utcnow().hour
+    if 15 <= h_utc <= 17:  # ~23:00-01:00 CST
+        score += 0.20
+
+    return min(1.0, score)
+
+
+async def _char_in_bedtime_window(agent_id: str) -> bool:
+    """Check if char's current time is within bedtime window (default 22:30-23:30)."""
+    import datetime as _dtcbw
+    try:
+        async with _db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM user_config WHERE key='user_context'")
+        ucv = row["value"] if row else None
+        uc  = (ucv if isinstance(ucv, dict) else __import__("json").loads(ucv)) if ucv else {}
+        tz_cfg   = uc.get("timezone") or {}
+        char_tz  = (tz_cfg.get("character", {}).get("default", "Asia/Shanghai")
+                    if isinstance(tz_cfg.get("character"), dict)
+                    else str(tz_cfg.get("character", "Asia/Shanghai")))
+
+        async with _db_pool.acquire() as conn2:
+            epr = await conn2.fetchrow("SELECT value FROM user_config WHERE key='evening_push_config'")
+        epcv = epr["value"] if epr else None
+        epc  = (epcv if isinstance(epcv, dict) else __import__("json").loads(epcv)) if epcv else {}
+        window = epc.get("char_bedtime_window", ["22:30", "23:30"])
+    except Exception:
+        char_tz = "Asia/Shanghai"
+        window  = ["22:30", "23:30"]
+
+    _OFF = {"Asia/Shanghai": 8, "Asia/Tokyo": 9, "America/Los_Angeles": -7,
+            "America/New_York": -4, "Europe/London": 1, "UTC": 0}
+    h_off = _OFF.get(char_tz, 8)
+    char_now = (_dtcbw.datetime.utcnow().hour * 60 + _dtcbw.datetime.utcnow().minute + h_off * 60) % (24 * 60)
+
+    def _hm(s):
+        h, m = s.split(":")
+        return int(h) * 60 + int(m)
+
+    ws, we = _hm(window[0]), _hm(window[1])
+    return ws <= char_now <= we
+
+
+async def _evening_push_for_agent(agent_id: str) -> None:
+    """Send a goodnight push based on timezone scenario (Notion spec §3.1).
+
+    Scenario A: char sleeps first, user still awake → send goodnight
+    Scenario B: user already asleep when char sleeps → no send, write diary note
+    Scenario C: same timezone → send goodnight
+    """
+    import random as _rne
+
+    if not await _char_in_bedtime_window(agent_id):
+        return
+    if not await _cd_gate(agent_id, "evening_goodnight", 86400):
+        return
+    if not await _check_daily_push_limit(agent_id):
+        return
+
+    sleep_prob = await _estimate_user_sleep_probability(agent_id)
+    same_tz    = True  # simplified: check if user_tz == char_tz
+    try:
+        async with _db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM user_config WHERE key='user_context'")
+        ucv = row["value"] if row else None
+        uc  = (ucv if isinstance(ucv, dict) else __import__("json").loads(ucv)) if ucv else {}
+        tz_cfg  = uc.get("timezone") or {}
+        user_tz = (tz_cfg.get("user", {}).get("default", "Asia/Shanghai")
+                   if isinstance(tz_cfg.get("user"), dict)
+                   else str(tz_cfg.get("user", "Asia/Shanghai")))
+        char_tz = (tz_cfg.get("character", {}).get("default", "Asia/Shanghai")
+                   if isinstance(tz_cfg.get("character"), dict)
+                   else str(tz_cfg.get("character", "Asia/Shanghai")))
+        same_tz = (user_tz == char_tz)
+    except Exception:
+        pass
+
+    _as = await _get_agent_settings(agent_id)
+    _sp = (_as.get("system_prompt") or "").strip()
+
+    # Scenario B: user likely already asleep → don't send, write diary note
+    if sleep_prob >= 0.50 and not same_tz:
+        # 15% chance to mention "想说晚安但没打扰" in tomorrow's morning push
+        if _rne.random() < 0.15:
+            await _state_set(agent_id, scene_note="昨晚想跟你说晚安，看你应该睡了就没打扰")
+        print(f"[evening_push] {agent_id}: user likely asleep (p={sleep_prob:.2f}), skipped", flush=True)
+        return
+
+    # Scenario A/C: send goodnight
+    # Pull tomorrow's important schedule to include
+    tomorrow_schedule = ""
+    try:
+        tasks = await todoist_get_tasks_raw(limit=3)
+        if tasks:
+            important = [t for t in tasks if t.get("priority", 1) >= 3]
+            if important:
+                tomorrow_schedule = "；".join(t["content"] for t in important[:2])
+    except Exception:
+        pass
+
+    try:
+        ctx_parts = []
+        if not same_tz:
+            ctx_parts.append("你比用户早睡，你们有时差")
+        if tomorrow_schedule:
+            ctx_parts.append(f"明天用户有：{tomorrow_schedule}")
+        ctx_block = "；".join(ctx_parts)
+
+        if _sp:
+            prompt = (
+                f"你是以下角色：\n{_sp[:350]}\n\n"
+                + (f"背景：{ctx_block}\n\n" if ctx_block else "")
+                + "写一条晚安消息发给用户（1-2句，中文口语，温暖自然"
+                + ("，如果明天有日程可以顺带提醒" if tomorrow_schedule else "")
+                + "，不要解释）："
+            )
+        else:
+            prompt = (
+                (f"背景：{ctx_block}\n\n" if ctx_block else "")
+                + "写一条温暖的晚安消息（1-2句，中文口语）："
+            )
+
+        msg = (await _call_llm_route("proactive_push", prompt)).strip().strip("\"'")
+        if not msg:
+            return
+
+        ok = await _telegram_send(msg)
+        await _push_log_write(
+            agent_id=agent_id, category="evening_goodnight",
+            trigger_src="bedtime_window",
+            message=msg, sent=ok,
+            modules={"scenario": "A" if not same_tz else "C",
+                     "sleep_prob": sleep_prob,
+                     "tomorrow_schedule": bool(tomorrow_schedule)},
+        )
+        if ok:
+            print(f"[evening_push] {agent_id}: sent goodnight (scenario {'A' if not same_tz else 'C'})", flush=True)
+    except Exception as _ee:
+        print(f"[evening_push] error for {agent_id}: {_ee}", flush=True)
+
+
+async def _evening_push_loop() -> None:
+    """Check every 15 min if any char agent should send goodnight (Notion spec §3)."""
+    await asyncio.sleep(600)  # stagger 10 min after startup
+    while True:
+        try:
+            async with _db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT agent_id FROM agent_settings "
+                    "WHERE agent_type='character' AND auto_memory=TRUE"
+                )
+            for r in rows:
+                try:
+                    await _evening_push_for_agent(r["agent_id"])
+                except Exception as _ae:
+                    print(f"[evening_push] loop err {r['agent_id']}: {_ae}")
+        except Exception as e:
+            print(f"[evening_push] loop err: {e}")
+        await asyncio.sleep(900)  # check every 15 min
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P2.2  Event Chain Reactions (Notion spec §6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DELAY_RANGES: dict[str, tuple[int, int]] = {
+    "immediate":   (0,      0),
+    "within_1h":   (300,    3600),
+    "within_12h":  (3600,   43200),
+}
+
+
+def _compute_fire_at(delay_type: str) -> str:
+    """Return UTC ISO8601 datetime when chain event should fire."""
+    import datetime as _dtca, random as _rnca
+    if delay_type == "next_morning":
+        # char timezone ~07:00-09:00 = UTC+8 → 23:00-01:00 UTC prev day
+        now = _dtca.datetime.utcnow()
+        # next occurrence of 23:00-01:00 UTC
+        target = now.replace(hour=23, minute=_rnca.randint(0, 120), second=0, microsecond=0)
+        if target <= now:
+            target += _dtca.timedelta(days=1)
+        return target.isoformat()
+    lo, hi = _DELAY_RANGES.get(delay_type, (0, 3600))
+    secs = _rnca.uniform(lo, hi)
+    return (_dtca.datetime.utcnow() + _dtca.timedelta(seconds=secs)).isoformat()
+
+
+async def _maybe_schedule_chain(agent_id: str, event: dict) -> None:
+    """If event has a chain_definition, roll probability and schedule chain event."""
+    import json as _jsc, random as _rnsc
+    chain_raw = event.get("chain_definition")
+    if not chain_raw:
+        return
+    try:
+        chain = _jsc.loads(chain_raw) if isinstance(chain_raw, str) else chain_raw
+        if not chain:
+            return
+    except Exception:
+        return
+
+    prob = float(chain.get("probability", 0.30))
+    if _rnsc.random() >= prob:
+        return
+
+    delay_type  = chain.get("delay", "within_1h")
+    fire_at     = _compute_fire_at(delay_type)
+    content     = chain.get("event", "")
+    if not content:
+        return
+
+    # mood_effect amplified × 1.5 (Notion spec §6.1)
+    raw_mood = chain.get("mood_effect") or {}
+    amp_mood = {k: v * 1.5 for k, v in raw_mood.items()}
+
+    raw_acc  = chain.get("accumulator_effect") or {}
+    amp_acc  = {k: v * 1.5 for k, v in raw_acc.items()}
+
+    await _chain_schedule(
+        agent_id        = agent_id,
+        trigger_event_id= event.get("id", ""),
+        trigger_content = event.get("content", ""),
+        content         = content,
+        fire_at         = fire_at,
+        level           = chain.get("level", event.get("level", "green")),
+        mood_effect     = amp_mood,
+        accumulator_effect = amp_acc,
+        send_policy     = chain.get("send_policy", "maybe"),
+        carry_over      = chain.get("carry_over") or {},
+    )
+    print(f"[chain] scheduled '{content[:50]}' for {agent_id} at {fire_at}", flush=True)
+
+
+async def _process_due_chain_events(agent_id: str) -> None:
+    """Fire any due chain events for agent: apply effects + maybe send message."""
+    import random as _rnpe, json as _jpe
+    due = await _chain_events_due(agent_id)
+    if not due:
+        return
+
+    _SEND_PROBS = {"always": 1.0, "likely": 0.70, "maybe": 0.40,
+                   "rarely": 0.15, "never": 0.0}
+
+    for ev in due:
+        await _chain_mark_fired(ev["id"])
+
+        # Apply mood + accumulator effects
+        try:
+            mood_eff = _jpe.loads(ev["mood_effect"]) if isinstance(ev["mood_effect"], str) else (ev["mood_effect"] or {})
+            acc_eff  = _jpe.loads(ev["accumulator_effect"]) if isinstance(ev["accumulator_effect"], str) else (ev["accumulator_effect"] or {})
+
+            if mood_eff:
+                # mood_valence / mood_energy
+                await _accumulate_state(agent_id, mood_eff)
+            if acc_eff:
+                await _accumulate_state(agent_id, acc_eff)
+                await _check_accumulator_thresholds(agent_id)
+        except Exception as _me:
+            print(f"[chain] effect apply err: {_me}")
+
+        # Apply carry_over (tomorrow state preset)
+        try:
+            co = _jpe.loads(ev["carry_over"]) if isinstance(ev["carry_over"], str) else (ev["carry_over"] or {})
+            tomorrow_state = co.get("tomorrow_state") or {}
+            if tomorrow_state:
+                await _state_set(agent_id, scene_note=f"chain_carry:{_jpe.dumps(tomorrow_state)}")
+        except Exception:
+            pass
+
+        # Maybe send message
+        send_prob = _SEND_PROBS.get(ev["send_policy"], 0.40)
+        if _rnpe.random() >= send_prob:
+            continue
+        if await _check_quiet_hours():
+            continue
+        if not await _check_daily_push_limit(agent_id):
+            continue
+
+        try:
+            _as = await _get_agent_settings(agent_id)
+            _sp = (_as.get("system_prompt") or "").strip()
+            trigger_ctx = ev.get("trigger_content", "")
+            chain_event = ev["content"]
+
+            if _sp:
+                prompt = (
+                    f"你是以下角色：\n{_sp[:300]}\n\n"
+                    + (f"之前发生了：「{trigger_ctx}」，\n" if trigger_ctx else "")
+                    + f"现在又发生了：「{chain_event}」。\n"
+                    "写一条简短消息分享给用户（1-2句，中文口语，自然）："
+                )
+            else:
+                prompt = (
+                    f"发生了：「{chain_event}」。\n"
+                    "写一条简短分享消息（1-2句，中文口语）："
+                )
+
+            msg = (await _call_llm_route("proactive_push", prompt)).strip().strip("\"'")
+            if msg:
+                ok = await _telegram_send(msg)
+                await _push_log_write(
+                    agent_id=agent_id, category="chain_event",
+                    trigger_src=trigger_ctx[:60], message=msg, sent=ok,
+                )
+                if ok:
+                    print(f"[chain] sent for {agent_id}: {msg[:50]}", flush=True)
+        except Exception as _ce:
+            print(f"[chain] send error: {_ce}")
+
+
+async def _chain_event_loop() -> None:
+    """Background task: check and fire due chain events every 5 minutes."""
+    await asyncio.sleep(120)  # stagger after startup
+    while True:
+        try:
+            async with _db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT agent_id FROM agent_settings "
+                    "WHERE agent_type='character' AND auto_memory=TRUE"
+                )
+            for r in rows:
+                try:
+                    await _process_due_chain_events(r["agent_id"])
+                except Exception as _ae:
+                    print(f"[chain_loop] err {r['agent_id']}: {_ae}")
+        except Exception as e:
+            print(f"[chain_loop] err: {e}")
+        await asyncio.sleep(300)  # every 5 min
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P2.3  Items & Promises Tracking (Notion spec §4.4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _extract_items_promises(agent_id: str, messages: list) -> None:
+    """Post-conversation: extract items char mentioned having + promises made.
+
+    Char messages → analyzer LLM → update character_state.items/promises JSON arrays.
+    Each item: {"name": "...", "desc": "...", "added_at": "ISO8601"}
+    Each promise: {"content": "...", "made_at": "ISO8601", "days_since": 0}
+    """
+    import json as _jip, datetime as _dtip
+    char_msgs = [
+        m.get("content","") for m in messages
+        if m.get("role") == "assistant" and isinstance(m.get("content"), str)
+    ]
+    if not char_msgs:
+        return
+
+    char_text = " ".join(char_msgs[-5:])
+
+    # Keyword pre-filter — skip LLM if no relevant content
+    _ITEM_KW   = ["买了", "收到", "有", "带了", "剩下", "还有一", "还剩"]
+    _PROMISE_KW = ["等我", "我会", "下次", "下回", "改天", "到时候", "记着", "一定"]
+    has_items    = any(kw in char_text for kw in _ITEM_KW)
+    has_promises = any(kw in char_text for kw in _PROMISE_KW)
+    if not has_items and not has_promises:
+        return
+
+    prompt = (
+        "从以下角色对话中提取：(1) 角色提到自己拥有的物品；(2) 角色对用户许下的承诺。\n"
+        "只提取明确表达的，不推测。没有则返回空数组。\n"
+        f"对话：{char_text[:1200]}\n\n"
+        "输出 JSON（只输出 JSON）：\n"
+        '{"items": [{"name": "...", "desc": "..."}], '
+        '"promises": [{"content": "..."}]}'
+    )
+    try:
+        raw = await _call_llm_route("analyzer", prompt)
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
+        data = json.loads(raw)
+    except Exception:
+        return
+
+    now_iso = _dtip.datetime.utcnow().isoformat()
+
+    # Read current state
+    st = await _state_get(agent_id)
+    try:
+        items_cur    = json.loads(st.get("items") or "[]") if isinstance(st.get("items"), str) else (st.get("items") or [])
+        promises_cur = json.loads(st.get("promises") or "[]") if isinstance(st.get("promises"), str) else (st.get("promises") or [])
+    except Exception:
+        items_cur, promises_cur = [], []
+
+    changed = False
+
+    # Merge items (cap at 10)
+    for it in (data.get("items") or []):
+        name = str(it.get("name","")).strip()
+        if not name:
+            continue
+        if not any(x.get("name","") == name for x in items_cur):
+            items_cur.append({"name": name, "desc": str(it.get("desc",""))[:60], "added_at": now_iso})
+            changed = True
+    items_cur = items_cur[-10:]  # keep last 10
+
+    # Merge promises (cap at 10)
+    for pr in (data.get("promises") or []):
+        content = str(pr.get("content","")).strip()
+        if not content or len(content) < 5:
+            continue
+        if not any(x.get("content","") == content for x in promises_cur):
+            promises_cur.append({"content": content, "made_at": now_iso})
+            changed = True
+    promises_cur = promises_cur[-10:]
+
+    if changed:
+        await _state_set(agent_id,
+                         items=json.dumps(items_cur, ensure_ascii=False),
+                         promises=json.dumps(promises_cur, ensure_ascii=False))
+        print(f"[items_promises] {agent_id}: items={len(items_cur)} promises={len(promises_cur)}", flush=True)
+
+
+async def _check_promise_reminders(agent_id: str) -> None:
+    """Morning/nightly: probabilistically mention overdue promises (Notion spec §4.4).
+
+    Reminder probability by days since promise:
+    3d→10%, 7d→25%, 14d→40%, 30d→60%
+    Only adds to morning push context; does NOT send independently.
+    """
+    import datetime as _dtpr, json as _jpr, random as _rnpr
+    st = await _state_get(agent_id)
+    try:
+        promises = json.loads(st.get("promises") or "[]") if isinstance(st.get("promises"), str) else (st.get("promises") or [])
+    except Exception:
+        return
+
+    if not promises:
+        return
+
+    now = _dtpr.datetime.utcnow()
+    pending = []
+    for pr in promises:
+        made_at_str = pr.get("made_at", "")
+        if not made_at_str:
+            continue
+        try:
+            made_at = _dtpr.datetime.fromisoformat(made_at_str.split("+")[0].replace("Z",""))
+            days = (now - made_at).days
+        except Exception:
+            continue
+
+        prob = (0.10 if days >= 3 else 0) or (0.25 if days >= 7 else 0) or \
+               (0.40 if days >= 14 else 0) or (0.60 if days >= 30 else 0)
+        if prob > 0 and _rnpr.random() < prob:
+            pending.append((days, pr["content"]))
+
+    if not pending:
+        return
+
+    # Append to scene_note so it shows up in tomorrow's morning push context
+    days, content = max(pending, key=lambda x: x[0])
+    tone = ("随口一提" if days < 7 else
+            "自然提起" if days < 14 else
+            "有点在意" if days < 30 else "认真追问")
+    note = f"承诺提醒({tone})：「{content}」（{days}天前）"
+    await _state_set(agent_id, scene_note=note)
 
 
 async def _auto_archive_completed_projects(agent_id: str) -> None:
@@ -3751,13 +5588,51 @@ async def _proxy_call_tool(
             rf = data.get("random_float") or []
             if rf:
                 parts.append("💭 " + rf[0]["content"][:120])
-            # Character state (mood, fatigue, scene)
+            # Character state — Notion spec §4.7 format
             try:
                 st = await _state_get(agent_id)
-                state_line = f"🎭 mood={st['mood_label']}({st['mood_score']:+d}) fatigue={st['fatigue']} scene={st['scene']}"
-                if st.get("scene_note"):
-                    state_line += f" [{st['scene_note']}]"
-                parts.append(state_line)
+                _fat   = st.get("fatigue", 0)
+                _mood  = st.get("mood_label", "neutral")
+                _ms    = st.get("mood_score", 0)
+                _miss  = float(st.get("miss_you") or 0.0)
+                _lm    = float(st.get("low_mood") or 0.0)
+                _irr   = float(st.get("irritable") or 0.0)
+                _busy  = st.get("busy_level", "normal")
+                _health = st.get("health_status", "healthy")
+                _items   = st.get("items", "[]")
+                _promises = st.get("promises", "[]")
+
+                state_lines = [
+                    "[角色当前状态]",
+                    f"情绪：{_mood}（mood_score={_ms:+d}，惯性延续中，非固定）",
+                    f"疲劳度：{_fat}/5",
+                    f"思念值：{_miss:.1f}/10",
+                ]
+                if _lm > 0.5:
+                    state_lines.append(f"低落值：{_lm:.1f}/8")
+                if _irr > 0.5:
+                    state_lines.append(f"烦躁值：{_irr:.1f}/6")
+                if _busy != "normal":
+                    state_lines.append(f"忙碌状态：{_busy}")
+                if _health != "healthy":
+                    state_lines.append(f"健康状态：{_health}")
+                try:
+                    import json as _jst
+                    items_list = _jst.loads(_items) if isinstance(_items, str) else (_items or [])
+                    if items_list:
+                        state_lines.append("物品：" + "、".join(str(x) for x in items_list[:5]))
+                except Exception:
+                    pass
+                try:
+                    prom_list = __import__("json").loads(_promises) if isinstance(_promises, str) else (_promises or [])
+                    if prom_list:
+                        state_lines.append("未兑现承诺：" + "；".join(str(p) for p in prom_list[:3]))
+                except Exception:
+                    pass
+                state_lines.append("")
+                state_lines.append("注意：以上状态供参考以保持一致性。不要机械表演状态，让它自然影响语气和精力水平。疲劳度高时回复可以更简短。")
+                parts.append(chr(10).join(state_lines))
+
                 # Scene-specific context hint
                 _sc = st.get("scene", "daily")
                 if _sc == "long_distance":
@@ -3861,6 +5736,96 @@ async def _proxy_call_tool(
         except Exception as e:
             print(f"[proxy] palimpsest_anchor: {e}")
 
+    elif tool_name == "weather":
+        # Keyword-triggered: return real-time weather for the user's configured city
+        try:
+            async with _db_pool.acquire() as _wc2:
+                _uc_row2 = await _wc2.fetchrow(
+                    "SELECT value FROM user_config WHERE key='user_context'")
+            _ucv2 = _uc_row2["value"] if _uc_row2 else None
+            _uc2 = (
+                _ucv2 if isinstance(_ucv2, dict) else __import__("json").loads(_ucv2)
+            ) if _ucv2 else {}
+            _city2 = (_uc2.get("location") or {}).get("city", "")
+            if not _city2:
+                return ""
+            _w2 = await amap_weather(_city2)
+            if _w2 and not _w2.startswith("Error") and not _w2.startswith("Weather error"):
+                return f"[实时天气] {_w2}"
+            return ""
+        except Exception as e:
+            print(f"[proxy] weather: {e}")
+            return ""
+
+    elif tool_name == "news":
+        # Keyword-triggered: inject today's news headlines into context
+        try:
+            _news_cfg2 = await _get_news_config()
+            if not _news_cfg2.get("enabled", True):
+                return ""
+            headlines = await _get_today_news(max_items=3)
+            if not headlines:
+                return ""
+            lines = []
+            for h in headlines:
+                src = h.get("source", "")
+                title = h.get("title", "")
+                summary = h.get("summary", "")
+                line = f"• {title}（{src}）"
+                if summary:
+                    line += f"\n  {summary[:80]}"
+                lines.append(line)
+            return "[今日新闻]\n" + "\n".join(lines)
+        except Exception as e:
+            print(f"[proxy] news: {e}")
+            return ""
+
+    elif tool_name == "calendar":
+        # Keyword-triggered: fetch upcoming calendar events from Todoist/GCAL
+        try:
+            import os as _osc
+            import datetime as _dtc
+            import httpx as _hxc
+            lines = []
+
+            # Try Google Calendar first
+            gcal_token = _osc.getenv("GCAL_BEARER_TOKEN", "")
+            gcal_cal_id = _osc.getenv("GCAL_CALENDAR_ID", "primary")
+            if gcal_token:
+                try:
+                    _now = _dtc.datetime.utcnow()
+                    _max = (_now + _dtc.timedelta(days=7)).isoformat() + "Z"
+                    _min = _now.isoformat() + "Z"
+                    async with _hxc.AsyncClient(timeout=8) as _cl:
+                        _r = await _cl.get(
+                            f"https://www.googleapis.com/calendar/v3/calendars/{gcal_cal_id}/events",
+                            headers={"Authorization": f"Bearer {gcal_token}"},
+                            params={"timeMin": _min, "timeMax": _max,
+                                    "singleEvents": "true", "orderBy": "startTime",
+                                    "maxResults": "5"},
+                        )
+                    if _r.status_code == 200:
+                        for ev in _r.json().get("items", []):
+                            _st = ev.get("start", {})
+                            _dt = _st.get("dateTime") or _st.get("date", "")
+                            _dt_fmt = _dt[:16].replace("T", " ") if "T" in _dt else _dt
+                            lines.append(f"• {_dt_fmt} {ev.get('summary','(无标题)')}")
+                except Exception:
+                    pass
+
+            # Fallback to Todoist
+            if not lines:
+                tasks = await todoist_get_tasks_raw(limit=5)
+                for t in tasks:
+                    _due = (t.get("due") or {}).get("string", "")
+                    lines.append(f"• {_due} {t['content']}" if _due else f"• {t['content']}")
+
+            if not lines:
+                return ""
+            return "[近期日程]\n" + "\n".join(lines)
+        except Exception as e:
+            print(f"[proxy] calendar: {e}")
+            return ""
 
     elif tool_name == "notion_diary":
         # Keyword-triggered: extract diary content from messages → write to Notion
@@ -3911,8 +5876,37 @@ async def _process_character_mcp(agent_id: str, messages: list, proxy_cfg: dict)
     Returns a context string to inject naturally into the system prompt.
     """
     import re as _re
-    tools = proxy_cfg.get("tools") or [{"name": "memory_surface", "trigger_mode": "auto"}]
+    tools = proxy_cfg.get("tools") or [
+        {"name": "memory_surface",  "trigger_mode": "auto"},
+        {"name": "daily_life_read", "trigger_mode": "auto"},
+        {
+            "name": "weather",
+            "trigger_mode": "keyword",
+            "triggers": ["天气", "下雨", "下雪", "热", "冷", "出门", "穿什么",
+                         "外面", "温度", "天晴", "阴天", "刮风", "晴天"],
+        },
+        {
+            "name": "news",
+            "trigger_mode": "keyword",
+            "triggers": ["新闻", "最近发生", "今天发生", "热点", "时事", "有什么大事",
+                         "最新消息", "今日", "社会", "国际", "国内", "发生了什么"],
+        },
+        {
+            "name": "calendar",
+            "trigger_mode": "keyword",
+            "triggers": ["日程", "安排", "计划", "提醒", "明天", "后天", "下周",
+                         "会议", "约", "几点", "什么时候", "记一下", "加一个"],
+        },
+    ]
     injected: list[str] = []
+
+    # ── P0.2: Timezone injection at top (Notion spec §1) ─────────────────────
+    try:
+        _tz_ctx = await build_time_context(agent_id)
+        if _tz_ctx:
+            injected.append(_tz_ctx)
+    except Exception as _tze:
+        print(f"[mcp_proxy] tz_inject err: {_tze}")
     for tool in tools:
         mode = tool.get("trigger_mode", "disabled")
         if mode == "disabled":
@@ -4092,6 +6086,203 @@ async def _generate_l5_summary(agent_id: str, session_id: str, messages: list) -
         print(f"[l5] summary generation failed for {agent_id}: {e}", flush=True)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# P2.2  Reverse Identification (Notion spec §7)
+# Post-conversation: cheap model detects state changes the char announced
+# ─────────────────────────────────────────────────────────────────────────────
+
+_REVERSE_KEYWORDS: dict[str, list[str]] = {
+    "busy":        ["最近有点忙", "在忙", "赶ddl", "赶deadline", "加班", "项目很紧", "忙死了"],
+    "sick":        ["感冒了", "不舒服", "头疼", "生病了", "发烧", "嗓子疼", "肚子不舒服"],
+    "schedule":    ["明天要", "明天得", "明天有", "下周", "后天", "约了", "要开会", "要上课"],
+    "location":    ["去你这", "来你那", "到了", "在你家", "搬过来", "回去了", "出差", "出门了"],
+}
+
+
+async def _reverse_identify(agent_id: str, messages: list) -> None:
+    """Post-conversation analyzer: detect character self-stated state changes.
+
+    Two-layer approach (Notion spec §7.2):
+    1. Keyword pre-filter (zero cost)
+    2. Cheap LLM analysis only if keywords match
+    Auto-applies state changes with confidence >= threshold.
+    """
+    # Extract only character (assistant) messages
+    char_msgs = [
+        m.get("content", "")
+        for m in messages
+        if m.get("role") == "assistant" and isinstance(m.get("content"), str)
+    ]
+    if not char_msgs:
+        return
+    char_text = " ".join(char_msgs[-6:])  # last 6 assistant turns
+
+    # Layer 1: keyword pre-filter
+    matched_categories = [
+        cat for cat, kws in _REVERSE_KEYWORDS.items()
+        if any(kw in char_text for kw in kws)
+    ]
+    if not matched_categories:
+        return
+
+    # Layer 2: analyzer LLM
+    try:
+        st = await _state_get(agent_id)
+        analyzer_prompt = (
+            "你是角色状态分析器。阅读角色对话输出，提取角色自述的状态变化。只提取角色主动表达的，不推测。\n\n"
+            f"角色对话（最近几轮）：\n{char_text[:1500]}\n\n"
+            f"当前状态：busy_level={st.get('busy_level','normal')}, "
+            f"health_status={st.get('health_status','healthy')}\n\n"
+            "输出 JSON（只输出 JSON，不要其他内容）：\n"
+            '{"state_changes": [{"field": "...", "new_value": "...", "confidence": 0.0, "evidence": "..."}], '
+            '"schedule_mentions": [{"content": "...", "time": "...", "importance": "normal"}]}'
+        )
+        raw = await _call_llm_route("analyzer", analyzer_prompt)
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
+        data = json.loads(raw)
+    except Exception:
+        return
+
+    # Auto-apply state changes
+    for change in (data.get("state_changes") or []):
+        field   = change.get("field", "")
+        new_val = change.get("new_value", "")
+        conf    = float(change.get("confidence") or 0.0)
+        if field in ("busy_level",) and conf >= 0.7:
+            await _state_set(agent_id, busy_level=str(new_val))
+            print(f"[reverse_id] auto-set {agent_id}.{field}={new_val!r} (conf={conf:.2f})", flush=True)
+        elif field in ("health_status",) and conf >= 0.7:
+            await _state_set(agent_id, health_status=str(new_val))
+            print(f"[reverse_id] auto-set {agent_id}.{field}={new_val!r} (conf={conf:.2f})", flush=True)
+        elif field in ("mood_label", "mood_score") and conf >= 0.6:
+            if field == "mood_label":
+                await _state_set(agent_id, mood_label=str(new_val))
+            elif field == "mood_score":
+                try:
+                    await _state_set(agent_id, mood_score=int(new_val))
+                except Exception:
+                    pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P1.3  Schedule Capture from Conversation (Notion spec §2.3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SCHEDULE_PATTERNS_RE = [
+    r"明天.{0,10}(要|得|需要|记得)",
+    r"后天.{0,10}(要|得)",
+    r"下周[一二三四五六日].{0,10}(要|有|是)",
+    r"\d{1,2}[月号日].{0,10}(要|有|截止|deadline)",
+    r"别忘了", r"记得", r"提醒我",
+]
+
+
+async def _capture_schedules_from_conversation(agent_id: str, messages: list) -> None:
+    """Detect user-mentioned schedules/reminders → classify → write to calendar/Todoist.
+
+    type='schedule'  (has date+time) → Google Calendar (if GCAL_BEARER_TOKEN+GCAL_CALENDAR_ID set)
+                                       OR Todoist with due date (fallback)
+    type='reminder'  (no specific time) → Todoist task
+    type='both'      (uncertain)        → both
+
+    Keyword pattern pre-filter → analyzer LLM extracts & classifies → write to target(s).
+    """
+    import re as _re_sc, os as _os_sc, httpx as _hx_sc
+    _todoist_key  = _os_sc.getenv("TODOIST_API_TOKEN", _os_sc.getenv("TODOIST_API_KEY", ""))
+    _gcal_token   = _os_sc.getenv("GCAL_BEARER_TOKEN", "")
+    _gcal_cal_id  = _os_sc.getenv("GCAL_CALENDAR_ID", "primary")
+    if not _todoist_key and not _gcal_token:
+        return
+
+    # Only scan user messages
+    user_msgs = [
+        m.get("content", "")
+        for m in messages
+        if m.get("role") == "user" and isinstance(m.get("content"), str)
+    ]
+    if not user_msgs:
+        return
+    user_text = " ".join(user_msgs[-5:])
+
+    # Pre-filter
+    if not any(_re_sc.search(p, user_text) for p in _SCHEDULE_PATTERNS_RE):
+        return
+
+    try:
+        extract_prompt = (
+            "从以下用户对话中提取用户提到的未来计划或提醒事项（只提取明确的，不推测）。\n\n"
+            "分类规则：\n"
+            "- 有明确日期/时间的事件（会议、约定、截止日等）→ type='schedule'\n"
+            "- 没有明确时间的待办/提醒（买东西、记得做某事）→ type='reminder'\n"
+            "- 不确定时 → type='both'\n\n"
+            f"用户对话：{user_text[:800]}\n\n"
+            "输出 JSON 数组（没有则输出 []）：\n"
+            '[{"content":"事项内容","time":"时间描述(如明天下午/下周一)","importance":"high或normal","type":"schedule|reminder|both"}]'
+        )
+        raw = await _call_llm_route("analyzer", extract_prompt)
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
+        schedules = json.loads(raw)
+        if not isinstance(schedules, list):
+            return
+    except Exception:
+        return
+
+    for sch in schedules[:3]:
+        content  = str(sch.get("content", "")).strip()
+        if not content or len(content) < 3:
+            continue
+        time_str = str(sch.get("time", "")).strip()
+        item_type = str(sch.get("type", "both")).lower()
+        priority  = 4 if sch.get("importance") == "high" else 1
+
+        # ── Write to Google Calendar (schedule or both) ───────────────────────
+        write_calendar = item_type in ("schedule", "both")
+        if write_calendar and _gcal_token:
+            try:
+                import datetime as _dtgc
+                _gcal_body: dict = {
+                    "summary": content,
+                    "description": f"[由AI对话捕获] {time_str}" if time_str else "[由AI对话捕获]",
+                }
+                # Attempt to build a simple all-day event for tomorrow if no exact time
+                _tomorrow = (_dtgc.date.today() + _dtgc.timedelta(days=1)).isoformat()
+                _gcal_body["start"] = {"date": _tomorrow}
+                _gcal_body["end"]   = {"date": _tomorrow}
+                async with _hx_sc.AsyncClient(timeout=15) as _cl:
+                    await _cl.post(
+                        f"https://www.googleapis.com/calendar/v3/calendars/{_gcal_cal_id}/events",
+                        headers={"Authorization": f"Bearer {_gcal_token}",
+                                 "Content-Type": "application/json"},
+                        json=_gcal_body,
+                    )
+                print(f"[schedule_capture] gcal: '{content}'", flush=True)
+            except Exception as _ge:
+                print(f"[schedule_capture] gcal write failed: {_ge}")
+
+        # ── Write to Todoist (reminder or both, or schedule fallback) ─────────
+        write_todoist = item_type in ("reminder", "both") or (write_calendar and not _gcal_token)
+        if write_todoist and _todoist_key:
+            try:
+                task_label  = "[日程] " if item_type == "schedule" else ""
+                task_content = task_label + content + (f"（{time_str}）" if time_str else "")
+                _td_body: dict = {"content": task_content, "priority": priority}
+                if time_str:
+                    _td_body["due_string"] = time_str
+                async with _hx_sc.AsyncClient(timeout=15) as _cl:
+                    await _cl.post(
+                        "https://api.todoist.com/rest/v2/tasks",
+                        headers={"Authorization": f"Bearer {_todoist_key}"},
+                        json=_td_body,
+                    )
+                print(f"[schedule_capture] todoist ({item_type}): '{task_content}'", flush=True)
+            except Exception as _te:
+                print(f"[schedule_capture] todoist write failed: {_te}")
+
+
 async def _post_conversation_tasks(
     agent_id: str, session_id: str, full: list,
     cid: str, agent_type: str, auto_memory: bool,
@@ -4101,7 +6292,32 @@ async def _post_conversation_tasks(
     if agent_type == "character":
         if auto_memory:
             await _auto_extract_character_memory(agent_id, full)
-        # Character agents use daily_events as their memory store; skip Qdrant distillation
+        # Track last user message time for silence detection
+        try:
+            import datetime as _dtpc
+            await _state_set(agent_id, last_user_msg=_dtpc.datetime.utcnow().isoformat())
+        except Exception:
+            pass
+        # Drain miss_you accumulator when conversation happens (Notion spec §4.3)
+        try:
+            await _accumulate_state(agent_id, {"miss_you": -10.0, "low_mood": -3.0})
+        except Exception:
+            pass
+        # P2.2 Reverse identification: keyword pre-filter → analyzer LLM
+        try:
+            await _reverse_identify(agent_id, full)
+        except Exception as _rie:
+            print(f"[post_conv] reverse_identify err: {_rie}")
+        # P1.3 Schedule capture from conversation
+        try:
+            await _capture_schedules_from_conversation(agent_id, full)
+        except Exception as _sce:
+            print(f"[post_conv] schedule_capture err: {_sce}")
+        # P2.3 Items & promises extraction
+        try:
+            await _extract_items_promises(agent_id, full)
+        except Exception as _ipe:
+            print(f"[post_conv] items_promises err: {_ipe}")
     else:
         # Agent type: distill into Qdrant profile/project/recent
         await _distill_and_store(agent_id, session_id, full, agent_type=agent_type)
@@ -5272,10 +7488,17 @@ _DAILY_SKELETON_DEFAULT = {
 }
 
 @app.get("/admin/api/config/daily-skeleton")
-async def get_daily_skeleton(_=Depends(_require_key)):
+async def get_daily_skeleton(agent_id: str = "", _=Depends(_require_key)):
     import json as _j
     async with _db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT value FROM user_config WHERE key='daily_skeleton'")
+        row = None
+        if agent_id:
+            row = await conn.fetchrow(
+                "SELECT value FROM user_config WHERE key=$1",
+                f"daily_skeleton:{agent_id}"
+            )
+        if not row:
+            row = await conn.fetchrow("SELECT value FROM user_config WHERE key='daily_skeleton'")
     if not row:
         return _DAILY_SKELETON_DEFAULT
     v = row["value"]
@@ -5284,21 +7507,30 @@ async def get_daily_skeleton(_=Depends(_require_key)):
 @app.post("/admin/api/config/daily-skeleton")
 async def set_daily_skeleton(body: dict, _=Depends(_require_key)):
     import json as _j
+    agent_id = body.pop("agent_id", "")
+    key = f"daily_skeleton:{agent_id}" if agent_id else "daily_skeleton"
     async with _db_pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO user_config(key,value,updated_at) VALUES('daily_skeleton',$1::jsonb,NOW()) "
-            "ON CONFLICT(key) DO UPDATE SET value=$1::jsonb, updated_at=NOW()",
-            _j.dumps(body)
+            "INSERT INTO user_config(key,value,updated_at) VALUES($1,$2::jsonb,NOW()) "
+            "ON CONFLICT(key) DO UPDATE SET value=$2::jsonb, updated_at=NOW()",
+            key, _j.dumps(body)
         )
     return {"ok": True}
 
 
 # ── Screen-time rules config ───────────────────────────────────────────────
 @app.get("/admin/api/config/screen-time-rules")
-async def get_screen_time_rules(_=Depends(_require_key)):
+async def get_screen_time_rules(agent_id: str = "", _=Depends(_require_key)):
     import json as _j
     async with _db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT value FROM user_config WHERE key='screen_time_rules'")
+        row = None
+        if agent_id:
+            row = await conn.fetchrow(
+                "SELECT value FROM user_config WHERE key=$1",
+                f"screen_time_rules:{agent_id}"
+            )
+        if not row:
+            row = await conn.fetchrow("SELECT value FROM user_config WHERE key='screen_time_rules'")
     if not row:
         return {"rules": _DEFAULT_SCREEN_RULES, "using_defaults": True}
     v = row["value"]
@@ -5307,18 +7539,241 @@ async def get_screen_time_rules(_=Depends(_require_key)):
 
 @app.post("/admin/api/config/screen-time-rules")
 async def set_screen_time_rules(body: dict, _=Depends(_require_key)):
-    """body: {"rules": [...]}"""
+    """body: {"rules": [...], "agent_id": "..."}"""
     import json as _j
     rules = body.get("rules")
     if not isinstance(rules, list):
         raise HTTPException(400, "body.rules must be an array")
+    agent_id = body.get("agent_id", "")
+    key = f"screen_time_rules:{agent_id}" if agent_id else "screen_time_rules"
     async with _db_pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO user_config(key,value,updated_at) VALUES('screen_time_rules',$1::jsonb,NOW()) "
-            "ON CONFLICT(key) DO UPDATE SET value=$1::jsonb, updated_at=NOW()",
-            _j.dumps(rules)
+            "INSERT INTO user_config(key,value,updated_at) VALUES($1,$2::jsonb,NOW()) "
+            "ON CONFLICT(key) DO UPDATE SET value=$2::jsonb, updated_at=NOW()",
+            key, _j.dumps(rules)
         )
     return {"ok": True, "count": len(rules)}
+
+
+# ── New config endpoints (Notion spec) ────────────────────────────────────
+
+@app.get("/admin/api/config/api-routes")
+async def get_api_routes(_=Depends(_require_key)):
+    async with _db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM user_config WHERE key='api_routes'")
+    rv = row["value"] if row else None
+    data = (rv if isinstance(rv, dict) else json.loads(rv)) if rv else {}
+    return {"routes": {**_DEFAULT_API_ROUTES, **data}}
+
+@app.post("/admin/api/config/api-routes")
+async def set_api_routes(body: dict, _=Depends(_require_key)):
+    routes = body.get("routes")
+    if not isinstance(routes, dict):
+        raise HTTPException(400, "body.routes must be an object")
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO user_config(key,value,updated_at) VALUES('api_routes',$1::jsonb,NOW()) "
+            "ON CONFLICT(key) DO UPDATE SET value=$1::jsonb, updated_at=NOW()",
+            json.dumps(routes)
+        )
+    return {"ok": True}
+
+
+@app.get("/admin/api/config/push-control")
+async def get_push_control_cfg(_=Depends(_require_key)):
+    ctrl = await _get_push_control()
+    return {"push_control": ctrl}
+
+@app.post("/admin/api/config/push-control")
+async def set_push_control_cfg(body: dict, _=Depends(_require_key)):
+    ctrl = body.get("push_control", body)
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO user_config(key,value,updated_at) VALUES('push_control',$1::jsonb,NOW()) "
+            "ON CONFLICT(key) DO UPDATE SET value=$1::jsonb, updated_at=NOW()",
+            json.dumps(ctrl)
+        )
+    return {"ok": True}
+
+
+@app.get("/admin/api/config/morning-push")
+async def get_morning_push_cfg(_=Depends(_require_key)):
+    async with _db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM user_config WHERE key='morning_push_config'")
+    rv = row["value"] if row else None
+    data = (rv if isinstance(rv, dict) else json.loads(rv)) if rv else {}
+    defaults = {
+        "time_window": ["08:15", "08:30"],
+        "weather_normal_probability": 0.20,
+        "weather_severe_probability": 0.80,
+        "schedule_normal_probability": 0.45,
+        "random_event_enabled": True,
+    }
+    return {"config": {**defaults, **data}}
+
+@app.post("/admin/api/config/morning-push")
+async def set_morning_push_cfg(body: dict, _=Depends(_require_key)):
+    cfg = body.get("config", body)
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO user_config(key,value,updated_at) VALUES('morning_push_config',$1::jsonb,NOW()) "
+            "ON CONFLICT(key) DO UPDATE SET value=$1::jsonb, updated_at=NOW()",
+            json.dumps(cfg)
+        )
+    return {"ok": True}
+
+
+@app.get("/admin/api/push-log")
+async def get_push_log(agent_id: str = "", limit: int = 50, _=Depends(_require_key)):
+    """Return recent push log entries for observability."""
+    from memory_db import get_db as _gdb_pl
+    db = await _gdb_pl()
+    if agent_id:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM push_log WHERE agent_id=? ORDER BY created_at DESC LIMIT ?",
+            (agent_id, limit)
+        )
+    else:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM push_log ORDER BY created_at DESC LIMIT ?",
+            (limit,)
+        )
+    return {"logs": [dict(r) for r in rows]}
+
+
+@app.get("/admin/api/config/timezone")
+async def get_timezone_cfg(_=Depends(_require_key)):
+    async with _db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM user_config WHERE key='user_context'")
+    rv = row["value"] if row else None
+    uc = (rv if isinstance(rv, dict) else json.loads(rv)) if rv else {}
+    return {"timezone": uc.get("timezone") or {
+        "user": {"default": "Asia/Shanghai"},
+        "character": {"default": "Asia/Shanghai"},
+    }}
+
+@app.post("/admin/api/config/timezone")
+async def set_timezone_cfg(body: dict, _=Depends(_require_key)):
+    """Merge timezone config into user_context JSON."""
+    tz_data = body.get("timezone", body)
+    async with _db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM user_config WHERE key='user_context'")
+    rv = row["value"] if row else None
+    uc = (rv if isinstance(rv, dict) else json.loads(rv)) if rv else {}
+    uc["timezone"] = tz_data
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO user_config(key,value,updated_at) VALUES('user_context',$1::jsonb,NOW()) "
+            "ON CONFLICT(key) DO UPDATE SET value=$1::jsonb, updated_at=NOW()",
+            json.dumps(uc)
+        )
+    return {"ok": True}
+
+
+@app.get("/admin/api/config/evening-push")
+async def get_evening_push_cfg(_=Depends(_require_key)):
+    async with _db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM user_config WHERE key='evening_push_config'")
+    rv = row["value"] if row else None
+    data = (rv if isinstance(rv, dict) else json.loads(rv)) if rv else {}
+    defaults = {"enabled": True, "char_bedtime_window": ["22:30", "23:30"]}
+    return {"config": {**defaults, **data}}
+
+@app.post("/admin/api/config/evening-push")
+async def set_evening_push_cfg(body: dict, _=Depends(_require_key)):
+    cfg = body.get("config", body)
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO user_config(key,value,updated_at) VALUES('evening_push_config',$1::jsonb,NOW()) "
+            "ON CONFLICT(key) DO UPDATE SET value=$1::jsonb, updated_at=NOW()",
+            json.dumps(cfg)
+        )
+    return {"ok": True}
+
+
+# ── News config ────────────────────────────────────────────────────────────
+@app.get("/admin/api/config/news")
+async def get_news_cfg(_=Depends(_require_key)):
+    cfg = await _get_news_config()
+    return {"config": cfg}
+
+@app.post("/admin/api/config/news")
+async def set_news_cfg(body: dict, _=Depends(_require_key)):
+    cfg = body.get("config", body)
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO user_config(key,value,updated_at) VALUES('news_config',$1::jsonb,NOW()) "
+            "ON CONFLICT(key) DO UPDATE SET value=$1::jsonb, updated_at=NOW()",
+            json.dumps(cfg)
+        )
+    return {"ok": True}
+
+
+# ── Health monitor config ───────────────────────────────────────────────────
+@app.get("/admin/api/config/health")
+async def get_health_cfg(_=Depends(_require_key)):
+    cfg = await _get_health_config()
+    return {"config": cfg}
+
+@app.post("/admin/api/config/health")
+async def set_health_cfg(body: dict, _=Depends(_require_key)):
+    cfg = body.get("config", body)
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO user_config(key,value,updated_at) VALUES('health_config',$1::jsonb,NOW()) "
+            "ON CONFLICT(key) DO UPDATE SET value=$1::jsonb, updated_at=NOW()",
+            json.dumps(cfg)
+        )
+    return {"ok": True}
+
+
+@app.get("/admin/api/chain-events")
+async def get_chain_events(agent_id: str = "", include_fired: bool = False, _=Depends(_require_key)):
+    """List pending (or all) chain events."""
+    from memory_db import get_db as _gdb_ce
+    db = await _gdb_ce()
+    if agent_id:
+        if include_fired:
+            rows = await db.execute_fetchall(
+                "SELECT * FROM chain_events WHERE agent_id=? ORDER BY fire_at DESC LIMIT 50", (agent_id,))
+        else:
+            rows = await db.execute_fetchall(
+                "SELECT * FROM chain_events WHERE agent_id=? AND fired=0 ORDER BY fire_at LIMIT 50", (agent_id,))
+    else:
+        if include_fired:
+            rows = await db.execute_fetchall("SELECT * FROM chain_events ORDER BY fire_at DESC LIMIT 100")
+        else:
+            rows = await db.execute_fetchall(
+                "SELECT * FROM chain_events WHERE fired=0 ORDER BY fire_at LIMIT 100")
+    return {"events": [dict(r) for r in rows]}
+
+
+@app.delete("/admin/api/chain-events/{event_id}")
+async def delete_chain_event(event_id: str, _=Depends(_require_key)):
+    from memory_db import get_db as _gdb_ce2
+    db = await _gdb_ce2()
+    await db.execute("UPDATE chain_events SET fired=1 WHERE id=?", (event_id,))
+    await db.commit()
+    return {"ok": True}
+
+
+@app.get("/admin/api/character-state/{agent_id}")
+async def get_character_state_full(agent_id: str, _=Depends(_require_key)):
+    """Return full character state including accumulators."""
+    st = await _state_get(agent_id)
+    return {"state": st}
+
+@app.patch("/admin/api/character-state/{agent_id}")
+async def patch_character_state(agent_id: str, body: dict, _=Depends(_require_key)):
+    """Update character state fields (including accumulators)."""
+    allowed = {"mood_score","mood_label","fatigue","scene","scene_note",
+               "mood_valence","mood_energy","miss_you","low_mood","irritable",
+               "items","promises","busy_level","health_status"}
+    update = {k: v for k, v in body.items() if k in allowed}
+    if not update:
+        raise HTTPException(400, "No valid fields")
+    await _state_set(agent_id, **update)
+    return {"ok": True, "updated": list(update.keys())}
 
 
 @app.get("/admin/api/user-profiles")
@@ -5399,13 +7854,42 @@ async def admin_list_events(agent_id: str = "", _=Depends(_require_key)):
 
 @app.post("/admin/api/random-events")
 async def admin_add_event(body: dict, _=Depends(_require_key)):
+    import json as _jevt_add
+    def _js(v, default="{}"):
+        if isinstance(v, (dict, list)): return _jevt_add.dumps(v, ensure_ascii=False)
+        return str(v) if v else default
     evt = await _event_add(
         content=body.get("content",""),
         level=body.get("level","green"),
         weight=float(body.get("weight",1.0)),
         agent_id=body.get("agent_id",""),
+        scene=body.get("scene",""),
+        conditions=_js(body.get("conditions"), "{}"),
+        mood_effect=_js(body.get("mood_effect"), "{}"),
+        accumulator_effect=_js(body.get("accumulator_effect"), "{}"),
+        send_policy=body.get("send_policy","maybe"),
+        send_probability=float(body.get("send_probability", 0.40)),
+        chain_definition=_js(body.get("chain_definition"), ""),
     )
     return evt
+
+@app.put("/admin/api/random-events/{event_id}")
+async def admin_update_event(event_id: str, body: dict, _=Depends(_require_key)):
+    import json as _jevt_upd
+    def _js(v, default="{}"):
+        if isinstance(v, (dict, list)): return _jevt_upd.dumps(v, ensure_ascii=False)
+        return str(v) if v else default
+    update = {}
+    for k in ("content","level","scene","agent_id"):
+        if k in body: update[k] = body[k]
+    if "weight" in body: update["weight"] = float(body["weight"])
+    if "send_probability" in body: update["send_probability"] = float(body["send_probability"])
+    for k in ("conditions","mood_effect","accumulator_effect","chain_definition"):
+        if k in body: update[k] = _js(body[k], "{}" if k != "chain_definition" else "")
+    if "send_policy" in body: update["send_policy"] = body["send_policy"]
+    result = await _event_update(event_id, **update)
+    if not result: raise HTTPException(404, "Event not found")
+    return result
 
 @app.delete("/admin/api/random-events/{event_id}")
 async def admin_delete_event(event_id: str, _=Depends(_require_key)):
@@ -5857,7 +8341,12 @@ async def _check_activity_rules(agent_id: str, app: str, category: str, duration
     """
     import datetime as _dt2, re as _re2
     async with _db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT value FROM user_config WHERE key='screen_time_rules'")
+        row = await conn.fetchrow(
+            "SELECT value FROM user_config WHERE key=$1",
+            f"screen_time_rules:{agent_id}"
+        )
+        if not row:
+            row = await conn.fetchrow("SELECT value FROM user_config WHERE key='screen_time_rules'")
     if row and row["value"]:
         _rv = row["value"]
         rules = _rv if isinstance(_rv, list) else __import__("json").loads(_rv)
@@ -5887,6 +8376,25 @@ async def _check_activity_rules(agent_id: str, app: str, category: str, duration
             allowed = await _cd_gate(agent_id, cd_cat)
             if allowed:
                 msg = push.format(app=app, category=category, minutes=duration_minutes)
+                # Try to generate char-voice message via LLM (Telegram channel)
+                tg_sent = False
+                try:
+                    _as = await _get_agent_settings(agent_id)
+                    _sp = (_as.get("system_prompt") or "").strip()
+                    if _sp:
+                        _char_prompt = (
+                            f"你是以下角色：\n{_sp[:400]}\n\n"
+                            f"现在你想发一条消息给用户，内容大意是：「{msg}」。\n"
+                            "用你自己的口吻改写这条消息（1-2句，中文口语，自然真实，不要解释）："
+                        )
+                        char_msg = (await _call_llm_route("proactive_push", _char_prompt)).strip().strip("\"'")
+                        if char_msg:
+                            tg_sent = await _telegram_send(char_msg)
+                            if tg_sent:
+                                print(f"[activity] char-voice sent for {agent_id}: {char_msg[:60]}", flush=True)
+                except Exception as _ce:
+                    print(f"[activity] char-voice error: {_ce}", flush=True)
+                # Bark fallback (always fire as notification ping)
                 try:
                     await bark_push(msg, sound=sound)
                     print(f"[activity] rule fired: {cond!r} → bark: {msg!r}", flush=True)
@@ -6656,8 +9164,24 @@ async def daily_api_write(body: dict, _=Depends(_require_key)):
         mood=body.get("mood", "neutral"),
         carry_over=body.get("carry_over", ""),
         source="manual",
+        relation_type=body.get("relation_type", "living_together"),
     )
     return {"ok": True, "event": result}
+
+@app.put("/admin/api/daily/{event_id}")
+async def daily_api_update(event_id: str, body: dict, _=Depends(_require_key)):
+    updated = await _daily_update(
+        event_id,
+        summary=body.get("summary"),
+        mood=body.get("mood"),
+        time_of_day=body.get("time_of_day"),
+        carry_over=body.get("carry_over"),
+        relation_type=body.get("relation_type"),
+        date=body.get("date"),
+    )
+    if not updated:
+        raise HTTPException(404, "Event not found")
+    return {"ok": True}
 
 @app.delete("/admin/api/daily/{event_id}")
 async def daily_api_delete(event_id: str, _=Depends(_require_key)):
@@ -7050,4 +9574,391 @@ async def admin_mcp_intiface_devices(_=Depends(_require_key)):
     """List Intiface devices."""
     result = await intiface_list_devices()
     return {"ok": True, "result": result}
+
+
+# ── Timeline dashboard (timeline-for-agent integration) ──────────────────────
+
+_TIMELINE_TAXONOMY = {
+    "categories": [
+        {
+            "id": "memory",
+            "label": "记忆层",
+            "color": "#a78bfa",
+            "children": [
+                {"id": "memory.L1", "label": "L1 身份"},
+                {"id": "memory.L2", "label": "L2 背景"},
+                {"id": "memory.L3", "label": "L3 事件"},
+                {"id": "memory.L4", "label": "L4 时刻"},
+                {"id": "memory.L5", "label": "L5 重写"},
+            ],
+        },
+        {
+            "id": "daily",
+            "label": "日记",
+            "color": "#94a3b8",
+            "children": [
+                {"id": "daily.entry", "label": "每日记录"},
+            ],
+        },
+    ],
+    "eventNodes": [],
+}
+
+_LAYER_SUBCATEGORY = {
+    "L1": "memory.L1",
+    "L2": "memory.L2",
+    "L3": "memory.L3",
+    "L4": "memory.L4",
+    "L5": "memory.L5",
+}
+
+_LAYER_DURATION_MIN = {
+    "L1": 60,
+    "L2": 45,
+    "L3": 30,
+    "L4": 15,
+    "L5": 20,
+}
+
+_tl_bearer = HTTPBearer(auto_error=False)
+
+
+def _tl_require_key(
+    cred: Optional[HTTPAuthorizationCredentials] = Security(_tl_bearer),
+    key: Optional[str] = Query(default=None),
+):
+    """Accept admin key from Bearer header or ?key= query param."""
+    raw = None
+    if cred:
+        raw = cred.credentials
+    elif key:
+        raw = key
+    if not raw or raw.split(":", 1)[0] != GATEWAY_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return raw
+
+
+def _tl_to_utc_z(dt: datetime) -> str:
+    """Return a clean UTC ISO string like 2026-04-28T11:41:32Z."""
+    if dt.tzinfo is not None:
+        t = dt.utctimetuple()
+        dt = datetime(*t[:6])
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+async def _build_tl_state(agent_id: str = "default", days: int = 90) -> dict:
+    """Build the timeline-for-agent state dict from Palimpsest + Daily data."""
+    cutoff_iso = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+
+    mems    = await _mem_list(agent_id=agent_id, importance_min=1,
+                               include_archived=False, limit=1000)
+    dailies = await _daily_list(agent_id=agent_id, limit=days * 3)
+    facts: dict = {}
+
+    for m in mems:
+        raw_ts = (m.get("created_at") or "").rstrip("Z").replace("+00:00", "")
+        if not raw_ts or raw_ts < cutoff_iso:
+            continue
+        try:
+            dt = datetime.fromisoformat(raw_ts)
+        except ValueError:
+            continue
+        date_str = (dt + timedelta(hours=8)).strftime("%Y-%m-%d")
+        layer    = m.get("layer") or "L4"
+        end_dt   = dt + timedelta(minutes=_LAYER_DURATION_MIN.get(layer, 20))
+        sub_cat  = _LAYER_SUBCATEGORY.get(layer, "memory.L4")
+        content  = m.get("content") or ""
+        start_z, end_z = _tl_to_utc_z(dt), _tl_to_utc_z(end_dt)
+        event = {
+            "id": f"mem:{m['id']}",
+            "startAt": start_z, "endAt": end_z,
+            "title": content.split("\n")[0][:80],
+            "note": content,
+            "categoryId": "memory",
+            "subcategoryId": sub_cat,
+            "confidence": round(min(1.0, (m.get("importance") or 3) / 5.0), 2),
+            "tags": [],
+        }
+        if date_str not in facts:
+            facts[date_str] = {"status": "final", "updatedAt": start_z, "events": []}
+        facts[date_str]["events"].append(event)
+
+    for d in dailies:
+        date_str = d.get("date") or ""
+        if not date_str:
+            continue
+        start_iso = f"{date_str}T01:00:00Z"
+        summary   = d.get("summary") or ""
+        mood      = d.get("mood") or "neutral"
+        event = {
+            "id": f"daily:{d['id']}",
+            "startAt": start_iso, "endAt": f"{date_str}T01:30:00Z",
+            "title": f"[{mood}] {summary.split(chr(10))[0][:80]}",
+            "note": summary,
+            "categoryId": "daily", "subcategoryId": "daily.entry",
+            "confidence": 1.0, "tags": [mood],
+        }
+        if date_str not in facts:
+            facts[date_str] = {"status": "final", "updatedAt": start_iso, "events": []}
+        facts[date_str]["events"].append(event)
+
+    for day_data in facts.values():
+        day_data["events"].sort(key=lambda e: e["startAt"])
+
+    now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "state": {
+            "version": 1, "timezone": "Asia/Shanghai",
+            "taxonomy": _TIMELINE_TAXONOMY, "facts": facts,
+        },
+        "meta": {
+            "updatedAt": now_iso, "factsUpdatedAt": now_iso,
+            "taxonomyUpdatedAt": now_iso, "isDemoData": False, "locale": "zh-CN",
+        },
+    }
+
+
+@app.get("/timeline/__timeline_source_data")
+async def timeline_source_data(
+    agent_id: str = "default",
+    days: int = 90,
+    _=Depends(_tl_require_key),
+):
+    """Return raw state (used by admin panel button with key in URL)."""
+    return await _build_tl_state(agent_id=agent_id, days=days)
+
+
+def _tl_dur_min(start: str, end: str) -> int:
+    """Return duration in minutes between two ISO timestamps."""
+    try:
+        s = datetime.fromisoformat(start.rstrip("Z").replace("+00:00", ""))
+        e = datetime.fromisoformat(end.rstrip("Z").replace("+00:00", ""))
+        return max(0, int((e - s).total_seconds() / 60))
+    except Exception:
+        return 0
+
+
+def _tl_fmt_dur(minutes: int) -> str:
+    if minutes < 60:
+        return f"{minutes}min"
+    h, m = divmod(minutes, 60)
+    return f"{h}hr {m}min" if m else f"{h}hr"
+
+
+def _tl_week_start(date_str: str) -> str:
+    """Return the Sunday-start week date for a given YYYY-MM-DD string."""
+    from datetime import date as _date
+    d = _date.fromisoformat(date_str)
+    # isoweekday(): Mon=1…Sun=7; days_since_sunday = isoweekday() % 7
+    days_since_sunday = d.isoweekday() % 7
+    return (d - timedelta(days=days_since_sunday)).isoformat()
+
+
+def _build_tl_views(state: dict, meta: dict) -> dict:
+    """Python equivalent of buildTimelineViews from timeline-analytics.js.
+
+    Produces the full JSON shape that the React dashboard expects.
+    Week/month range stats are simplified but the day timeline is complete.
+    """
+    facts    = state.get("facts") or {}
+    taxonomy = state.get("taxonomy") or {}
+    dates    = sorted(facts.keys())
+
+    # Build category → color map
+    cat_color: dict = {}
+    for cat in taxonomy.get("categories", []):
+        color = cat.get("color", "#4E79A7")
+        cat_color[cat["id"]] = color
+        for child in cat.get("children", []):
+            cat_color[child["id"]] = color
+
+    def _item(event: dict) -> dict:
+        sub  = event.get("subcategoryId", "")
+        cat  = event.get("categoryId", "")
+        color = cat_color.get(sub) or cat_color.get(cat) or "#4E79A7"
+        dur  = _tl_dur_min(event.get("startAt", ""), event.get("endAt", ""))
+        return {
+            "id":      event["id"],
+            "start":   event["startAt"],
+            "end":     event["endAt"],
+            "content": f"{event.get('title', '')} | {_tl_fmt_dur(dur)}",
+            "style":   f"background:{color};border-color:{color};color:var(--text);",
+            "tooltip": {
+                "title":        event.get("title", ""),
+                "note":         event.get("note", ""),
+                "color":        color,
+                "durationText": _tl_fmt_dur(dur),
+                "timeText":     "",
+            },
+            "className": f"cat-{cat}",
+        }
+
+    # ── Day timelines ──────────────────────────────────────────────────────────
+    day_timelines: dict = {}
+    for date in dates:
+        events = facts[date].get("events") or []
+        day_timelines[date] = {
+            "date":   date,
+            "start":  f"{date}T00:00:00.000+08:00",
+            "end":    f"{date}T23:59:59.999+08:00",
+            "groups": [],
+            "items":  [_item(e) for e in events],
+        }
+
+    # ── Week timelines ────────────────────────────────────────────────────────
+    # Group dates by week (Sunday-start)
+    week_groups: dict = {}
+    for date in dates:
+        ws = _tl_week_start(date)
+        week_groups.setdefault(ws, []).append(date)
+
+    from datetime import date as _date_cls
+    WEEKDAY_ZH = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
+
+    week_timelines: dict = {}
+    for ws, wdates in sorted(week_groups.items()):
+        groups, items = [], []
+        ws_end = (_date_cls.fromisoformat(ws) + timedelta(days=6)).isoformat()
+        for date in sorted(wdates):
+            d_obj = _date_cls.fromisoformat(date)
+            day_label = f"{WEEKDAY_ZH[d_obj.isoweekday() % 7]} {date[5:]}"
+            groups.append({"id": date, "content": day_label})
+            for e in (facts[date].get("events") or []):
+                # Use actual timestamps — group field creates rows per day
+                it = _item(e)
+                items.append({**it, "group": date})
+        week_timelines[ws] = {
+            "weekStart": ws,
+            "start": f"{ws}T00:00:00.000+08:00",
+            "end":   f"{ws_end}T23:59:59.999+08:00",
+            "groups": groups,
+            "items":  items,
+        }
+
+    # ── Ranges (category stats matching buildRangeAggregate output) ───────────
+    def _cat_label(cid: str) -> str:
+        for cat in taxonomy.get("categories", []):
+            if cat["id"] == cid:
+                return cat.get("label", cid)
+            for child in cat.get("children", []):
+                if child["id"] == cid:
+                    return child.get("label", cid)
+        return cid
+
+    def _range_agg(evts: list, key: str = "", label: str = "", unit: str = "day",
+                   all_dates: list | None = None) -> dict:
+        total = sum(_tl_dur_min(e.get("startAt",""), e.get("endAt","")) for e in evts)
+        cat_buckets: dict = {}
+        sub_buckets: dict = {}
+        # trend: date → {subcategoryId → minutes}
+        trend_map: dict = {d: {} for d in (all_dates or [])}
+
+        for e in evts:
+            cid  = e.get("categoryId", "")
+            sid  = e.get("subcategoryId", "")
+            dur  = _tl_dur_min(e.get("startAt",""), e.get("endAt",""))
+            edate = (e.get("startAt","") or "")[:10]
+
+            # category bucket
+            if cid not in cat_buckets:
+                cat_buckets[cid] = {
+                    "categoryId": cid, "label": _cat_label(cid),
+                    "color": cat_color.get(cid, "#4E79A7"),
+                    "minutes": 0, "percentage": 0,
+                }
+            cat_buckets[cid]["minutes"] += dur
+
+            # subcategory bucket
+            if sid:
+                if sid not in sub_buckets:
+                    sub_buckets[sid] = {
+                        "subcategoryId": sid, "categoryId": cid,
+                        "label": _cat_label(sid),
+                        "color": cat_color.get(cid, "#4E79A7"),
+                        "minutes": 0, "percentage": 0,
+                    }
+                sub_buckets[sid]["minutes"] += dur
+
+            # trend
+            if edate in trend_map and sid:
+                trend_map[edate][sid] = trend_map[edate].get(sid, 0) + dur
+
+        for b in cat_buckets.values():
+            b["percentage"] = round(b["minutes"] / total * 100) if total else 0
+        for b in sub_buckets.values():
+            b["percentage"] = round(b["minutes"] / total * 100) if total else 0
+
+        subcategory_trend = [
+            {
+                "date": d,
+                "subcategories": sorted(
+                    [{"subcategoryId": k, "minutes": v} for k, v in sm.items()],
+                    key=lambda x: -x["minutes"],
+                ),
+            }
+            for d, sm in sorted(trend_map.items())
+        ]
+
+        return {
+            "key":   key,
+            "label": label,
+            "unit":  unit,
+            "totalMinutes": total,
+            "timeBlocks":   len(evts),
+            "categories":   sorted(cat_buckets.values(), key=lambda x: -x["minutes"]),
+            "subcategories": sorted(sub_buckets.values(), key=lambda x: -x["minutes"]),
+            "subcategoryTrend": subcategory_trend,
+        }
+
+    day_ranges = {
+        d: _range_agg(facts[d].get("events") or [], key=d, label=d, unit="day", all_dates=[d])
+        for d in dates
+    }
+
+    week_ranges: dict = {}
+    for ws, wdates in sorted(week_groups.items()):
+        all_evts = [e for d in wdates for e in (facts[d].get("events") or [])]
+        week_ranges[ws] = _range_agg(
+            all_evts, key=ws, label=f"Week of {ws}", unit="week", all_dates=sorted(wdates)
+        )
+
+    month_groups: dict = {}
+    for date in dates:
+        month_groups.setdefault(date[:7], []).append(date)
+    month_ranges: dict = {}
+    for ym, mdates in sorted(month_groups.items()):
+        all_evts = [e for d in mdates for e in (facts[d].get("events") or [])]
+        month_ranges[ym] = _range_agg(
+            all_evts, key=ym, label=ym, unit="month", all_dates=sorted(mdates)
+        )
+
+    now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "meta": {
+            "generatedAt":      now_iso,
+            "updatedAt":        meta.get("updatedAt", now_iso),
+            "taxonomyUpdatedAt": meta.get("taxonomyUpdatedAt", now_iso),
+            "factsUpdatedAt":   meta.get("factsUpdatedAt", now_iso),
+            "isDemoData":       False,
+            "timezone":         state.get("timezone", "Asia/Shanghai"),
+            "locale":           meta.get("locale", "zh-CN"),
+            "availableDates":   dates,
+            "latestDate":       dates[-1] if dates else "",
+        },
+        "taxonomy": taxonomy,
+        "timelines": {"day": day_timelines, "week": week_timelines},
+        "ranges":    {"day": day_ranges, "week": week_ranges, "month": month_ranges},
+    }
+
+
+@app.get("/timeline/dashboard-data.json")
+async def timeline_dashboard_data(agent_id: str = "default", days: int = 90):
+    """Pre-processed views data — no auth needed, used by the React dashboard."""
+    state_data = await _build_tl_state(agent_id=agent_id, days=days)
+    views = _build_tl_views(state_data["state"], state_data["meta"])
+    return views
+
+
+# Mount timeline static dashboard (MUST be after /timeline/* route definitions)
+app.mount("/timeline", StaticFiles(directory="static/timeline", html=True), name="timeline")
 

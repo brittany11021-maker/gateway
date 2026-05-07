@@ -954,26 +954,35 @@ async def memory_list_pending_l1(agent_id: str) -> list[dict]:
 
 _DAILY_INIT = """
 CREATE TABLE IF NOT EXISTS daily_events (
-    id          TEXT PRIMARY KEY,
-    agent_id    TEXT NOT NULL DEFAULT 'default',
-    date        TEXT NOT NULL,          -- YYYY-MM-DD
-    time_of_day TEXT DEFAULT '',        -- HH:MM or 'morning'/'afternoon'/'evening'
-    mood        TEXT DEFAULT 'neutral', -- happy/neutral/sad/excited/tired/anxious/calm
-    summary     TEXT NOT NULL,          -- narrative prose for the day/event
-    carry_over  TEXT DEFAULT '',        -- things to carry forward to tomorrow
-    source      TEXT DEFAULT 'auto',    -- 'auto' (LLM-generated) | 'manual'
-    created_at  TEXT DEFAULT (datetime('now'))
+    id            TEXT PRIMARY KEY,
+    agent_id      TEXT NOT NULL DEFAULT 'default',
+    date          TEXT NOT NULL,          -- YYYY-MM-DD
+    time_of_day   TEXT DEFAULT '',        -- HH:MM or 'morning'/'afternoon'/'evening'
+    mood          TEXT DEFAULT 'neutral', -- happy/neutral/sad/excited/tired/anxious/calm
+    summary       TEXT NOT NULL,          -- narrative prose for the day/event
+    carry_over    TEXT DEFAULT '',        -- things to carry forward to tomorrow
+    source        TEXT DEFAULT 'auto',    -- 'auto' (LLM-generated) | 'manual'
+    relation_type TEXT DEFAULT 'living_together', -- living_together | long_distance
+    created_at    TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_daily_agent_date ON daily_events (agent_id, date DESC);
 """
 
+_DAILY_SELECT = "id, date, time_of_day, mood, summary, carry_over, source, relation_type, created_at"
+
 
 async def _ensure_daily_table(db) -> None:
-    """Create daily_events table if it doesn't exist yet."""
+    """Create daily_events table if it doesn't exist yet, and migrate missing columns."""
     for stmt in _DAILY_INIT.strip().split(";"):
         s = stmt.strip()
         if s:
             await db.execute(s)
+    try:
+        await db.execute(
+            "ALTER TABLE daily_events ADD COLUMN relation_type TEXT DEFAULT 'living_together'"
+        )
+    except Exception:
+        pass  # column already exists
     await db.commit()
 
 
@@ -985,6 +994,7 @@ async def daily_write(
     mood: str = "neutral",
     carry_over: str = "",
     source: str = "auto",
+    relation_type: str = "living_together",
 ) -> dict:
     """Persist a daily life event entry."""
     import uuid as _uuid, datetime as _dt
@@ -994,12 +1004,29 @@ async def daily_write(
         date = _dt.datetime.utcnow().strftime("%Y-%m-%d")
     eid = str(_uuid.uuid4())
     await db.execute(
-        "INSERT INTO daily_events (id, agent_id, date, time_of_day, mood, summary, carry_over, source) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (eid, agent_id, date, time_of_day, mood, summary, carry_over, source),
+        "INSERT INTO daily_events (id, agent_id, date, time_of_day, mood, summary, carry_over, source, relation_type) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (eid, agent_id, date, time_of_day, mood, summary, carry_over, source, relation_type),
     )
     await db.commit()
-    return {"id": eid, "date": date, "mood": mood, "summary": summary}
+    return {"id": eid, "date": date, "mood": mood, "summary": summary, "relation_type": relation_type}
+
+
+async def daily_update(event_id: str, **fields) -> bool:
+    """Update mutable fields of a daily event. Returns True if found."""
+    allowed = {"summary", "mood", "time_of_day", "carry_over", "relation_type", "date"}
+    updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    if not updates:
+        return False
+    db = await get_db()
+    await _ensure_daily_table(db)
+    sets = ", ".join(f"{k} = ?" for k in updates)
+    cur = await db.execute(
+        f"UPDATE daily_events SET {sets} WHERE id = ?",
+        (*updates.values(), event_id),
+    )
+    await db.commit()
+    return cur.rowcount > 0
 
 
 async def daily_read(agent_id: str = "default", days: int = 3) -> list[dict]:
@@ -1007,8 +1034,7 @@ async def daily_read(agent_id: str = "default", days: int = 3) -> list[dict]:
     db = await get_db()
     await _ensure_daily_table(db)
     rows = await db.execute_fetchall(
-        "SELECT id, date, time_of_day, mood, summary, carry_over, source, created_at "
-        "FROM daily_events "
+        f"SELECT {_DAILY_SELECT} FROM daily_events "
         "WHERE agent_id = ? AND date >= date('now', ?) "
         "ORDER BY date DESC, created_at DESC",
         (agent_id, f"-{days} days"),
@@ -1021,8 +1047,8 @@ async def daily_list(agent_id: str = "default", limit: int = 30) -> list[dict]:
     db = await get_db()
     await _ensure_daily_table(db)
     rows = await db.execute_fetchall(
-        "SELECT id, date, time_of_day, mood, summary, carry_over, source, created_at "
-        "FROM daily_events WHERE agent_id = ? ORDER BY date DESC, created_at DESC LIMIT ?",
+        f"SELECT {_DAILY_SELECT} FROM daily_events "
+        "WHERE agent_id = ? ORDER BY date DESC, created_at DESC LIMIT ?",
         (agent_id, limit),
     )
     return [dict(r) for r in rows]
@@ -1279,6 +1305,140 @@ async def _ensure_p1_tables(db) -> None:
         await db.commit()
     except Exception:
         pass
+    # ── New character_state accumulator columns (Notion spec §4) ──────────────
+    for _col, _defval in [
+        ("mood_valence",   "0.0"),
+        ("mood_energy",    "0.0"),
+        ("miss_you",       "0.0"),
+        ("low_mood",       "0.0"),
+        ("irritable",      "0.0"),
+        ("items",          "'[]'"),
+        ("promises",       "'[]'"),
+        ("busy_level",     "'normal'"),
+        ("health_status",  "'healthy'"),
+        ("last_user_msg",  "(datetime('now'))"),
+    ]:
+        try:
+            await db.execute(
+                f"ALTER TABLE character_state ADD COLUMN {_col} "
+                f"{'TEXT' if _col in ('items','promises','busy_level','health_status','last_user_msg') else 'REAL'} "
+                f"DEFAULT {_defval}"
+            )
+            await db.commit()
+        except Exception:
+            pass  # already exists
+    # ── New random_events condition columns (Notion spec §5) ─────────────────
+    for _col, _defval in [
+        ("conditions",         "'{}'"),
+        ("mood_effect",        "'{}'"),
+        ("accumulator_effect", "'{}'"),
+        ("send_policy",        "'maybe'"),
+        ("send_probability",   "0.4"),
+    ]:
+        try:
+            await db.execute(
+                f"ALTER TABLE random_events ADD COLUMN {_col} "
+                f"{'TEXT' if _col not in ('send_probability',) else 'REAL'} "
+                f"DEFAULT {_defval}"
+            )
+            await db.commit()
+        except Exception:
+            pass  # already exists
+    # ── Push log table (Notion spec §10) ─────────────────────────────────────
+    try:
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS push_log (
+                id          TEXT PRIMARY KEY,
+                agent_id    TEXT NOT NULL,
+                category    TEXT NOT NULL,
+                trigger_src TEXT DEFAULT '',
+                message     TEXT NOT NULL,
+                sent        INTEGER DEFAULT 1,
+                reason      TEXT DEFAULT '',
+                modules     TEXT DEFAULT '{}',
+                model       TEXT DEFAULT '',
+                tokens_in   INTEGER DEFAULT 0,
+                tokens_out  INTEGER DEFAULT 0,
+                created_at  TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_push_log_agent ON push_log(agent_id, created_at);
+        """)
+        await db.commit()
+    except Exception:
+        pass
+    # ── Chain events queue (Notion spec §6) ──────────────────────────────────
+    try:
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS chain_events (
+                id                TEXT PRIMARY KEY,
+                agent_id          TEXT NOT NULL,
+                trigger_event_id  TEXT DEFAULT '',
+                trigger_content   TEXT DEFAULT '',
+                content           TEXT NOT NULL,
+                level             TEXT DEFAULT 'green',
+                mood_effect       TEXT DEFAULT '{}',
+                accumulator_effect TEXT DEFAULT '{}',
+                send_policy       TEXT DEFAULT 'maybe',
+                carry_over        TEXT DEFAULT '{}',
+                fire_at           TEXT NOT NULL,
+                fired             INTEGER DEFAULT 0,
+                created_at        TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_chain_fire
+                ON chain_events(agent_id, fire_at, fired);
+        """)
+        await db.commit()
+    except Exception:
+        pass
+    # ── chain_definition column on random_events ──────────────────────────────
+    try:
+        await db.execute(
+            "ALTER TABLE random_events ADD COLUMN chain_definition TEXT DEFAULT NULL"
+        )
+        await db.commit()
+    except Exception:
+        pass
+
+    # ── News cache (§13) ──────────────────────────────────────────────────────
+    try:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS news_cache (
+                id          TEXT PRIMARY KEY,
+                category    TEXT NOT NULL,
+                title       TEXT NOT NULL,
+                summary     TEXT DEFAULT '',
+                source      TEXT DEFAULT '',
+                url         TEXT DEFAULT '',
+                published   TEXT DEFAULT '',
+                fetched_at  TEXT DEFAULT (datetime('now')),
+                pushed      INTEGER DEFAULT 0,
+                injected    INTEGER DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_news_cat_fetched
+                ON news_cache(category, fetched_at);
+        """)
+        await db.commit()
+    except Exception:
+        pass
+
+    # ── Health snapshot cache (§15) ───────────────────────────────────────────
+    try:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS health_snapshots (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                metric      TEXT NOT NULL,
+                value       REAL,
+                unit        TEXT DEFAULT '',
+                sampled_at  TEXT DEFAULT (datetime('now')),
+                pushed      INTEGER DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_health_metric_sampled
+                ON health_snapshots(metric, sampled_at);
+        """)
+        await db.commit()
+    except Exception:
+        pass
+
     await db.commit()
     _p1_initialized = True
 
@@ -1307,8 +1467,15 @@ async def state_set(agent_id: str, **kwargs) -> dict:
     """Update one or more state fields. Returns updated state."""
     db = await get_db()
     await _ensure_p1_tables(db)
-    allowed = {"mood_score", "mood_label", "fatigue", "scene", "scene_note",
-               "cooldown_minutes", "cooldown_message", "dream_text", "dream_date"}
+    allowed = {
+        "mood_score", "mood_label", "fatigue", "scene", "scene_note",
+        "cooldown_minutes", "cooldown_message", "dream_text", "dream_date",
+        # Accumulator fields (Notion spec §4)
+        "mood_valence", "mood_energy",
+        "miss_you", "low_mood", "irritable",
+        "items", "promises",
+        "busy_level", "health_status", "last_user_msg",
+    }
     sets = {k: v for k, v in kwargs.items() if k in allowed}
     if sets:
         cols = ", ".join(f"{k}=?" for k in sets)
@@ -1338,6 +1505,123 @@ async def state_touch(agent_id: str) -> None:
     await db.commit()
 
 
+# Accumulator field ranges (Notion spec §4.3)
+_ACCUMULATOR_RANGES: dict[str, tuple[float, float]] = {
+    "miss_you":  (0.0, 10.0),
+    "low_mood":  (0.0,  8.0),
+    "irritable": (0.0,  6.0),
+    "mood_valence": (-1.0, 1.0),
+    "mood_energy":  (-1.0, 1.0),
+    "fatigue":   (0.0,  5.0),
+}
+
+
+async def accumulate_state(agent_id: str, delta: dict) -> dict:
+    """Apply incremental deltas to accumulator fields, clamping to valid ranges.
+
+    Example: await accumulate_state("chiaki", {"miss_you": +1.5, "mood_valence": -0.1})
+    Returns the updated state dict.
+    """
+    db = await get_db()
+    await _ensure_p1_tables(db)
+    await db.execute("INSERT OR IGNORE INTO character_state (agent_id) VALUES (?)", (agent_id,))
+    # Fetch current values
+    cur = await db.execute(
+        "SELECT miss_you, low_mood, irritable, mood_valence, mood_energy, fatigue "
+        "FROM character_state WHERE agent_id=?", (agent_id,)
+    )
+    row = await cur.fetchone()
+    current = dict(row) if row else {}
+    sets = []
+    vals = []
+    for field, inc in delta.items():
+        lo, hi = _ACCUMULATOR_RANGES.get(field, (-1e9, 1e9))
+        cur_val = float(current.get(field) or 0.0)
+        new_val = max(lo, min(hi, cur_val + float(inc)))
+        sets.append(f"{field}=?")
+        vals.append(new_val)
+    if sets:
+        vals.append(agent_id)
+        await db.execute(
+            f"UPDATE character_state SET {', '.join(sets)}, updated_at=datetime('now') "
+            f"WHERE agent_id=?", vals
+        )
+        await db.commit()
+    return await state_get(agent_id)
+
+
+async def push_log_write(
+    agent_id: str, category: str, message: str,
+    trigger_src: str = "", sent: bool = True, reason: str = "",
+    modules: dict = None, model: str = "", tokens_in: int = 0, tokens_out: int = 0,
+) -> None:
+    """Write a push event to push_log for observability (Notion spec §10)."""
+    import uuid as _ul, json as _jl
+    db = await get_db()
+    await _ensure_p1_tables(db)
+    await db.execute(
+        """INSERT INTO push_log
+           (id, agent_id, category, trigger_src, message, sent, reason, modules, model, tokens_in, tokens_out)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (str(_ul.uuid4()), agent_id, category, trigger_src,
+         message[:2000], 1 if sent else 0, reason,
+         _jl.dumps(modules or {}), model, tokens_in, tokens_out)
+    )
+    await db.commit()
+
+
+# ── Chain Events ──────────────────────────────────────────────────────────────
+
+async def chain_event_schedule(
+    agent_id: str,
+    trigger_event_id: str,
+    trigger_content: str,
+    content: str,
+    fire_at: str,                   # UTC ISO8601
+    level: str = "green",
+    mood_effect: dict = None,
+    accumulator_effect: dict = None,
+    send_policy: str = "maybe",
+    carry_over: dict = None,
+) -> str:
+    """Schedule a chain event to fire at fire_at (UTC). Returns its id."""
+    import uuid as _uce, json as _jce
+    db = await get_db()
+    await _ensure_p1_tables(db)
+    eid = str(_uce.uuid4())
+    await db.execute(
+        """INSERT INTO chain_events
+           (id, agent_id, trigger_event_id, trigger_content, content, level,
+            mood_effect, accumulator_effect, send_policy, carry_over, fire_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (eid, agent_id, trigger_event_id, trigger_content, content, level,
+         _jce.dumps(mood_effect or {}), _jce.dumps(accumulator_effect or {}),
+         send_policy, _jce.dumps(carry_over or {}), fire_at)
+    )
+    await db.commit()
+    return eid
+
+
+async def chain_events_due(agent_id: str) -> list[dict]:
+    """Return all unfired chain events whose fire_at has passed."""
+    import datetime as _dtce
+    db = await get_db()
+    await _ensure_p1_tables(db)
+    now = _dtce.datetime.utcnow().isoformat()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM chain_events WHERE agent_id=? AND fired=0 AND fire_at<=? ORDER BY fire_at",
+        (agent_id, now)
+    )
+    return [dict(r) for r in rows]
+
+
+async def chain_event_mark_fired(event_id: str) -> None:
+    db = await get_db()
+    await _ensure_p1_tables(db)
+    await db.execute("UPDATE chain_events SET fired=1 WHERE id=?", (event_id,))
+    await db.commit()
+
+
 async def state_cooldown_active(agent_id: str) -> bool:
     """Return True if the character is still within their cooldown window."""
     db = await get_db()
@@ -1362,12 +1646,16 @@ async def state_cooldown_active(agent_id: str) -> bool:
 
 # Default cooldown durations in seconds
 _COOLDOWN_DEFAULTS: dict[str, int] = {
-    "casual":           3600,    # 1 hour
-    "weather":          86400,   # 24 hours — one weather push per day
-    "game_check":       7200,    # 2 hours
-    "late_night":       28800,   # 8 hours — don't nag all night
-    "proactive_casual": 14400,   # 4 hours
-    "reminder":         0,       # no cooldown for explicit reminders
+    "casual":            3600,    # 1 hour
+    "weather":           86400,   # 24 hours — one weather push per day
+    "morning_weather":   86400,   # 24 hours — one morning greeting per day
+    "evening_goodnight": 86400,   # 24 hours — one goodnight per day
+    "game_check":        7200,    # 2 hours
+    "late_night":        28800,   # 8 hours — don't nag all night
+    "proactive_casual":  14400,   # 4 hours
+    "miss_you_trigger":  7200,    # 2 hours
+    "low_mood_trigger":  14400,   # 4 hours
+    "reminder":          0,       # no cooldown for explicit reminders
 }
 
 
@@ -1483,29 +1771,69 @@ async def state_mood_drift(agent_id: str, event_level: str) -> dict:
     return await state_set(agent_id, mood_score=new_mood, mood_label=label, fatigue=new_fat)
 
 
-async def event_list(agent_id: str = "", limit: int = 50) -> list[dict]:
+async def event_list(agent_id: str = "", limit: int = 200) -> list[dict]:
     db = await get_db()
     await _ensure_p1_tables(db)
-    rows = await db.execute_fetchall(
-        "SELECT * FROM random_events WHERE agent_id=? OR agent_id='' "
-        "ORDER BY level, weight DESC LIMIT ?",
-        (agent_id, limit),
-    )
+    if agent_id:
+        # for roll: agent-specific + global
+        rows = await db.execute_fetchall(
+            "SELECT * FROM random_events WHERE agent_id=? OR agent_id='' "
+            "ORDER BY agent_id, level, weight DESC LIMIT ?",
+            (agent_id, limit),
+        )
+    else:
+        # for admin panel: all events
+        rows = await db.execute_fetchall(
+            "SELECT * FROM random_events ORDER BY agent_id, level, weight DESC LIMIT ?",
+            (limit,),
+        )
     return [dict(r) for r in rows]
 
 
 async def event_add(content: str, level: str = "green", weight: float = 1.0,
-                    agent_id: str = "") -> dict:
+                    agent_id: str = "", scene: str = "",
+                    conditions: str = "{}", mood_effect: str = "{}",
+                    accumulator_effect: str = "{}", send_policy: str = "maybe",
+                    send_probability: float = 0.40,
+                    chain_definition: str = "") -> dict:
     import uuid as _uuid3
     db = await get_db()
     await _ensure_p1_tables(db)
     eid = str(_uuid3.uuid4())
     await db.execute(
-        "INSERT INTO random_events (id, agent_id, content, level, weight) VALUES (?,?,?,?,?)",
-        (eid, agent_id, content, level, weight),
+        "INSERT INTO random_events "
+        "(id, agent_id, scene, content, level, weight, "
+        " conditions, mood_effect, accumulator_effect, send_policy, send_probability, chain_definition) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (eid, agent_id, scene, content, level, weight,
+         conditions, mood_effect, accumulator_effect, send_policy, send_probability, chain_definition),
     )
     await db.commit()
-    return {"id": eid, "content": content, "level": level, "weight": weight}
+    return {"id": eid, "content": content, "level": level, "weight": weight,
+            "agent_id": agent_id, "scene": scene, "conditions": conditions,
+            "mood_effect": mood_effect, "accumulator_effect": accumulator_effect,
+            "send_policy": send_policy, "send_probability": send_probability,
+            "chain_definition": chain_definition}
+
+
+async def event_update(event_id: str, **kwargs) -> dict | None:
+    """Update mutable fields of a random event by id."""
+    import json as _jeu
+    _ALLOWED = {"content", "level", "weight", "scene", "agent_id",
+                "conditions", "mood_effect", "accumulator_effect",
+                "send_policy", "send_probability", "chain_definition"}
+    updates = {k: v for k, v in kwargs.items() if k in _ALLOWED}
+    if not updates:
+        return None
+    db = await get_db()
+    await _ensure_p1_tables(db)
+    sets   = ", ".join(f"{k}=?" for k in updates)
+    vals   = list(updates.values()) + [event_id]
+    await db.execute(f"UPDATE random_events SET {sets} WHERE id=?", vals)
+    await db.commit()
+    cur = await db.execute("SELECT * FROM random_events WHERE id=?", (event_id,))
+    row = await cur.fetchone()
+    return dict(row) if row else None
 
 
 async def event_delete(event_id: str) -> bool:

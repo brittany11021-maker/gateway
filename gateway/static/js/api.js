@@ -1,8 +1,8 @@
 // ── Constants ─────────────────────────────────────────────────────────────────
-const COL   = { profile:'memory_profile', project:'memory_project', recent:'memory_recent' };
-const LABEL = { memory_profile:'角色', memory_project:'Project', memory_recent:'Recent' };
+const COL   = { profile:'memory_profile', project:'memory_project', memory:'memory_recent' };
+const LABEL = { memory_profile:'角色', memory_project:'Project', memory_recent:'Memory' };
 const ICON  = { memory_profile:'◉', memory_project:'◈', memory_recent:'◑' };
-const TYPE  = { memory_profile:'type-profile', memory_project:'type-project', memory_recent:'type-recent' };
+const TYPE  = { memory_profile:'type-profile', memory_project:'type-project', memory_recent:'type-memory' };
 const PAGE_SIZE = 20;
 
 const AV_DAY   = ['#D2D5FF','#BEF0D5','#FFD4C8','#FFE5B4','#D5E5FF','#FFD5E8','#C8F0F0','#F5E0C8'];
@@ -108,7 +108,7 @@ async function loadGlobalStats() {
     const d = await api('/admin/api/stats/global');
     document.getElementById('n-profile').textContent       = d.memory_profile  ?? 0;
     document.getElementById('n-project').textContent       = d.memory_project  ?? 0;
-    document.getElementById('n-recent').textContent        = d.memory_recent   ?? 0;
+    document.getElementById('n-memory').textContent         = d.memory_recent   ?? 0;
     document.getElementById('n-conversations').textContent = d.conversations   ?? 0;
     if (d.books     !== undefined) document.getElementById('n-books').textContent = d.books;
     if (d.daily     !== undefined) document.getElementById('n-daily').textContent = d.daily;

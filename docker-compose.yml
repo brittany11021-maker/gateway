@@ -61,6 +61,25 @@ services:
     volumes:
       - screentime_data:/app/data
 
+  cloud-music:
+    build: ./cloud-music-mcp
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3011:3011"   # nginx 反代
+    environment:
+      CLOUD_MUSIC_PORT: "3011"
+
+  spotify:
+    build: ./spotify-mcp
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3012:3012"   # nginx 反代
+    environment:
+      SPOTIFY_MCP_PORT:       "3012"
+      SPOTIFY_CLIENT_ID:      ${SPOTIFY_CLIENT_ID:-}
+      SPOTIFY_CLIENT_SECRET:  ${SPOTIFY_CLIENT_SECRET:-}
+      SPOTIFY_REFRESH_TOKEN:  ${SPOTIFY_REFRESH_TOKEN:-}
+
 volumes:
   gateway_data:
   qdrant_data:
