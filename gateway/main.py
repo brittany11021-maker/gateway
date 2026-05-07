@@ -624,7 +624,9 @@ async def _check_user_outgoing_yesterday(agent_id: str) -> bool:
 RECENT_DAYS     = 30
 BACKUP_DIR      = Path("/app/backups")
 MAX_BACKUPS     = 7
-BOOK_COLLECTION = "book_chunks"
+BOOK_COLLECTION        = "book_chunks"
+QDRANT_MEM_COLLECTION  = "memories"      # L1-L4 semantic index
+QDRANT_CONV_COLLECTION = "conversations" # exchange-pair RAG history
 COVERS_DIR      = Path("/app/static/covers")
 MAX_BOOKS       = 4
 CHARS_PER_PAGE  = 2000
@@ -1402,18 +1404,34 @@ async def palimpsest_write(
         parent_id:  ID of parent memory for comment chains.
     """
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+    # B6 Layer 2: validate layer before write
+    layer, importance, _vnote = _validate_memory_layer(content.strip(), layer, importance)
     try:
         result = await _mem_write(
             agent_id=agent_id, content=content.strip(),
             layer=layer, type_=type, importance=importance,
             tags=tag_list, source=source, parent_id=parent_id,
         )
+        # B6 Layer 3: L1 writes → confirmed=0 (pending manual confirmation)
+        if layer == "L1":
+            try:
+                from memory_db import get_db as _gdb_l1v
+                _dbl1 = await _gdb_l1v()
+                await _dbl1.execute("UPDATE memories SET confirmed=0 WHERE id=?", (result["id"],))
+                await _dbl1.commit()
+                result["confirmed"] = 0
+            except Exception as _cfe:
+                print(f"[palimpsest_write] L1 confirm=0 err: {_cfe}")
+        # Sync to Qdrant (non-blocking)
+        asyncio.create_task(_sync_memory_to_qdrant({**result, "agent_id": agent_id}))
         mid = result["id"]
         ml = result["layer"]
         mt = result["type"]
         mi = result["importance"]
         mtags = result["tags"]
-        return "Memory saved.\n  id: " + mid + "\n  layer: " + ml + ", type: " + mt + ", importance: " + str(mi) + "\n  tags: " + str(mtags)
+        _note = f" [{_vnote}]" if _vnote else ""
+        _conf_note = " ⏳pending-L1-confirmation" if layer == "L1" else ""
+        return "Memory saved.\n  id: " + mid + "\n  layer: " + ml + _note + _conf_note + ", type: " + mt + ", importance: " + str(mi) + "\n  tags: " + str(mtags)
     except ValueError as e:
         return f"Error: {e}"
 
@@ -1469,24 +1487,58 @@ async def palimpsest_search(
     query: str,
     agent_id: str = "default",
     limit: int = 10,
+    layer: str = "",
 ) -> str:
-    """Full-text search over Palimpsest memories using FTS5.
-
-    Searches content and tags. Triggers touch on results.
-    Use keywords or FTS5 syntax (e.g. "morning OR habit").
+    """Semantic search over Palimpsest memories via Qdrant vector search.
+    Falls back to FTS5 keyword search if Qdrant is unavailable.
 
     Args:
-        query:    Search query.
+        query:    Search query (natural language or keywords).
         agent_id: Which agent.
         limit:    Max results (default 10).
+        layer:    Optional filter: L1 | L2 | L3 | L4 (empty = all layers).
     """
+    # ── Qdrant vector search (primary) ────────────────────────────────────────
+    if _qdrant:
+        try:
+            vec = await _embed_mem(query)
+            if vec:
+                must_filters = [
+                    FieldCondition("agent_id", MatchValue(value=agent_id)),
+                    FieldCondition("archived",  MatchValue(value=0)),
+                ]
+                if layer:
+                    must_filters.append(FieldCondition("layer", MatchValue(value=layer)))
+                hits = _qdrant.search(
+                    collection_name=QDRANT_MEM_COLLECTION,
+                    query_vector=vec,
+                    query_filter=Filter(must=must_filters),
+                    limit=limit,
+                    score_threshold=0.40,
+                )
+                if hits:
+                    lines = [f"Found {len(hits)} memories (vector search):"]
+                    for h in hits:
+                        pl = h.payload
+                        mid = pl.get("mem_id", "?")
+                        lines.append(
+                            f"[{mid[:8]}] [{pl.get('layer','?')}] score={h.score:.2f}"
+                            f" | {pl.get('original_text','')[:120]}"
+                        )
+                        # Touch (best-effort, non-blocking)
+                        asyncio.create_task(_mem_read(mid, touch=True))
+                    return "\n".join(lines)
+        except Exception as _qe:
+            print(f"[palimpsest_search] qdrant err: {_qe}")
+
+    # ── FTS5 fallback ─────────────────────────────────────────────────────────
     try:
         results = await _mem_search(agent_id=agent_id, query=query, limit=limit)
     except Exception as e:
         return "Search error: " + str(e)
     if not results:
         return "No memories found for: " + query
-    lines = ["Found " + str(len(results)) + " memories:"]
+    lines = ["Found " + str(len(results)) + " memories (keyword fallback):"]
     for r in results:
         tags_str = ", ".join(r["tags"]) if r["tags"] else ""
         line = "[" + r["id"][:8] + "] [" + r["layer"] + "] imp=" + str(r["importance"])
@@ -1494,7 +1546,7 @@ async def palimpsest_search(
         if tags_str:
             line += " #" + tags_str
         lines.append(line)
-    return chr(10).join(lines)
+    return "\n".join(lines)
 
 
 @_mcp.tool()
@@ -1544,6 +1596,8 @@ async def palimpsest_update(
         return "Error: " + str(e)
     if not result:
         return "Memory not found: " + memory_id
+    # Re-sync to Qdrant (content or metadata changed)
+    asyncio.create_task(_sync_memory_to_qdrant(result))
     return "Updated " + memory_id[:8] + ": layer=" + result["layer"] + " type=" + result["type"] + " imp=" + str(result["importance"]) + " archived=" + str(result["archived"])
 
 
@@ -3028,6 +3082,38 @@ async def startup():
     except Exception:
         pass
 
+    # memories collection — L1-L4 semantic index
+    if not _qdrant.collection_exists(QDRANT_MEM_COLLECTION):
+        _qdrant.create_collection(
+            QDRANT_MEM_COLLECTION,
+            vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+        )
+    for _mf, _ms in [
+        ("agent_id",  PayloadSchemaType.KEYWORD),
+        ("layer",     PayloadSchemaType.KEYWORD),
+        ("confirmed", PayloadSchemaType.INTEGER),
+        ("archived",  PayloadSchemaType.INTEGER),
+    ]:
+        try:
+            _qdrant.create_payload_index(QDRANT_MEM_COLLECTION, _mf, _ms)
+        except Exception:
+            pass
+
+    # conversations collection — exchange-pair RAG
+    if not _qdrant.collection_exists(QDRANT_CONV_COLLECTION):
+        _qdrant.create_collection(
+            QDRANT_CONV_COLLECTION,
+            vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+        )
+    for _cf, _cs in [
+        ("agent_id",        PayloadSchemaType.KEYWORD),
+        ("conversation_id", PayloadSchemaType.KEYWORD),
+    ]:
+        try:
+            _qdrant.create_payload_index(QDRANT_CONV_COLLECTION, _cf, _cs)
+        except Exception:
+            pass
+
     # Start MCP Streamable HTTP session manager as a background task
     global _sh_task
     _sh_task = asyncio.create_task(_run_sh_session_manager())
@@ -3130,6 +3216,217 @@ async def _embed(text: str, input_type: str = "query") -> list[float]:
         return resp.json()["data"][0]["embedding"]
 
 
+# ── Memory-specific embedding (non-fatal wrapper) ─────────────────────────────
+async def _embed_mem(text: str) -> list[float] | None:
+    """Embed text for memory/conversation indexing. Returns None on any failure."""
+    try:
+        return await _embed(text[:1500], input_type="passage")
+    except Exception as _ee:
+        print(f"[embed_mem] {_ee}")
+        return None
+
+
+def _mem_id_to_qdrant(mem_id: str) -> str:
+    """Deterministically convert any string ID to a valid UUID for Qdrant."""
+    try:
+        uuid.UUID(mem_id)
+        return mem_id
+    except (ValueError, AttributeError):
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, mem_id))
+
+
+async def _sync_memory_to_qdrant(mem: dict) -> None:
+    """Upsert one memory record into Qdrant memories collection (best-effort)."""
+    if not _qdrant:
+        return
+    vec = await _embed_mem(mem.get("content", ""))
+    if not vec:
+        return
+    try:
+        _qdrant.upsert(
+            collection_name=QDRANT_MEM_COLLECTION,
+            points=[PointStruct(
+                id=_mem_id_to_qdrant(mem["id"]),
+                vector=vec,
+                payload={
+                    "mem_id":        mem["id"],
+                    "agent_id":      mem.get("agent_id", ""),
+                    "layer":         mem.get("layer", "L4"),
+                    "type":          mem.get("type", "diary"),
+                    "importance":    int(mem.get("importance", 3)),
+                    "confirmed":     int(mem.get("confirmed", 1)),
+                    "archived":      int(mem.get("archived", 0)),
+                    "original_text": mem.get("content", ""),
+                    "created_at":    str(mem.get("created_at", "")),
+                },
+            )],
+        )
+    except Exception as _ue:
+        print(f"[qdrant_mem] upsert err: {_ue}")
+
+
+# ── B6: L1 write-guard (code validation, 2nd defence layer) ───────────────────
+import re as _re
+
+_L1_TIME_PATS = [
+    r'\d{1,2}月\d{1,2}[日号]', r'最近', r'目前', r'正在', r'这几天', r'这段时间',
+    r'上周', r'这周', r'下周', r'昨天', r'今天', r'明天', r'上个月', r'这个月',
+]
+_L1_ONGOING_PATS = [
+    r'正处于', r'正在经历', r'正在进行', r'需要处理', r'尚未解决', r'持续中',
+]
+
+
+def _validate_memory_layer(content: str, layer: str, importance: int) -> tuple[str, int, str]:
+    """Auto-downgrade L1 → L2 when hard rules are violated.
+    Returns (final_layer, final_importance, note_string).
+    """
+    if layer != "L1":
+        return layer, importance, ""
+    # Rule 1: contains near-term time markers
+    if any(_re.search(p, content) for p in _L1_TIME_PATS):
+        return "L2", min(importance, 4), "auto_downgraded:time_marker"
+    # Rule 2: too long (L1 must be a short factual statement)
+    if len(content) > 100:
+        return "L2", min(importance, 4), "auto_downgraded:too_long"
+    # Rule 3: describes an ongoing/in-progress state
+    if any(_re.search(p, content) for p in _L1_ONGOING_PATS):
+        return "L2", min(importance, 4), "auto_downgraded:ongoing_state"
+    return "L1", importance, ""
+
+
+# ── Conversation exchange-pair chunker ────────────────────────────────────────
+def _chunk_exchange_pairs(messages: list) -> list[dict]:
+    """Produce [{chunk_text, user_text, assistant_text}] from a message list."""
+    cleaned = []
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+        content = str(content).strip()
+        if len(content) < 15 or role in ("tool_use", "tool_result"):
+            continue
+        # Skip injected system context blocks
+        if role == "system" and (
+            msg.get("_wb") or
+            any(kw in content for kw in ("[主记忆", "[用户信息]", "[Relevant memories", "[Character context]"))
+        ):
+            continue
+        cleaned.append({"role": role, "content": content})
+
+    chunks: list[dict] = []
+    i = 0
+    while i < len(cleaned):
+        if cleaned[i]["role"] != "user":
+            i += 1
+            continue
+        user_text = cleaned[i]["content"]
+        assistant_text = ""
+        if i + 1 < len(cleaned) and cleaned[i + 1]["role"] == "assistant":
+            assistant_text = cleaned[i + 1]["content"][:300]
+            i += 2
+        else:
+            i += 1
+        chunk_text = f"用户：{user_text}"
+        if assistant_text:
+            chunk_text += f"\n回复：{assistant_text}"
+        chunks.append({
+            "chunk_text":     chunk_text,
+            "user_text":      user_text,
+            "assistant_text": assistant_text,
+        })
+    return chunks
+
+
+async def _ingest_conv_to_qdrant(
+    agent_id: str, messages: list, conversation_id: str = "",
+) -> None:
+    """Embed exchange pairs and upsert into Qdrant conversations collection."""
+    if not _qdrant:
+        return
+    chunks = _chunk_exchange_pairs(messages)
+    if not chunks:
+        return
+    now_str = datetime.utcnow().isoformat()
+    for chunk in chunks:
+        try:
+            vec = await _embed_mem(chunk["chunk_text"])
+            if vec:
+                _qdrant.upsert(
+                    collection_name=QDRANT_CONV_COLLECTION,
+                    points=[PointStruct(
+                        id=str(uuid.uuid4()),
+                        vector=vec,
+                        payload={
+                            "agent_id":        agent_id,
+                            "conversation_id": conversation_id,
+                            "source":          "gateway",
+                            "timestamp":       now_str,
+                            "user_text":       chunk["user_text"],
+                            "assistant_text":  chunk["assistant_text"],
+                            "chunk_text":      chunk["chunk_text"],
+                        },
+                    )],
+                )
+        except Exception as _ce:
+            print(f"[conv_ingest] {_ce}")
+
+
+async def _build_rag_context(user_query: str, agent_id: str) -> str:
+    """Semantic search over memories + conversation history.
+    Returns formatted context string, or '' if nothing relevant / Qdrant unavailable.
+    """
+    if not _qdrant or not user_query:
+        return ""
+    vec = await _embed_mem(user_query)
+    if not vec:
+        return ""
+
+    parts: list[str] = []
+
+    # 1. L1-L4 memories (confirmed, not archived)
+    try:
+        mem_hits = _qdrant.search(
+            collection_name=QDRANT_MEM_COLLECTION,
+            query_vector=vec,
+            query_filter=Filter(must=[
+                FieldCondition("agent_id",  MatchValue(value=agent_id)),
+                FieldCondition("confirmed", MatchValue(value=1)),
+                FieldCondition("archived",  MatchValue(value=0)),
+            ]),
+            limit=5,
+            score_threshold=0.50,
+        )
+        if mem_hits:
+            parts.append("[语义记忆]")
+            for h in mem_hits:
+                pl = h.payload
+                parts.append(f"- [{pl.get('layer','?')}] {pl.get('original_text','')[:150]}")
+    except Exception as _me:
+        print(f"[rag] mem search: {_me}")
+
+    # 2. Conversation history
+    try:
+        conv_hits = _qdrant.search(
+            collection_name=QDRANT_CONV_COLLECTION,
+            query_vector=vec,
+            query_filter=Filter(must=[
+                FieldCondition("agent_id", MatchValue(value=agent_id)),
+            ]),
+            limit=3,
+            score_threshold=0.55,
+        )
+        if conv_hits:
+            parts.append("[相关对话]")
+            for h in conv_hits:
+                parts.append(f"- {h.payload.get('chunk_text','')[:200]}")
+    except Exception as _ce:
+        print(f"[rag] conv search: {_ce}")
+
+    return "\n".join(parts)
+
+
 async def _store_conversation(conv_id: str, agent_id: str, session_id: str, messages: list) -> None:
     # Use a stable daily ID for gateway API conversations so same-day exchanges
     # accumulate in one record instead of creating one per Q&A.
@@ -3197,7 +3494,16 @@ async def _distill_and_store(agent_id: str, session_id: str, messages: list,
         f"  BAD: '宗教经文分析'  →  GOOD: '用户与{ai_name}分析《约伯记》中关于苦难意义的段落；用户认为苦难是灵魂成长的必经之路，而非惩罚'\n"
         f"  BAD: '讨论哲学'     →  GOOD: '用户与{ai_name}探讨爱是否需要连续性；用户倾向认为爱是当下的选择而非持续的状态'\n\n"
 
-        "━━ RULE 3 — LAYER CLASSIFICATION (when unsure, classify HIGHER) ━━\n"
+        "━━ RULE 3 — L1 HARD GATE (violation = classification error) ━━\n"
+        "STOP before placing ANYTHING in L1. Run this checklist:\n"
+        "  ❌ Contains dates/time words (\"4月\",\"最近\",\"目前\",\"正在\",\"这周\") → NOT L1, use L2 or L3\n"
+        "  ❌ Content > 100 characters → NOT L1 (L1 must be a single short factual statement)\n"
+        "  ❌ Describes ongoing/in-progress state (\"正处于\",\"尚未解决\",\"需要处理\") → NOT L1\n"
+        "  ❌ Describes a single event → NOT L1 (use L3)\n"
+        "  ✅ L1 only: permanent facts with NO time limit (name, core trait, relationship milestone)\n"
+        "  ✅ Judgment order: First ask 'Is this NOT L1?' Then classify L2/L3/L4.\n"
+        "  ✅ If memory has both a trait AND a specific event → split into 2 items: trait→L1/L2, event→L3\n\n"
+        "━━ RULE 4 — LAYER CLASSIFICATION ━━\n"
         "L1 永久核心 — PERMANENT (once true, always true):\n"
         "  自取的名字/身份认同、核心价值观、关系里程碑、定义性偏好、传记级事实\n"
         "  e.g. '用户为自己取名Reeva（河岸），代表临界地带与流动的存在感'\n"
@@ -3211,7 +3517,7 @@ async def _distill_and_store(agent_id: str, session_id: str, messages: list,
         "L4 原子细节 — EPHEMERAL (trivial, one-off, no long-term value):\n"
         "  路过的细节、单次提及、不需长期记忆的背景信息\n\n"
 
-        "━━ RULE 4 — TRACK CLASSIFICATION ━━\n"
+        "━━ RULE 5 — TRACK CLASSIFICATION ━━\n"
         "Classify the primary nature of this conversation:\n"
         "  emotional — reflection, identity, relationships, philosophy, roleplay\n"
         "  practical — tool use, tasks, project work, technical problem-solving\n"
@@ -3219,6 +3525,11 @@ async def _distill_and_store(agent_id: str, session_id: str, messages: list,
         "If track is 'practical' or 'mixed': identify the ongoing project/goal.\n"
         "  project.name must be a concise unique identifier (≤40 chars).\n"
         "  project.goal must be a single clear sentence describing the objective.\n\n"
+        "━━ SELF-CHECK (run before outputting JSON) ━━\n"
+        "For each item in L1: does it contain a time word? Is it >100 chars? Ongoing state?\n"
+        "  If any YES → move to L2 or L3.\n"
+        "Does any item combine a personality trait + a specific event in one sentence?\n"
+        "  If YES → split into two items (trait→L1/L2, event→L3).\n\n"
         "━━ OUTPUT ━━\n"
         "Respond ONLY with valid JSON (no markdown fences, no explanation):\n"
         '{"track":"emotional","L1":["..."],"L2":["..."],"L3":["..."],"L4":["..."],"project":null}\n'
@@ -3239,12 +3550,19 @@ async def _distill_and_store(agent_id: str, session_id: str, messages: list,
         for layer, imp in layer_importance.items():
             for text in data.get(layer, []):
                 try:
-                    mem_type = "project" if (layer == "L2" and _track in ("practical", "mixed")) else "diary"
-                    await _mem_write_smart(
+                    # B6 Layer 2: code-level validation before write
+                    v_layer, v_imp, v_note = _validate_memory_layer(text, layer, imp)
+                    if v_note:
+                        print(f"[distill] L1 downgrade: {v_note} | {text[:60]}")
+                    mem_type = "project" if (v_layer == "L2" and _track in ("practical", "mixed")) else "diary"
+                    _written = await _mem_write_smart(
                         agent_id=agent_id, content=text,
-                        layer=layer, type_=mem_type, importance=imp,
+                        layer=v_layer, type_=mem_type, importance=v_imp,
                         tags=["distilled"], source="distill",
                     )
+                    # Sync to Qdrant (non-blocking)
+                    if isinstance(_written, dict) and _written.get("id"):
+                        asyncio.create_task(_sync_memory_to_qdrant({**_written, "agent_id": agent_id}))
                 except Exception as _mwe:
                     print(f"[distill] palimpsest {layer} write error: {_mwe}")
 
@@ -6319,10 +6637,12 @@ async def _post_conversation_tasks(
         except Exception as _ipe:
             print(f"[post_conv] items_promises err: {_ipe}")
     else:
-        # Agent type: distill into Qdrant profile/project/recent
+        # Agent type: distill into Palimpsest L1-L4
         await _distill_and_store(agent_id, session_id, full, agent_type=agent_type)
-    # L5 留底层：所有 agent 类型都生成对话摘要
+    # L5 留底层：所有 agent 类型都生成对话摘要（Phase B7 废弃前保留）
     await _generate_l5_summary(agent_id, session_id, full)
+    # Ingest exchange pairs into Qdrant conversations collection (RAG pipeline)
+    asyncio.create_task(_ingest_conv_to_qdrant(agent_id, full, cid))
 
 
 def _strip_injection(messages: list) -> list:
@@ -6641,6 +6961,23 @@ async def chat_completions(request: Request, body: dict, cred: HTTPAuthorization
                 messages[0] = {**messages[0], "content": _mem_ctx + "\n\n" + messages[0]["content"]}
             else:
                 messages = [{"role": "system", "content": _mem_ctx}] + messages
+
+        # RAG: inject semantically relevant memories + conversation history
+        try:
+            _user_q = next(
+                (m["content"] for m in reversed(messages)
+                 if m.get("role") == "user" and isinstance(m.get("content"), str)), ""
+            )
+            _rag = await _build_rag_context(_user_q, agent_id)
+            if _rag:
+                _rag_msg = {"role": "system", "content": "[语义检索]\n" + _rag, "_wb": True}
+                if messages and messages[0].get("role") == "system":
+                    messages.insert(1, _rag_msg)
+                else:
+                    messages.insert(0, _rag_msg)
+        except Exception as _rage:
+            print(f"[rag_inject] {_rage}")
+
     # Build ordered (provider, model) call list from llm_chain_config or fallback
     call_list = _build_call_list(_agent_cfg)
     # Explicit model in request body overrides everything
