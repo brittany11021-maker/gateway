@@ -128,9 +128,9 @@ async function openAgentPage(aid) {
 
   const atype = agentTypes[aid] || 'agent';
   const tabs = S.tab === 'project'
-    ? ['l1', 'l2project', 'l3', 'l4', 'l5', 'history', 'trash']
-    : ['l1', 'l2', 'l3', 'l4', 'l5', 'history', 'trash'];
-  if (atype === 'character') tabs.splice(5, 0, 'daily');
+    ? ['l1', 'l2project', 'l3', 'l4', 'history', 'trash']
+    : ['l1', 'l2', 'l3', 'l4', 'history', 'trash'];
+  if (atype === 'character') tabs.splice(4, 0, 'daily');
 
   const tabsHtml = tabs.map(t => {
     const cfg = TIER_CFG[t];
