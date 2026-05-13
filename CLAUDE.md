@@ -411,7 +411,7 @@ event_roll / event_list / event_add / event_delete
 
 ### 音乐系统待完成（P2）
 
-- [ ] **Cloud Music MCP 迁移到 VPS**：目前跑在本地 Y9000P，需推到 Oracle VPS（执行文档 §14.1）
+- [x] **Cloud Music MCP 迁移到 Oracle VPS**：服务已从腾讯云迁移至 Oracle VPS（161.118.195.9），以 Docker 容器运行（端口 3011，内网绑定）。访问地址：`https://palimpsest.513129.xyz/cloud-music/mcp`。腾讯云已停止 cloud-music 容器并移除 nginx 块。2026-05-14 完成。
 - [ ] **音乐推荐集成到主动消息**：2-3次/周，定时/情绪关联/关键词三种触发模式，角色视角选歌 + curation prompt（执行文档 §14.2-14.3）。cloud-music-mcp 已作为独立 Docker 服务存在但未接入 main.py 的推送逻辑
 - [ ] **音乐记忆学习**：记录推荐历史避免重复，追踪用户反馈调整方向（执行文档 §14.4）
 
