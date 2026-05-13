@@ -62,14 +62,6 @@ services:
     volumes:
       - screentime_data:/app/data
 
-  cloud-music:
-    build: ./cloud-music-mcp
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:3011:3011"   # nginx 反代
-    environment:
-      CLOUD_MUSIC_PORT: "3011"
-
   spotify:
     build: ./spotify-mcp
     restart: unless-stopped

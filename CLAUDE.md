@@ -420,7 +420,7 @@ event_roll / event_list / event_add / event_delete
 - [ ] **死脑筋模型兼容模式**：对不擅长 tool use 的模型，网关预查询 MCP 结果写进 system prompt（执行文档 §12.4）——当前所有 character 都走 keyword/intent 代理触发，但结果注入格式可优化
 - [ ] **配置面板 UI 整合**：执行文档 §9 描述的完整 React/Vue 单页配置面板。当前有 engine.js 展示状态引擎 + user.js 用户配置 + admin.html 各 tab，但缺一个统一的「配置总控台」（API 线路/推送参数/冷却时间等集中编辑）
 - [ ] **RSSHub 自建实例**：VPS Docker 部署自建 RSSHub，避免公共实例限速不稳定（执行文档 §13.5）——当前直接用 rsshub.app 公共实例
-- [ ] **GitHub 代码自动同步**：每日凌晨 git add+commit+push 脚本（整体架构 §13）——R2 数据备份已有，代码同步未自动化
+- [x] **GitHub 代码自动同步**：`/opt/scripts/git-sync.sh`，cron `0 3 * * *`（03:00 CST）。`git add -A`（遵守 .gitignore）→ 有变更则 commit `chore: auto-sync YYYY-MM-DD (N file(s) changed)` → push。无变更静默退出 0。日志 `/var/log/git-sync.log`（自动轮转保留 500 行）。2026-05-14 已部署，首次 push 同时整理了 .gitignore（排除 build artifacts 和旧位置副本）。
 - [x] **备份验证**：`_weekly_backup_verify_loop()` 每周一 01:00 UTC（09:00 CST）检查过去7天 R2 备份完整性，缺失或不完整时发 Telegram 告警。手动触发端点：`GET /admin/api/backup/r2/verify?days=7`。R2 未启用时自动跳过。2026-05-14 已部署。
 
 ### 文档冲突解决记录
