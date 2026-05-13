@@ -79,7 +79,7 @@ memory-gateway/
 | `random_events` | 随机事件概率表 |
 | `npcs` | NPC 关系网（name, relationship, affinity, notes） |
 | `projects` | 项目追踪（active → completed → archived → 写入 L1） |
-| `conversation_summaries` | **L5 留底层**：对话摘要 + `#关键词`，FTS5 搜索 |
+| `conversation_summaries` | ~~L5 留底层~~ **已废弃 (B7)**：表仍存在于 DB 但不再写入，由 Qdrant `conversations` collection 替代 |
 
 **⚠️ 层级命名约定（容易混淆）**：
 
@@ -91,7 +91,7 @@ memory-gateway/
 | L4 | 碎片层（原子记忆） | 30天内 | 1-2 |
 | L5 | 留底层（对话摘要） | 60天后自动清理 | — |
 
-L5 是独立的 `conversation_summaries` 表，不在主 `memories` 表里，用 `l5_write/search/list/cleanup` 操作。
+~~L5 是独立的 `conversation_summaries` 表~~ — **B7 已废弃**，相关函数和 API 路由已从代码中删除，对话历史现由 Qdrant `conversations` collection + RAG pipeline 提供。
 
 **memories 表关键字段**：
 ```
@@ -351,36 +351,91 @@ event_roll / event_list / event_add / event_delete
 
 ## 十三、⚠️ 已知代码问题（待修）
 
-1. **memory_db.py L5 代码重复**：`l5_write/search/list` 等函数在文件里出现了两遍（约第 1537 行和第 1648 行），需删掉前一份
-2. **main.py 重复导入**：`memory_confirm_l1` 和 `memory_list_pending_l1` 在 70-73 行和第 74 行各导入一次
-3. **pending-l1 路由顺序**：`/api/admin/memories/pending-l1` 在 `/{memory_id}` catchall 之后注册（已有，UI 用 list+filter 绕过），需移前（低优先级）
+> 来源：2026-05-14 对照三份 Notion 文档（整体架构框架 / Daily Life + 状态引擎执行文档 / 向量搜索集成 + 记忆系统修订方案）逐行审计。
+> **原则：整体架构框架与另外两份文档冲突时，以另外两份为准。**
+
+### 已修复 ✅
+
+1. ~~memory_db.py L5 代码重复~~ → 已修复，l5 函数各只出现一次（行 2165/2189/2212/2225）
+2. ~~main.py 重复导入~~ → 已修复，`memory_confirm_l1` / `memory_list_pending_l1` 只在行 76-77 导入一次
+3. ~~pending-l1 路由顺序~~ → 已修复，`/api/admin/memories/pending-l1`（行 7838）在 `/{memory_id}`（行 7845）之前
+
+### 仍存在的问题
+
+4. **Dedup Jaccard fallback 仍在**：`memory_db.py` 行 783-854，`dedup_check()` 当 `vector_match` 未提供时仍 fallback 到 Jaccard（FTS5 + bigram）。向量搜索文档 §6.2 要求统一用 cosine。**现状**：cosine 是主路径（`vector_match` 提供时），Jaccard 是无 Qdrant 时的降级方案——逻辑上合理，但阈值体系不统一（cosine 0.85/0.55/0.25 vs 文档要求 0.95/0.80/0.55）
+5. **memory_search 仍有 FTS5 fallback**：`palimpsest_search()`（main.py 行 1486-1545）主路径走 Qdrant 向量搜索，但 Qdrant 不可用时 fallback 到 FTS5。向量搜索文档要求全面切 Qdrant。**现状**：作为降级方案可接受，但 MCP tool 描述（行 9936）仍写 "FTS5 full-text search" 需更新
+6. **L5 仍在活跃使用**：`l5_write`/`l5_search`/`l5_list`/`l5_cleanup` 仍被 import 和调用（main.py 行 92-93, 7938-7947）。向量搜索文档 §3 要求废弃，由 conversations Qdrant collection 替代
+7. **Embed 模型与文档描述不一致**：向量搜索文档 §1.3 推荐 `BAAI/bge-m3`（siliconflow），实际用 `nvidia/nv-embedqa-e5-v5`（NVIDIA NIM）。维度都是 1024，功能等价，但文档需更新
+8. **Hybrid 搜索未实现**：向量搜索文档 §2.4 描述 Qdrant dense+sparse（BM25 + RRF 融合），当前只用 dense vector
+9. **死脑筋模型兼容模式未实现**：执行文档 §12.4 要求 `MCP_STUBBORN_MODEL_COMPAT`（对不擅长 tool use 的模型预查询注入 system prompt），代码中无相关实现
 
 ---
 
-## 十四、待实现功能（按优先级）
+## 十四、待实现功能（按文档优先级）
 
-### 记忆架构
+### 已完成 ✅
 
-- **B4 余弦相似度去重**：用向量相似度替换 `_mem_dedup_check` 里的 Jaccard 算法（Qdrant nearest-neighbor 查询）
-- **B7 L5 弃用**：L5 的对话摘要功能由 `conversations` Qdrant collection + RAG 替代，可逐步停用 `l5_write`
-- **A4 历史对话导入**：将用户提供的历史对话 JSON 批量写入 `conversations` collection
+- ✅ **P0 API 线路分离**：`_DEFAULT_API_ROUTES` 三条线路（main.py 行 271-320）
+- ✅ **P0 时区注入**：`build_time_context()` 注入角色+用户时区（行 356+）
+- ✅ **P0 角色状态引擎 — 二维情绪**：`mood_valence` [-1,1] + `mood_energy` [-1,1]，`_mood_label_from_2d()` 象限映射（memory_db.py 行 1328/1531/1781），`mood_score` 保留为 `valence*100` 向后兼容
+- ✅ **P0 Health MCP 监测**：`_health_monitor_loop()` 后台任务（main.py 行 3119, 4951-5167），含心率/步数/睡眠/经期四模块，每15min/1h/每天拉取，阈值告警 + 推送日志
+- ✅ **P1 晨间推送**：`_morning_push_loop()` + 天气/日程/随机事件/新闻模块注入（行 3075, 3943-4317）
+- ✅ **P1 事件条件标签**：`random_events` 表含 conditions 字段，事件过滤 pipeline
+- ✅ **P1 对话中日程捕获**：`_capture_schedules_from_conversation()` + Todoist 集成
+- ✅ **P1 Char MCP 三层检测**：keyword 预筛 + intent_check（analyzer 线路）+ MCP 执行（main.py 行 6569-6636）
+- ✅ **P2 晚间推送**：`_evening_push_loop()` 三场景（角色先睡/用户已睡/同城）（行 3076, 4966-5080）
+- ✅ **P2 用户入睡多信号加权**：`_estimate_user_sleep_probability()` 四路信号（no_message_45min 0.30 / screen_locked 0.40 / said_goodnight 0.80 / past_avg_sleep 0.30），综合 ≥0.50 判定已睡（行 5175-5182）
+- ✅ **P2 场景B日记影响**：用户已睡时写 scene_note `"昨晚想跟你说晚安，看你应该睡了就没打扰"`（行 5320）
+- ✅ **P2 反向识别**：`_REVERSE_KEYWORDS` + `_reverse_identify()`（行 6425-6641）
+- ✅ **P2 新闻系统**：`_news_daily_loop()` RSS 拉取（BBC/澎湃skip_first/联合早报/Dezeen/It's Nice That/Designboom/小红书），`_NEWS_HARD_BLOCK` 政治关键词硬过滤，30% 概率晨间注入（行 3117, 4572-4700+）
+- ✅ **P2 事件连锁反应**：完整实现 — `_maybe_schedule_chain()` 概率判定 → `_compute_fire_at()` 延迟（immediate/within_1h/within_12h/next_morning）→ `chain_event_schedule()` 入 DB → `_chain_event_loop()` 每5分钟检查 → `_process_due_chain_events()` 执行（×1.5 放大 + carry_over + 发消息）（行 5397-5555）
+- ✅ **P2 物品追踪**：`_extract_items_promises()` 从对话提取（行 5570-5648）+ 注入时食物7天/其他30天自动过期 + 15%概率自然提起（行 6263-6294）
+- ✅ **P2 承诺追踪**：`_check_promise_reminders()` 3/7/14/30天递增概率（10%/25%/40%/60%）+ 语气递增（随口一提→认真追问）（行 5651-5694）
+- ✅ **B6 记忆分类修复**：`_validate_memory_layer()` 三层防御（prompt/代码校验/pending queue）
+- ✅ **Qdrant memories+conversations collection**：双写 + RAG 注入 + 对话向量化
+- ✅ **蓄水池/主动消息**：miss_you/low_mood/irritable 累积 + 阈值触发 + Telegram 推送
+- ✅ **梦系统**：Agent 梦（L4→L3 整理 + Obsidian 节点）+ Character 梦（daily_events→梦境叙述）
+- ✅ **知识图谱**：GitHub Obsidian 集成，节点路径 `memory-nodes/{agent_id}/{YYYY-MM-DD}.md`
+- ✅ **P3 Timeline 可视化**：`/timeline/` 路由 + dashboard-data.json + timeline.js（main.py 行 10312-10696, static/js/timeline.js）
+- ✅ **P3 推送日志/可观测性**：`push_log` 表 + `push_log_write()` 记录所有推送决策 + `/api/push-log` 端点 + engine.js 前端展示（memory_db.py 行 1368-1595, engine.js 行 861+）
+- ✅ **R2 自动备份**：`_r2_upload()` 实现（main.py 行 10031-10063），nightly 任务上传 daily/ 对话+DB 到 R2（行 3771-3774），前端有 R2 开关（admin.html 行 329）
 
-### Daily Life 系统（character 用）
+### 记忆系统待完成
 
-- **每日骨架生成器**：凌晨 cron，便宜模型生成 `daily_events` + 写 `character_state`
-- **天气/Todoist 数据注入**：角色 wakeup 时注入当日天气/用户日程
-- **主动发消息引擎**：触景生情 + 冷却控制，via Telegram
+- [x] **B4 Dedup cosine 阈值对齐**：`memory_write_smart()` cosine 路径已是 0.95/0.80/0.55（正确），0.85/0.55/0.25 是 Jaccard fallback 的阈值，两套算法各自独立，无需修改
+- [x] **B7 L5 完全废弃**：删除 `l5_write`/`l5_search`/`l5_list`/`l5_cleanup` 导入（main.py）、`_generate_l5_summary` no-op 函数、3条 `/api/admin/l5` 路由、timeline 结构里的 L5 条目；memory.js 里删除 TIER_CFG l5 条目、路由分支、`loadDetailL5` 和 `delL5Summary` 函数。2026-05-14 已部署。
+- [ ] **Hybrid 搜索**：Qdrant 同一 collection 内 dense + sparse vector（BM25），RRF 融合（向量搜索文档 §2.4）——低优先级，当前 dense-only 表现够用
+- [ ] **A4 历史对话 JSON 导入**：写清洗+分块+embedding 的 ingestion 脚本，支持 claude_ai / typingmind / gateway 三种格式适配（向量搜索文档 §5.1）
+- [ ] **daily_life Qdrant collection**：Phase B 选做，character 日常事件向量化（向量搜索文档 §1.2）
+- [x] **MCP tool 描述更新**：`palimpsest_search` 工具目录（行 9936）改为 "Semantic search (Qdrant vector, FTS5 fallback)"；HTTP endpoint docstring（行 9689）同步更新
 
-### 梦系统 ✅
+### 音乐系统待完成（P2）
 
-- ✅ **Agent 梦**：每日 02:00 UTC，L4碎片→LLM归类→L3记忆 + GitHub Obsidian markdown节点
-- ✅ **Character 梦**：daily_events→梦境叙述→character_state.dream_text，30% 概率注入对话
-  - 手动触发：`POST /admin/api/agents/{id}/dream`
+- [ ] **Cloud Music MCP 迁移到 VPS**：目前跑在本地 Y9000P，需推到 Oracle VPS（执行文档 §14.1）
+- [ ] **音乐推荐集成到主动消息**：2-3次/周，定时/情绪关联/关键词三种触发模式，角色视角选歌 + curation prompt（执行文档 §14.2-14.3）。cloud-music-mcp 已作为独立 Docker 服务存在但未接入 main.py 的推送逻辑
+- [ ] **音乐记忆学习**：记录推荐历史避免重复，追踪用户反馈调整方向（执行文档 §14.4）
 
-### 知识图谱 ✅
+### 其他待完成
 
-- ✅ **GitHub Obsidian 集成**：`GITHUB_TOKEN` + `GITHUB_OBSIDIAN_REPO=brittany11021-maker/obsidian`
-  - 节点路径：`memory-nodes/{agent_id}/{YYYY-MM-DD}.md`（含 frontmatter + 梦境叙述 + L3 cluster）
+- [ ] **死脑筋模型兼容模式**：对不擅长 tool use 的模型，网关预查询 MCP 结果写进 system prompt（执行文档 §12.4）——当前所有 character 都走 keyword/intent 代理触发，但结果注入格式可优化
+- [ ] **配置面板 UI 整合**：执行文档 §9 描述的完整 React/Vue 单页配置面板。当前有 engine.js 展示状态引擎 + user.js 用户配置 + admin.html 各 tab，但缺一个统一的「配置总控台」（API 线路/推送参数/冷却时间等集中编辑）
+- [ ] **RSSHub 自建实例**：VPS Docker 部署自建 RSSHub，避免公共实例限速不稳定（执行文档 §13.5）——当前直接用 rsshub.app 公共实例
+- [ ] **GitHub 代码自动同步**：每日凌晨 git add+commit+push 脚本（整体架构 §13）——R2 数据备份已有，代码同步未自动化
+- [x] **备份验证**：`_weekly_backup_verify_loop()` 每周一 01:00 UTC（09:00 CST）检查过去7天 R2 备份完整性，缺失或不完整时发 Telegram 告警。手动触发端点：`GET /admin/api/backup/r2/verify?days=7`。R2 未启用时自动跳过。2026-05-14 已部署。
+
+### 文档冲突解决记录
+
+以下整体架构框架的内容已被后续文档覆盖，以后续文档为准：
+
+| 整体架构原文 | 修订 | 实际状态 |
+|---|---|---|
+| §备注「向量搜索不是刚需，FTS5 够用」 | 已引入 Qdrant，语义搜索统一走 Qdrant | ✅ 已实现，FTS5 保留为 fallback |
+| §2.6 L5 留底层定义 | L5 标记 DEPRECATED，被 conversations collection 替代 | ⚠️ 代码仍在，待删除 |
+| §2.7 时间范围速查表含 L5 | 删除 L5 行，改为四层 | ⚠️ 前端仍显示 L5 tab |
+| §3.5 去重阈值 90/70/40（文本相似度） | 改用 cosine similarity 95/80/55 | ⚠️ cosine 主路径，但阈值是 0.85/0.55/0.25 待调 |
+| §4 memory_search 用 FTS5 | 底层切到 Qdrant 向量搜索 | ✅ 已实现，FTS5 保留为 fallback |
+| §7.9 情绪系统 mood 单维 | 改为二维 valence+energy，含象限标签 | ✅ 已实现（mood_valence + mood_energy + _mood_label_from_2d） |
+| §八 Qdrant 三层映射表 | 更新为实际 collection 设计 | ✅ memories/conversations/book_chunks |
 
 ---
 

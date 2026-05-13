@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Timeline — Memory Gateway</title>
+  <link rel="stylesheet" href="./assets/dashboard.css" />
+  <script>
+  // Inject agent_id from URL param into all dashboard-data.json fetches
+  (function () {
+    var params = new URLSearchParams(window.location.search);
+    var agentId = params.get('agent_id') || 'default';
+    window.__TL_AGENT_ID__ = agentId;
+    var _orig = window.fetch;
+    window.fetch = function (url, opts) {
+      if (typeof url === 'string' && url.includes('dashboard-data.json')) {
+        var u = new URL(url, window.location.href);
+        u.searchParams.set('agent_id', agentId);
+        return _orig.call(this, u.toString(), opts);
+      }
+      return _orig.call(this, url, opts);
+    };
+    // Update page title to show agent
+    if (agentId && agentId !== 'default') {
+      document.title = 'Timeline — ' + agentId;
+    }
+  })();
+  </script>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="./assets/dashboard.js"></script>
+</body>
+</html>

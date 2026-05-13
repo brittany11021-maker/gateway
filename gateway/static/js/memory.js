@@ -111,8 +111,6 @@ const TIER_CFG = {
         desc:'近期·~30天' },
   l4: { col:'L4', label:'L4 — Atomic',  icon:'·', cls:'type-memory',
         desc:'原子细节·短暂观察' },
-  l5: { col:null,  label:'L5 — Archive', icon:'⌛', cls:'type-memory',
-        desc:'对话摘要·留底层' },
   history: { col:null, label:'History', icon:'⟳', cls:'type-memory', desc:'原始对话' },
   daily:   { col:null, label:'Daily',   icon:'✦', cls:'type-memory', desc:'日记事件' },
   trash:   { col:null, label:'Trash',   icon:'🗑', cls:'type-memory', desc:'已删除·回收站' },
@@ -217,7 +215,6 @@ async function loadDetailTab(tab) {
 
   if (tab === 'history') { await loadDetailHistory(aid); return; }
   if (tab === 'daily')   { await loadDetailDaily(aid);   return; }
-  if (tab === 'l5')      { await loadDetailL5(aid);      return; }
   if (tab === 'trash')   { await loadDetailTrash(aid);   return; }
 
   const cfg = TIER_CFG[tab];
@@ -362,52 +359,6 @@ async function loadDetailDaily(aid) {
   }
 }
 
-async function loadDetailL5(aid) {
-  const body = document.getElementById('detail-body');
-  const cfg  = TIER_CFG['l5'];
-  try {
-    const params = new URLSearchParams({ agent_id: aid, limit: 100 });
-    if (S.q) params.set('q', S.q);
-    // Use search endpoint when there's a query, otherwise list
-    const endpoint = S.q
-      ? `/api/admin/l5/search?agent_id=${encodeURIComponent(aid)}&q=${encodeURIComponent(S.q)}&limit=50`
-      : `/api/admin/l5?${params}`;
-    const d = await api(endpoint);
-    const items = d.items || [];
-    if (!items.length) {
-      body.innerHTML = `<div style="font-size:10px;color:var(--muted);margin-bottom:12px;padding:0 2px">
-        ${cfg.desc} · 0 entries</div><div class="u-empty">No summaries yet</div>`;
-      return;
-    }
-    const cards = items.map(it => `
-      <div class="mem-card ${cfg.cls}" onclick="toggleCardExpand(this)">
-        <div class="mc-acts" onclick="event.stopPropagation()">
-          <button class="mc-act del" onclick="delL5Summary('${it.id}')">✕</button>
-        </div>
-        <div class="mc-label">${cfg.label}</div>
-        <div class="mc-text">${esc(it.summary || '')}</div>
-        ${it.keywords ? `<div style="font-size:10px;color:var(--muted);margin-top:4px">${esc(it.keywords)}</div>` : ''}
-        <div class="mc-footer">
-          <span class="mc-icon">${cfg.icon}</span>
-          <span class="mc-date">${fmtTs(it.created_at)}</span>
-        </div>
-      </div>`).join('');
-    body.innerHTML = `<div style="font-size:10px;color:var(--muted);margin-bottom:12px;padding:0 2px">
-      ${cfg.desc} · ${items.length} entries</div>
-      <div class="mem-grid">${cards}</div>`;
-  } catch(e) {
-    body.innerHTML = `<div class="u-empty">Error loading L5: ${e.message}</div>`;
-  }
-}
-
-async function delL5Summary(id) {
-  if (!confirm('Delete this summary?')) return;
-  try {
-    await api(`/api/admin/l5/${id}`, { method:'DELETE' });
-    toast('Deleted');
-    await loadDetailL5(_agentPageAid);
-  } catch(e) { toast('Error: '+e.message); }
-}
 
 async function delMemoryDetail(id) {
   if (!confirm('Move to trash?')) return;

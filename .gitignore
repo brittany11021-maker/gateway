@@ -7,3 +7,13 @@ __pycache__/
 node_modules/
 *.db
 *.sqlite
+
+# Build artifacts / misplaced duplicates
+gateway/static/timeline/assets/dashboard.js
+gateway/static/engine.js
+gateway/static/memory.js
+gateway/static/daily.js
+gateway/style.css
+gateway/timeline.js
+gateway/admin.html
+gateway/static/js/admin.html

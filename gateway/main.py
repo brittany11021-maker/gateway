@@ -89,10 +89,6 @@ from memory_db import (
     project_list_completed_stale as _proj_stale,
 )
 from memory_db import (
-    l5_write as _l5_write, l5_search as _l5_search,
-    l5_list as _l5_list, l5_cleanup as _l5_cleanup,
-)
-from memory_db import (
     cooldown_check as _cd_check, cooldown_set as _cd_set, cooldown_gate as _cd_gate,
 )
 
@@ -3117,6 +3113,7 @@ async def startup():
     asyncio.create_task(_news_daily_loop())          # Daily RSS news fetch & cache
     asyncio.create_task(_news_standalone_push_loop())  # 10% standalone news share (§13.2)
     asyncio.create_task(_health_monitor_loop())      # Health metrics monitor
+    asyncio.create_task(_weekly_backup_verify_loop())  # Weekly Monday R2 backup integrity check
     asyncio.create_task(_register_telegram_webhook())  # Telegram bot webhook
     asyncio.create_task(_heartbeat_loop())           # 24h LLM liveness watchdog
 
@@ -5216,7 +5213,7 @@ async def _estimate_user_sleep_probability(agent_id: str, messages_recent: list 
         )
         if any(kw in user_recent for kw in _GN_KW):
             score += 0.80
-    # Signal 3b: check last conversation text in L5 summaries (skip for now)
+    # Signal 3b: (L5 removed in B7 — conversation history in Qdrant conversations collection)
 
     # Signal 4: time heuristic — past typical sleep time (23:00-01:00 UTC+8 = 15:00-17:00 UTC)
     # Weight 0.30 per spec §3.2 (was 0.20)
@@ -6156,6 +6153,130 @@ async def _auto_backup_loop() -> None:
         await asyncio.sleep(3600)    # check every hour
 
 
+async def _r2_list_prefix(prefix: str) -> list[str]:
+    """Return list of R2 object keys under the given prefix. Returns [] if R2 not configured."""
+    try:
+        async with _db_pool.acquire() as _rc:
+            _rrows = {r["key"]: r["value"] for r in await _rc.fetch(
+                "SELECT key,value FROM gateway_config WHERE key LIKE 'r2_%'")}
+        if _rrows.get("r2_enabled") != "true":
+            return []
+        _acid = _rrows.get("r2_account_id", "")
+        _akey = _rrows.get("r2_access_key", "")
+        _skey = _rrows.get("r2_secret_key", "")
+        _bkt  = _rrows.get("r2_bucket", "")
+        if not all([_acid, _akey, _skey, _bkt]):
+            return []
+        import boto3, asyncio as _aio
+        from botocore.config import Config as _BConf
+        _s3 = boto3.client(
+            service_name="s3",
+            endpoint_url=f"https://{_acid}.r2.cloudflarestorage.com",
+            aws_access_key_id=_akey,
+            aws_secret_access_key=_skey,
+            region_name="auto",
+            config=_BConf(signature_version="s3v4"),
+        )
+        _loop = _aio.get_event_loop()
+        keys: list[str] = []
+        paginator = await _loop.run_in_executor(None, lambda: _s3.get_paginator("list_objects_v2"))
+        pages = await _loop.run_in_executor(
+            None,
+            lambda: list(paginator.paginate(Bucket=_bkt, Prefix=prefix))
+        )
+        for page in pages:
+            for obj in page.get("Contents", []):
+                keys.append(obj["Key"])
+        return keys
+    except Exception as _le:
+        print(f"[r2-list] error listing {prefix}: {_le}", flush=True)
+        return []
+
+
+async def _verify_r2_backups(days: int = 7) -> dict:
+    """Check R2 for backup completeness over the last `days` days.
+
+    For each calendar day (UTC, going back from yesterday), we expect:
+      - At least one  memory_backup_*.json  under  daily/{YYYY/MM/DD}/
+      - At least one  palimpsest_*.db       under  daily/{YYYY/MM/DD}/
+
+    Returns a dict:
+      {
+        "ok": bool,          # True = all days present and complete
+        "checked": int,      # number of days inspected
+        "missing": [str],    # dates with no files at all (YYYY-MM-DD)
+        "incomplete": [str], # dates where only one of the two files exists
+        "r2_enabled": bool,
+      }
+    """
+    import datetime as _dv
+    result: dict = {"ok": True, "checked": days, "missing": [], "incomplete": [], "r2_enabled": False}
+
+    # Quick R2-enabled check
+    try:
+        async with _db_pool.acquire() as _rc:
+            _rv = {r["key"]: r["value"] for r in await _rc.fetch(
+                "SELECT key,value FROM gateway_config WHERE key LIKE 'r2_%'")}
+        if _rv.get("r2_enabled") != "true":
+            return result  # R2 off — nothing to verify
+        result["r2_enabled"] = True
+    except Exception:
+        return result
+
+    today_utc = _dv.datetime.utcnow().date()
+    for offset in range(1, days + 1):
+        day = today_utc - _dv.timedelta(days=offset)
+        prefix = f"daily/{day.year}/{day.month:02d}/{day.day:02d}/"
+        keys = await _r2_list_prefix(prefix)
+        has_json = any(k.endswith(".json") for k in keys)
+        has_db   = any(k.endswith(".db")   for k in keys)
+        if not has_json and not has_db:
+            result["missing"].append(str(day))
+            result["ok"] = False
+        elif not has_json or not has_db:
+            result["incomplete"].append(str(day))
+            result["ok"] = False
+
+    return result
+
+
+async def _weekly_backup_verify_loop() -> None:
+    """Background task: every Monday ~09:00 CST (01:00 UTC), verify R2 backup completeness.
+
+    Checks past 7 days. Sends Telegram alert if any day is missing or incomplete.
+    """
+    import datetime as _dwk
+    # Wait until next Monday 01:00 UTC
+    now = _dwk.datetime.utcnow()
+    # weekday(): Mon=0 … Sun=6
+    days_until_monday = (7 - now.weekday()) % 7  # 0 if today is Monday
+    target = (now + _dwk.timedelta(days=days_until_monday)).replace(
+        hour=1, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += _dwk.timedelta(weeks=1)
+    wait_secs = (target - now).total_seconds()
+    await asyncio.sleep(wait_secs)
+
+    while True:
+        try:
+            report = await _verify_r2_backups(days=7)
+            if not report["r2_enabled"]:
+                print("[backup-verify] R2 not enabled, skipping check")
+            elif report["ok"]:
+                print("[backup-verify] ✅ All backups present for past 7 days")
+            else:
+                lines = ["⚠️ <b>备份完整性告警</b>"]
+                if report["missing"]:
+                    lines.append(f"❌ <b>完全缺失</b>：{', '.join(report['missing'])}")
+                if report["incomplete"]:
+                    lines.append(f"🟡 <b>不完整</b>（json/db 二者之一缺失）：{', '.join(report['incomplete'])}")
+                lines.append("\n请检查 R2 bucket 和备份任务日志。")
+                await _telegram_send("\n".join(lines), parse_mode="HTML")
+                print(f"[backup-verify] ⚠️ issues found: missing={report['missing']} incomplete={report['incomplete']}")
+        except Exception as _ve:
+            print(f"[backup-verify error] {_ve}")
+        await asyncio.sleep(7 * 24 * 3600)   # sleep 1 week
+
 
 # ── Agent type config ──────────────────────────────────────────────────────────
 
@@ -6711,13 +6832,6 @@ async def _auto_extract_character_memory(agent_id: str, messages: list) -> None:
         print(f"[auto_extract] {agent_id}: {e}")
 
 
-# B7: _generate_l5_summary deprecated — L5 replaced by conversations Qdrant collection.
-# Keeping function as no-op to avoid call-site churn; will be removed in a later cleanup.
-async def _generate_l5_summary(agent_id: str, session_id: str, messages: list) -> None:
-    """DEPRECATED (B7): L5 replaced by Qdrant conversations collection + RAG pipeline.
-    No-op kept to avoid call-site churn."""
-    return
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # P2.2  Reverse Identification (Notion spec §7)
@@ -6954,8 +7068,6 @@ async def _post_conversation_tasks(
     else:
         # Agent type: distill into Palimpsest L1-L4
         await _distill_and_store(agent_id, session_id, full, agent_type=agent_type)
-    # L5 留底层：所有 agent 类型都生成对话摘要（Phase B7 废弃前保留）
-    await _generate_l5_summary(agent_id, session_id, full)
     # Ingest exchange pairs into Qdrant conversations collection (RAG pipeline)
     asyncio.create_task(_ingest_conv_to_qdrant(agent_id, full, cid))
 
@@ -7929,33 +8041,6 @@ async def pal_confirm_l1(memory_id: str, _=Depends(_require_key)):
         raise HTTPException(404, "Memory not found or already confirmed")
     return _pal_row(mem)
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Admin: L5 留底层 — conversation summaries
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@app.get("/api/admin/l5")
-async def l5_list_api(agent_id: str, limit: int = 30, _=Depends(_require_key)):
-    """List recent L5 conversation summaries for an agent."""
-    rows = await _l5_list(agent_id=agent_id, limit=limit)
-    return {"items": rows, "total": len(rows)}
-
-
-@app.get("/api/admin/l5/search")
-async def l5_search_api(agent_id: str, q: str, limit: int = 10, _=Depends(_require_key)):
-    """FTS5 keyword search over L5 summaries."""
-    rows = await _l5_search(agent_id=agent_id, query=q, limit=limit)
-    return {"items": rows, "total": len(rows)}
-
-
-@app.delete("/api/admin/l5/{summary_id}")
-async def l5_delete_api(summary_id: str, _=Depends(_require_key)):
-    """Hard-delete a single L5 summary."""
-    from memory_db import l5_delete as _l5_del
-    ok = await _l5_del(summary_id)
-    if not ok:
-        raise HTTPException(404, "Summary not found")
-    return {"ok": True}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9686,7 +9771,7 @@ async def palimpsest_api_search(
     limit: int = 10,
     _=Depends(_require_key),
 ):
-    """FTS5 full-text search across Palimpsest memories."""
+    """Semantic search across Palimpsest memories (Qdrant vector, FTS5 fallback)."""
     if not q.strip():
         raise HTTPException(400, "query param 'q' is required")
     results = await _mem_search(agent_id=agent_id, query=q.strip(), limit=limit)
@@ -9933,7 +10018,7 @@ _MCP_GROUPS = {
     "intiface_stop": ("Devices", "Stop device vibration"),
     "palimpsest_write": ("Memory", "Write a memory (L1-L4)"),
     "palimpsest_read": ("Memory", "Read memory by ID"),
-    "palimpsest_search": ("Memory", "FTS5 full-text search"),
+    "palimpsest_search": ("Memory", "Semantic search (Qdrant vector, FTS5 fallback)"),
     "palimpsest_update": ("Memory", "Update a memory"),
     "palimpsest_delete": ("Memory", "Delete / archive a memory"),
     "palimpsest_wakeup": ("Memory", "Cold-start context load"),
@@ -10100,6 +10185,16 @@ async def r2_test(_=Depends(_require_key)):
     if ok:
         return {"ok": True, "message": "R2 connection successful ✓"}
     raise HTTPException(500, "R2 upload failed — check credentials or enable flag")
+
+
+@app.get("/admin/api/backup/r2/verify")
+async def r2_verify(days: int = 7, _=Depends(_require_key)):
+    """Check R2 backup completeness for the past N days (default 7).
+
+    Returns per-day status: which days are missing or incomplete (json/db).
+    """
+    report = await _verify_r2_backups(days=days)
+    return report
 
 
 @app.get("/admin/api/telegram/status")
@@ -10322,7 +10417,6 @@ _TIMELINE_TAXONOMY = {
                 {"id": "memory.L2", "label": "L2 背景"},
                 {"id": "memory.L3", "label": "L3 事件"},
                 {"id": "memory.L4", "label": "L4 时刻"},
-                {"id": "memory.L5", "label": "L5 重写"},
             ],
         },
         {
@@ -10342,7 +10436,6 @@ _LAYER_SUBCATEGORY = {
     "L2": "memory.L2",
     "L3": "memory.L3",
     "L4": "memory.L4",
-    "L5": "memory.L5",
 }
 
 _LAYER_DURATION_MIN = {
@@ -10350,7 +10443,6 @@ _LAYER_DURATION_MIN = {
     "L2": 45,
     "L3": 30,
     "L4": 15,
-    "L5": 20,
 }
 
 _tl_bearer = HTTPBearer(auto_error=False)
