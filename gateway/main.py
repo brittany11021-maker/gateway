@@ -67,6 +67,12 @@ from memory_db import memory_wakeup as _mem_wakeup, memory_surface as _mem_surfa
 from memory_db import memory_stats as _mem_stats
 from memory_db import memory_get_history as _mem_history, memory_rollback as _mem_rollback
 from memory_db import backup_db as _mem_backup_db
+from memory_db import (
+    music_history_add as _music_hist_add,
+    music_history_get_recent_ids as _music_hist_recent,
+    music_history_set_reaction as _music_hist_react,
+    music_history_list as _music_hist_list,
+)
 from memory_db import dedup_check as _mem_dedup_check, dedup_list as _mem_dedup_list
 from memory_db import dedup_resolve as _mem_dedup_resolve
 from memory_db import memory_mark_read as _mem_mark_read
@@ -219,47 +225,72 @@ _CHEAP_LLM_MODELS = [
 # Note: moonshotai/kimi-k2.5 reached end-of-life 2026-04-30, removed.
 
 async def _call_llm_cheap(prompt: str) -> str:
-    """Call NVIDIA NIM LLM for background tasks (distillation, auto-extract).
+    """Call LLM for background tasks (distillation, auto-extract).
 
-    Tries models in priority order: deepseek-v4-pro → glm-5.1 → gemma-4-31b → mistral-small.
-    DISTILL_MODEL env var inserts an override at position 0.
-    Only uses the 'nvidia-llm' provider — never falls back to other providers.
-    Raises RuntimeError if ALL models fail.
+    Primary provider: nvidia-llm (DISTILL_MODEL override + fallback chain).
+    Secondary fallback: deepseek official API (stable, always available).
+    Raises RuntimeError only if ALL providers fail.
     """
     import os as _os
     override = _os.getenv("DISTILL_MODEL", "").strip()
-    models = (
+    nvidia_models = (
         [override] + [m for m in _CHEAP_LLM_MODELS if m != override]
         if override else _CHEAP_LLM_MODELS
     )
 
     async with _db_pool.acquire() as conn:
-        prow = await conn.fetchrow(
+        nvidia_row = await conn.fetchrow(
             "SELECT base_url, api_key FROM providers WHERE name='nvidia-llm' LIMIT 1"
         )
-    if not prow:
-        raise RuntimeError("[cheap_llm] Provider 'nvidia-llm' not found in DB")
+        ds_row = await conn.fetchrow(
+            "SELECT base_url, api_key FROM providers WHERE name='deepseek' LIMIT 1"
+        )
 
-    base = prow["base_url"].rstrip("/")
-    hdrs = {"Authorization": "Bearer " + prow["api_key"], "Content-Type": "application/json"}
     last_err = ""
-    for model in models:
+
+    # ── Try NVIDIA NIM models first (timeout 60s each) ─────────────────────────
+    if nvidia_row:
+        base = nvidia_row["base_url"].rstrip("/")
+        hdrs = {"Authorization": "Bearer " + nvidia_row["api_key"], "Content-Type": "application/json"}
+        for model in nvidia_models:
+            try:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    resp = await client.post(
+                        base + "/chat/completions", headers=hdrs,
+                        json={"model": model,
+                              "messages": [{"role": "user", "content": prompt}],
+                              "temperature": 0.3, "max_tokens": 2000},
+                    )
+                if resp.is_success:
+                    return resp.json()["choices"][0]["message"]["content"].strip()
+                last_err = f"{model}: HTTP {resp.status_code} {resp.text[:200]}"
+                print(f"[cheap_llm] {last_err} — trying next model", flush=True)
+            except Exception as _e:
+                last_err = f"{model}: {type(_e).__name__}: {_e}"
+                print(f"[cheap_llm] {last_err} — trying next model", flush=True)
+
+    # ── Fallback: DeepSeek official API ───────────────────────────────────────
+    if ds_row:
         try:
-            async with httpx.AsyncClient(timeout=120) as client:
+            base = ds_row["base_url"].rstrip("/")
+            hdrs = {"Authorization": "Bearer " + ds_row["api_key"], "Content-Type": "application/json"}
+            async with httpx.AsyncClient(timeout=60) as client:
                 resp = await client.post(
                     base + "/chat/completions", headers=hdrs,
-                    json={"model": model,
+                    json={"model": "deepseek-chat",
                           "messages": [{"role": "user", "content": prompt}],
                           "temperature": 0.3, "max_tokens": 2000},
                 )
             if resp.is_success:
+                print("[cheap_llm] using deepseek fallback ✓", flush=True)
                 return resp.json()["choices"][0]["message"]["content"].strip()
-            last_err = f"{model}: HTTP {resp.status_code} {resp.text[:200]}"
-            print(f"[cheap_llm] {last_err} — trying next model", flush=True)
+            last_err = f"deepseek: HTTP {resp.status_code} {resp.text[:200]}"
+            print(f"[cheap_llm] {last_err}", flush=True)
         except Exception as _e:
-            last_err = f"{model}: {type(_e).__name__}: {_e}"
-            print(f"[cheap_llm] {last_err} — trying next model", flush=True)
-    raise RuntimeError(f"[cheap_llm] All models failed. Last error: {last_err}")
+            last_err = f"deepseek: {type(_e).__name__}: {_e}"
+            print(f"[cheap_llm] {last_err}", flush=True)
+
+    raise RuntimeError(f"[cheap_llm] All providers failed. Last error: {last_err}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3037,6 +3068,9 @@ async def startup():
             "ALTER TABLE agent_settings ADD COLUMN IF NOT EXISTS llm_chain_config JSONB DEFAULT '{}'"
         )
         await conn.execute(
+            "ALTER TABLE agent_settings ADD COLUMN IF NOT EXISTS mcp_stubborn_compat BOOLEAN DEFAULT FALSE"
+        )
+        await conn.execute(
             "ALTER TABLE worldbook_entries ADD COLUMN IF NOT EXISTS embedding JSONB DEFAULT NULL"
         )
         await conn.execute(
@@ -3114,6 +3148,7 @@ async def startup():
     asyncio.create_task(_news_standalone_push_loop())  # 10% standalone news share (§13.2)
     asyncio.create_task(_health_monitor_loop())      # Health metrics monitor
     asyncio.create_task(_weekly_backup_verify_loop())  # Weekly Monday R2 backup integrity check
+    asyncio.create_task(_music_recommend_loop())       # Music recommendation ~2-3x/week
     asyncio.create_task(_register_telegram_webhook())  # Telegram bot webhook
     asyncio.create_task(_heartbeat_loop())           # 24h LLM liveness watchdog
 
@@ -3941,6 +3976,280 @@ async def _nightly_character_loop() -> None:
         await asyncio.sleep(24 * 3600)
 
 
+# ── Music Recommendation System (§14) ────────────────────────────────────────
+
+_CLOUD_MUSIC_URL = "https://palimpsest.513129.xyz/cloud-music/mcp"
+
+# Keywords that suggest the user is interested in music right now
+_MUSIC_KEYWORDS = [
+    "听歌", "音乐", "歌曲", "推荐首", "推荐一首", "好听", "歌单",
+    "playlist", "什么歌", "哪首歌", "放首歌", "听什么",
+    "bgm", "BGM", "耳机", "单曲循环",
+]
+
+# Mood → search keyword for low-valence states
+_MOOD_MUSIC_QUERY = {
+    "low":    ["治愈", "温暖", "陪伴", "轻柔"],
+    "high":   None,   # use daily_recommend instead
+    "normal": None,
+}
+
+
+def _sse_parse_json(text: str) -> dict | None:
+    """Parse the first JSON object from an SSE response body (data: ... lines)."""
+    import json as _jsn
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            payload = line[5:].strip()
+            if payload and payload != "[DONE]":
+                try:
+                    return _jsn.loads(payload)
+                except Exception:
+                    continue
+    return None
+
+
+async def _cloud_music_call(tool_name: str, arguments: dict | None = None) -> str:
+    """Call a tool on the cloud-music MCP server via streamable-http protocol.
+
+    Handles FastMCP's SSE (text/event-stream) response format.
+    Returns the text content from the tool response, or "" on failure.
+    """
+    if arguments is None:
+        arguments = {}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20) as _mc:
+            # Step 1: initialize session → get session ID from response header
+            init_r = await _mc.post(_CLOUD_MUSIC_URL, headers=headers, json={
+                "jsonrpc": "2.0", "id": 0,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "memory-gateway", "version": "1.0"},
+                },
+            })
+            # session ID is case-insensitive in headers
+            session_id = (
+                init_r.headers.get("mcp-session-id")
+                or init_r.headers.get("Mcp-Session-Id")
+                or ""
+            )
+
+            hdrs2 = {**headers}
+            if session_id:
+                hdrs2["Mcp-Session-Id"] = session_id
+
+            # Step 2: notifications/initialized (202, body may be empty)
+            try:
+                await _mc.post(_CLOUD_MUSIC_URL, headers=hdrs2, json={
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {},
+                })
+            except Exception:
+                pass
+
+            # Step 3: call tool, parse SSE response
+            tool_r = await _mc.post(_CLOUD_MUSIC_URL, headers=hdrs2, json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": arguments},
+            })
+            data = _sse_parse_json(tool_r.text) or {}
+            if "result" in data:
+                content = data["result"].get("content", [])
+                if content:
+                    return content[0].get("text", "")
+            if "error" in data:
+                print(f"[cloud_music] tool error: {data['error']}", flush=True)
+    except Exception as _cme:
+        print(f"[cloud_music] call error: {_cme}", flush=True)
+    return ""
+
+
+def _music_keyword_in_text(messages: list) -> bool:
+    """Return True if the last 2 user messages contain music-related keywords."""
+    user_msgs = [m.get("content", "") for m in messages if m.get("role") == "user"]
+    text = " ".join(user_msgs[-2:]).lower()
+    return any(kw in text for kw in _MUSIC_KEYWORDS)
+
+
+def _parse_songs_from_response(text: str) -> list[dict]:
+    """Parse songs list from cloud_music_get_daily_recommend / search text response.
+
+    Expected format per line: N. 歌名 - 歌手 (ID: XXXXXX)
+    Returns list of {"id": str, "name": str, "artist": str}
+    """
+    import re as _re_music
+    songs = []
+    for line in text.splitlines():
+        m = _re_music.search(r'(\d+)\.\s*(.+?)\s*-\s*(.+?)\s*\(ID:\s*(\d+)\)', line)
+        if m:
+            songs.append({"name": m.group(2).strip(), "artist": m.group(3).strip(), "id": m.group(4).strip()})
+    return songs
+
+
+async def _music_pick_and_send(
+    agent_id: str,
+    trigger_mode: str = "scheduled",
+    mood_tag: str = "",
+    force: bool = False,
+) -> bool:
+    """Core music recommendation: fetch songs → filter history → generate char message → send.
+
+    Returns True if message was sent.
+    """
+    import random as _rndm
+
+    # Fetch candidates depending on mode
+    if trigger_mode == "mood_low" and mood_tag:
+        # Comfort music: search for calming/healing songs
+        query = _rndm.choice(_MOOD_MUSIC_QUERY["low"])
+        raw = await _cloud_music_call("cloud_music_search", {"keyword": query})
+    else:
+        # Scheduled / keyword / mood_high: use daily recommendations
+        raw = await _cloud_music_call("cloud_music_get_daily_recommend")
+
+    if not raw:
+        print(f"[music] cloud_music_call returned empty for {agent_id}", flush=True)
+        return False
+
+    songs = _parse_songs_from_response(raw)
+    if not songs:
+        print(f"[music] no songs parsed from response", flush=True)
+        return False
+
+    # Filter recently recommended songs (past 30 days)
+    recent_ids = await _music_hist_recent(agent_id, days=30)
+    fresh = [s for s in songs if s["id"] not in recent_ids]
+    if not fresh:
+        fresh = songs  # all recently recommended → allow repeats
+
+    song = _rndm.choice(fresh[:10])  # pick randomly from top-10 fresh songs
+
+    # Get agent system prompt for character voice
+    try:
+        _as = await _get_agent_config(agent_id)
+        _sp = (_as.get("system_prompt") or "").strip()[:300]
+    except Exception:
+        _sp = ""
+
+    # Build trigger context hint
+    mode_hint = {
+        "scheduled":  "你今天想分享一首最近在听的歌",
+        "keyword":    "用户提到了音乐，你想趁机分享一首你喜欢的",
+        "mood_low":   "你想用音乐安慰对方，推荐一首治愈系的歌",
+        "mood_high":  "你心情很好，想分享一首让你开心的歌",
+    }.get(trigger_mode, "你想分享一首歌")
+
+    char_ctx = f"你是以下角色：\n{_sp}\n\n" if _sp else ""
+    prompt = (
+        f"{char_ctx}{mode_hint}。\n"
+        f"歌曲：《{song['name']}》- {song['artist']}\n"
+        "用角色的口吻写一条分享这首歌的消息（1-2句，口语自然，不要解释太多，"
+        "可以说为什么今天想到这首或听的感受），消息末尾附上歌名和歌手："
+    )
+
+    print(f"[music] calling LLM for {agent_id} song={song['name']}", flush=True)
+    try:
+        msg = (await _call_llm_route("proactive_push", prompt)).strip().strip("\"'")
+        print(f"[music] LLM returned: {msg[:80]!r}", flush=True)
+    except Exception as _le:
+        print(f"[music] LLM error: {_le}", flush=True)
+        return False
+
+    if not msg:
+        return False
+
+    # Append song info if LLM forgot
+    if song["name"] not in msg:
+        msg += f"\n🎵 《{song['name']}》- {song['artist']}"
+
+    # Quiet hours + daily limit guard (skipped when force=True)
+    if not force:
+        if await _check_quiet_hours():
+            return False
+        if not await _check_daily_push_limit(agent_id):
+            return False
+
+    ok = await _telegram_send(msg)
+    await _push_log_write(
+        agent_id=agent_id, category="music_recommend",
+        trigger_src=trigger_mode, message=msg, sent=ok,
+    )
+    if ok:
+        await _music_hist_add(
+            agent_id=agent_id,
+            song_id=song["id"], song_name=song["name"], artist=song["artist"],
+            trigger_mode=trigger_mode, mood_tag=mood_tag,
+        )
+        await _cd_set(agent_id, "music_recommend")
+        print(f"[music] sent ({trigger_mode}) for {agent_id}: {song['name']} - {song['artist']}", flush=True)
+    return ok
+
+
+async def _music_recommend_loop() -> None:
+    """Background task: scheduled music recommendations, ~2-3x per week per character.
+
+    Runs daily at 15:00 CST (07:00 UTC). Each day has ~35% fire probability
+    (expected value ≈ 2.45 recommendations/week). Hard cooldown: 48h between sends.
+    """
+    import datetime as _dtm, random as _rndm2
+
+    # Align first fire to configured daily_time_utc (default 07:00)
+    _mcfg0 = await _get_music_config()
+    _t0 = _mcfg0.get("daily_time_utc", "07:00")
+    try:
+        _h0, _m0 = (int(x) for x in _t0.split(":"))
+    except Exception:
+        _h0, _m0 = 7, 0
+    now = _dtm.datetime.utcnow()
+    target = now.replace(hour=_h0, minute=_m0, second=0, microsecond=0)
+    if target <= now:
+        target += _dtm.timedelta(days=1)
+    await asyncio.sleep((target - now).total_seconds())
+
+    while True:
+        music_cfg = await _get_music_config()
+        _prob = music_cfg.get("daily_probability", 0.35)
+        if music_cfg.get("enabled", True) and _rndm2.random() < _prob:
+            try:
+                async with _db_pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT agent_id FROM agent_settings "
+                        "WHERE agent_type = 'character' AND auto_memory = TRUE"
+                    )
+                for r in rows:
+                    aid = r["agent_id"]
+                    allowed = await _cd_check(aid, "music_recommend")
+                    if not allowed:
+                        continue
+                    try:
+                        await _music_pick_and_send(aid, trigger_mode="scheduled")
+                    except Exception as _me:
+                        print(f"[music_loop] error for {aid}: {_me}", flush=True)
+            except Exception as _le:
+                print(f"[music_loop] error: {_le}", flush=True)
+        # Re-read config for next fire time to support live updates
+        music_cfg = await _get_music_config()
+        _t = music_cfg.get("daily_time_utc", "07:00")
+        try:
+            _h, _m = (int(x) for x in _t.split(":"))
+        except Exception:
+            _h, _m = 7, 0
+        _now2 = _dtm.datetime.utcnow()
+        _next = _now2.replace(hour=_h, minute=_m, second=0, microsecond=0)
+        if _next <= _now2:
+            _next += _dtm.timedelta(days=1)
+        await asyncio.sleep((_next - _dtm.datetime.utcnow()).total_seconds())
+
+
 async def _check_proactive_triggers(agent_id: str) -> None:
     """Layer 3: 触景生情 — scan today's diary → search related memories → maybe send Telegram.
 
@@ -4423,8 +4732,10 @@ async def _check_accumulator_thresholds(agent_id: str) -> None:
         return
 
     st = await _state_get(agent_id)
+    acc_cfg = await _get_accumulator_config()
 
-    for acc, threshold in _ACCUMULATOR_THRESHOLDS.items():
+    for acc in acc_cfg:
+        threshold = float(acc_cfg[acc].get("threshold", _ACCUMULATOR_THRESHOLDS.get(acc, 999)))
         cur_val = float(st.get(acc) or 0.0)
         if cur_val < threshold:
             continue
@@ -4477,8 +4788,8 @@ async def _check_accumulator_thresholds(agent_id: str) -> None:
             if not msg:
                 continue
 
-            # Reset accumulator after trigger
-            reset_val = _ACCUMULATOR_RESET.get(acc, 0.0)
+            # Reset accumulator after trigger (config-driven, fallback to hardcoded default)
+            reset_val = float(acc_cfg.get(acc, {}).get("reset", _ACCUMULATOR_RESET.get(acc, 0.0)))
             await _state_set(agent_id, **{acc: reset_val})
 
             ok = await _push_send(msg, category=acc + "_trigger")
@@ -4566,19 +4877,22 @@ async def _silence_tracker_loop() -> None:
 # §13  新闻系统  (Notion spec §13)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Self-hosted RSSHub base URL — falls back to public instance if not configured
+_RSSHUB_BASE = os.getenv("RSSHUB_URL", "https://rsshub.app").rstrip("/")
+
 # Default RSS feeds — flat list, each item: {name, url, category?, skip_first?, take_count?, enabled?}
 _NEWS_RSS_DEFAULTS = [
-    {"name": "Reuters World", "url": "https://feeds.reuters.com/Reuters/worldNews",          "category": "world"},
-    {"name": "BBC World",     "url": "https://feeds.bbci.co.uk/news/world/rss.xml",           "category": "world"},
-    {"name": "澎湃要闻",       "url": "https://rsshub.app/thepaper/newsDetail/25",             "category": "china", "skip_first": 1},
-    {"name": "联合早报",       "url": "https://rsshub.app/zaobao/realtime/china",              "category": "china"},
-    {"name": "Dezeen",        "url": "https://www.dezeen.com/feed/",                          "category": "art_design"},
-    {"name": "It's Nice That","url": "https://www.itsnicethat.com/rss",                       "category": "art_design"},
-    {"name": "Designboom",    "url": "https://www.designboom.com/feed/",                      "category": "art_design"},
-    {"name": "Colossal",      "url": "https://www.thisiscolossal.com/feed/",                  "category": "art_design"},
-    {"name": "小红书热门",     "url": "https://rsshub.app/xiaohongshu/explore",                "category": "lifestyle", "enabled": False},
-    {"name": "36Kr",          "url": "https://36kr.com/feed",                                 "category": "tech"},
-    {"name": "少数派",         "url": "https://sspai.com/feed",                               "category": "tech"},
+    {"name": "Reuters World", "url": "https://feeds.reuters.com/Reuters/worldNews",                       "category": "world"},
+    {"name": "BBC World",     "url": "https://feeds.bbci.co.uk/news/world/rss.xml",                        "category": "world"},
+    {"name": "虎嗅",           "url": f"{_RSSHUB_BASE}/huxiu/article",                                    "category": "china"},
+    {"name": "联合早报",       "url": f"{_RSSHUB_BASE}/zaobao/realtime/china",                             "category": "china"},
+    {"name": "Dezeen",        "url": "https://www.dezeen.com/feed/",                                       "category": "art_design"},
+    {"name": "It's Nice That","url": "https://www.itsnicethat.com/rss",                                    "category": "art_design"},
+    {"name": "Designboom",    "url": "https://www.designboom.com/feed/",                                   "category": "art_design"},
+    {"name": "Colossal",      "url": "https://www.thisiscolossal.com/feed/",                               "category": "art_design"},
+    {"name": "小红书热门",     "url": f"{_RSSHUB_BASE}/xiaohongshu/explore",                               "category": "lifestyle", "enabled": False},
+    {"name": "36Kr",          "url": "https://36kr.com/feed",                                              "category": "tech"},
+    {"name": "少数派",         "url": "https://sspai.com/feed",                                            "category": "tech"},
 ]
 
 _NEWS_HARD_BLOCK = [
@@ -4628,6 +4942,7 @@ async def _news_fetch_once() -> int:
 
     feeds  = cfg.get("feeds") or _NEWS_RSS_DEFAULTS
     max_pf = cfg.get("max_items_per_feed", 3)
+    _hard_block = cfg.get("hard_block_keywords") or _NEWS_HARD_BLOCK
     stored = 0
 
     from memory_db import get_db as _gdb_n
@@ -4691,7 +5006,7 @@ async def _news_fetch_once() -> int:
                 break
             title = it["title"]
             # Hard-block political content
-            if any(kw.lower() in title.lower() for kw in _NEWS_HARD_BLOCK):
+            if any(kw.lower() in title.lower() for kw in _hard_block):
                 continue
             # Dedup by content hash
             uid = _hs.md5((name + title).encode()).hexdigest()
@@ -6288,6 +6603,7 @@ async def _get_agent_config(agent_id: str) -> dict:
         "auto_memory": False, "mcp_proxy_config": {},
         "llm_model": "", "api_chain": "",
         "prompt_enabled": True, "worldbook_enabled": True, "prompt_inject_mode": "always",
+        "mcp_stubborn_compat": False,
     }
     try:
         async with _db_pool.acquire() as conn:
@@ -6313,6 +6629,7 @@ async def _get_agent_config(agent_id: str) -> dict:
                 "prompt_enabled":   row.get("prompt_enabled") if row.get("prompt_enabled") is not None else True,
                 "worldbook_enabled": row.get("worldbook_enabled") if row.get("worldbook_enabled") is not None else True,
                 "prompt_inject_mode": row.get("prompt_inject_mode") or "always",
+                "mcp_stubborn_compat": bool(row.get("mcp_stubborn_compat")),
             }
     except Exception:
         pass
@@ -7065,6 +7382,25 @@ async def _post_conversation_tasks(
             await _extract_items_promises(agent_id, full)
         except Exception as _ipe:
             print(f"[post_conv] items_promises err: {_ipe}")
+        # §14 Music: keyword trigger
+        try:
+            if _music_keyword_in_text(full) and await _cd_check(agent_id, "music_recommend"):
+                asyncio.create_task(_music_pick_and_send(agent_id, trigger_mode="keyword"))
+        except Exception as _mke:
+            print(f"[post_conv] music_keyword err: {_mke}")
+        # §14 Music: mood trigger (low valence)
+        try:
+            _st_mood = await _state_get(agent_id)
+            _valence = float(_st_mood.get("mood_valence") or 0.0)
+            if _valence < -0.35 and await _cd_check(agent_id, "music_recommend"):
+                _mood_lbl = _st_mood.get("mood_label", "")
+                asyncio.create_task(_music_pick_and_send(
+                    agent_id, trigger_mode="mood_low", mood_tag=_mood_lbl))
+            elif _valence > 0.60 and await _cd_check(agent_id, "music_recommend"):
+                asyncio.create_task(_music_pick_and_send(
+                    agent_id, trigger_mode="mood_high", mood_tag="happy"))
+        except Exception as _mme:
+            print(f"[post_conv] music_mood err: {_mme}")
     else:
         # Agent type: distill into Palimpsest L1-L4
         await _distill_and_store(agent_id, session_id, full, agent_type=agent_type)
@@ -7410,8 +7746,16 @@ async def chat_completions(request: Request, body: dict, cred: HTTPAuthorization
     # Explicit model in request body overrides everything
     req_model = body.get("model", "")
 
-    payload = {k: v for k, v in body.items() if k not in ("agent_id", "session_id")}
+    _stubborn_compat = _agent_cfg.get("mcp_stubborn_compat", False)
+    _tool_strip_keys = {"tools", "tool_choice", "functions", "function_call", "tool_use"}
+    payload = {
+        k: v for k, v in body.items()
+        if k not in ("agent_id", "session_id")
+        and not (_stubborn_compat and k in _tool_strip_keys)
+    }
     payload["messages"] = messages
+    if _stubborn_compat and any(k in body for k in _tool_strip_keys):
+        print(f"[stubborn_compat] {agent_id}: stripped tool keys from payload", flush=True)
 
     if stream:
         async def event_stream() -> AsyncGenerator[bytes, None]:
@@ -8513,6 +8857,9 @@ async def set_evening_push_cfg(body: dict, _=Depends(_require_key)):
 @app.get("/admin/api/config/news")
 async def get_news_cfg(_=Depends(_require_key)):
     cfg = await _get_news_config()
+    # Augment with hard_block defaults if not stored yet
+    if "hard_block_keywords" not in cfg:
+        cfg["hard_block_keywords"] = list(_NEWS_HARD_BLOCK)
     return {"config": cfg}
 
 @app.post("/admin/api/config/news")
@@ -8525,6 +8872,89 @@ async def set_news_cfg(body: dict, _=Depends(_require_key)):
             json.dumps(cfg)
         )
     return {"ok": True}
+
+
+# ── Music config ─────────────────────────────────────────────────────────────
+_MUSIC_CFG_DEFAULTS: dict = {
+    "enabled":           True,
+    "daily_time_utc":    "07:00",
+    "daily_probability": 0.35,
+    "mood_low_keywords": ["治愈", "温暖", "陪伴", "轻柔"],
+    "cooldown_hours":    48,
+}
+
+async def _get_music_config() -> dict:
+    try:
+        async with _db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM user_config WHERE key='music_config'")
+        if row and row["value"]:
+            v = row["value"]
+            db_cfg = v if isinstance(v, dict) else json.loads(v)
+            return {**_MUSIC_CFG_DEFAULTS, **db_cfg}
+    except Exception:
+        pass
+    return dict(_MUSIC_CFG_DEFAULTS)
+
+@app.get("/admin/api/config/music")
+async def get_music_cfg(_=Depends(_require_key)):
+    return {"config": await _get_music_config()}
+
+@app.post("/admin/api/config/music")
+async def set_music_cfg(body: dict, _=Depends(_require_key)):
+    cfg = body.get("config", body)
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO user_config(key,value,updated_at) VALUES('music_config',$1::jsonb,NOW()) "
+            "ON CONFLICT(key) DO UPDATE SET value=$1::jsonb, updated_at=NOW()",
+            json.dumps(cfg)
+        )
+    return {"ok": True}
+
+
+# ── Accumulator config ────────────────────────────────────────────────────────
+_ACCUMULATOR_CFG_DEFAULTS: dict = {
+    "miss_you": {"threshold": 10.0, "reset": 0.0},
+    "low_mood": {"threshold":  8.0, "reset": 3.0},
+}
+
+async def _get_accumulator_config() -> dict:
+    try:
+        async with _db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM user_config WHERE key='accumulator_config'")
+        if row and row["value"]:
+            v = row["value"]
+            db_cfg = v if isinstance(v, dict) else json.loads(v)
+            return {k: {**_ACCUMULATOR_CFG_DEFAULTS[k], **(db_cfg.get(k) or {})}
+                    for k in _ACCUMULATOR_CFG_DEFAULTS}
+    except Exception:
+        pass
+    return {k: dict(v) for k, v in _ACCUMULATOR_CFG_DEFAULTS.items()}
+
+@app.get("/admin/api/config/accumulator")
+async def get_accumulator_cfg(_=Depends(_require_key)):
+    return {"config": await _get_accumulator_config()}
+
+@app.post("/admin/api/config/accumulator")
+async def set_accumulator_cfg(body: dict, _=Depends(_require_key)):
+    cfg = body.get("config", body)
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO user_config(key,value,updated_at) VALUES('accumulator_config',$1::jsonb,NOW()) "
+            "ON CONFLICT(key) DO UPDATE SET value=$1::jsonb, updated_at=NOW()",
+            json.dumps(cfg)
+        )
+    return {"ok": True}
+
+
+# ── System info (read-only) ───────────────────────────────────────────────────
+@app.get("/admin/api/config/system-info")
+async def get_system_info(_=Depends(_require_key)):
+    return {
+        "distill_model":  os.getenv("DISTILL_MODEL", ""),
+        "embed_provider": os.getenv("EMBED_PROVIDER", "nvidia"),
+        "rsshub_url":     os.getenv("RSSHUB_URL", "https://rsshub.app"),
+        "gateway_url":    os.getenv("GATEWAY_PUBLIC_URL", ""),
+    }
 
 
 # ── Health monitor config ───────────────────────────────────────────────────
@@ -8772,7 +9202,8 @@ async def get_agent_settings(agent_id: str, _=Depends(_require_key)):
     if not row:
         return {"agent_id": agent_id, "llm_model": "", "api_chain": "", "notes": "", "avatar": "",
                 "agent_type": "agent", "mcp_enabled": True, "auto_memory": False,
-                "mcp_proxy_config": {}, "system_prompt": "", "llm_chain_config": {}}
+                "mcp_proxy_config": {}, "system_prompt": "", "llm_chain_config": {},
+                "mcp_stubborn_compat": False}
     d = dict(row)
     cfg = d.get("mcp_proxy_config")
     if isinstance(cfg, dict):
@@ -8807,14 +9238,14 @@ async def save_agent_settings(agent_id: str, body: dict, _=Depends(_require_key)
             INSERT INTO agent_settings
                 (agent_id, llm_model, api_chain, notes, avatar,
                  agent_type, mcp_enabled, auto_memory, mcp_proxy_config, system_prompt,
-                 prompt_enabled, worldbook_enabled, llm_chain_config, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13::jsonb,now())
+                 prompt_enabled, worldbook_enabled, llm_chain_config, mcp_stubborn_compat, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13::jsonb,$14,now())
             ON CONFLICT (agent_id) DO UPDATE SET
                 llm_model=$2, api_chain=$3, notes=$4, avatar=$5,
                 agent_type=$6, mcp_enabled=$7, auto_memory=$8,
                 mcp_proxy_config=$9::jsonb, system_prompt=$10,
                 prompt_enabled=$11, worldbook_enabled=$12,
-                llm_chain_config=$13::jsonb, updated_at=now()
+                llm_chain_config=$13::jsonb, mcp_stubborn_compat=$14, updated_at=now()
         """, agent_id,
              body.get("llm_model", ""),
              body.get("api_chain", ""),
@@ -8827,7 +9258,8 @@ async def save_agent_settings(agent_id: str, body: dict, _=Depends(_require_key)
              body.get("system_prompt", ""),
              body.get("prompt_enabled", True),
              body.get("worldbook_enabled", True),
-             _chain_cfg)
+             _chain_cfg,
+             bool(body.get("mcp_stubborn_compat", False)))
     return {"ok": True}
 
 
@@ -9027,83 +9459,211 @@ async def import_data(body: dict, _=Depends(_require_key)):
     }
 
 
-# ── Import conversations with LLM extraction ──────────────────────────────────
-@app.post("/admin/api/import/conversations")
-async def import_conversations(
-    agent_id: str = Form(...),
-    file: UploadFile = File(...),
-    _=Depends(_require_key),
-):
-    """Accept Claude.ai export or gateway export JSON; distill each conversation into memories."""
-    raw = await file.read()
-    try:
-        data = json.loads(raw)
-    except Exception:
-        raise HTTPException(400, "Invalid JSON file")
+# ── A4: Conversation import — async job tracker ────────────────────────────────
+_conv_import_jobs: dict[str, dict] = {}
+# shape: {job_id: {status, total, done, skipped, errors, memories_created,
+#                  embedded, agent_id, format}}
 
-    # ── detect format and collect conversations ────────────────────────────────
-    conversations: list[dict] = []
 
-    if isinstance(data, list) and data and "chat_messages" in (data[0] if data else {}):
-        # Claude.ai export: list of conversation objects
-        for conv in data:
+def _detect_import_format(data) -> str:
+    """Guess the source format of an import payload."""
+    if isinstance(data, list) and data:
+        first = data[0]
+        if "chat_messages" in first:
+            return "claude_ai"
+        msgs = first.get("messages", [])
+        if isinstance(msgs, list) and msgs and "role" in (msgs[0] if msgs else {}):
+            return "typingmind"
+    elif isinstance(data, dict) and ("agents" in data or "users" in data):
+        return "gateway"
+    return "unknown"
+
+
+def _parse_import_conversations(data, fmt: str) -> list[dict]:
+    """Normalise import payload → list of {id, session_id, messages, created_at}."""
+    convs: list[dict] = []
+
+    if fmt == "claude_ai":
+        for c in data:
             msgs = []
-            for m in conv.get("chat_messages", []):
+            for m in c.get("chat_messages", []):
                 role = "user" if m.get("sender") == "human" else "assistant"
-                text = str(m.get("text") or "").strip()
+                text = m.get("text") or ""
+                if isinstance(text, list):
+                    text = " ".join(
+                        b.get("text", "") if isinstance(b, dict) else str(b) for b in text
+                    )
+                text = str(text).strip()
                 if text:
                     msgs.append({"role": role, "content": text})
             if msgs:
-                conversations.append({
-                    "id":         conv.get("uuid", str(uuid.uuid4())),
-                    "session_id": str(conv.get("name", ""))[:64],
+                convs.append({
+                    "id":         c.get("uuid", str(uuid.uuid4())),
+                    "session_id": str(c.get("name", ""))[:64],
                     "messages":   msgs,
-                    "created_at": conv.get("created_at", datetime.utcnow().isoformat()),
+                    "created_at": c.get("created_at", datetime.utcnow().isoformat()),
                 })
-    elif isinstance(data, dict) and ("agents" in data or "users" in data):
-        # Gateway export: extract conversations from every agent bucket
+
+    elif fmt == "typingmind":
+        for c in data:
+            msgs = []
+            for m in c.get("messages", []):
+                role = m.get("role", "")
+                if role not in ("user", "assistant"):
+                    continue
+                content = m.get("content", "") or ""
+                if isinstance(content, list):
+                    content = " ".join(
+                        b.get("text", "") if isinstance(b, dict) else str(b) for b in content
+                    )
+                content = str(content).strip()
+                if content:
+                    msgs.append({"role": role, "content": content})
+            if not msgs:
+                continue
+            # TypingMind timestamps are milliseconds
+            ts = c.get("createdAt") or c.get("created_at")
+            if isinstance(ts, (int, float)) and ts > 1e10:
+                ts = datetime.utcfromtimestamp(ts / 1000).isoformat()
+            elif not isinstance(ts, str):
+                ts = datetime.utcnow().isoformat()
+            convs.append({
+                "id":         c.get("id", str(uuid.uuid4())),
+                "session_id": str(c.get("title", ""))[:64],
+                "messages":   msgs,
+                "created_at": ts,
+            })
+
+    elif fmt == "gateway":
         agents_data = data.get("agents") or data.get("users", {})
-        for aid, adata in agents_data.items():
-            for conv in adata.get("conversations", []):
-                conversations.append(conv)
-    else:
-        raise HTTPException(
-            400,
-            "Unknown format. Supported: Claude.ai export (list) or gateway export (dict with 'agents' key).",
-        )
+        for _aid, adata in agents_data.items():
+            for c in adata.get("conversations", []):
+                convs.append(c)
 
-    # ── process ───────────────────────────────────────────────────────────────
-    imported = skipped = 0
+    return convs
 
-    for conv in conversations:
+
+async def _run_conv_import_job(job_id: str, agent_id: str, convs: list) -> None:
+    """Background task: insert → LLM distill → Qdrant embed per conversation."""
+    job = _conv_import_jobs[job_id]
+    job["status"] = "running"
+
+    for conv in convs:
         msgs = conv.get("messages", [])
         if not msgs:
-            skipped += 1
+            job["skipped"] += 1
+            job["done"] += 1
             continue
 
         cid = conv.get("id", str(uuid.uuid4()))
         sid = str(conv.get("session_id") or cid[:8])
         try:
             dt = datetime.fromisoformat(
-                str(conv.get("created_at", "")).replace("Z", "+00:00"))
+                str(conv.get("created_at", "")).replace("Z", "").split("+")[0]
+            )
         except Exception:
             dt = datetime.utcnow()
 
-        async with _db_pool.acquire() as conn:
-            result = await conn.execute(
-                "INSERT INTO conversations (id,agent_id,session_id,messages,created_at) "
-                "VALUES ($1,$2,$3,$4,$5) ON CONFLICT (id) DO NOTHING",
-                cid, agent_id, sid, json.dumps(msgs), dt,
-            )
-        if result.endswith(" 0"):
-            skipped += 1
+        # 1. Persist to PostgreSQL (idempotent)
+        try:
+            async with _db_pool.acquire() as conn:
+                result = await conn.execute(
+                    "INSERT INTO conversations (id,agent_id,session_id,messages,created_at) "
+                    "VALUES ($1,$2,$3,$4,$5) ON CONFLICT (id) DO NOTHING",
+                    cid, agent_id, sid, json.dumps(msgs), dt,
+                )
+            if result.endswith(" 0"):   # duplicate
+                job["skipped"] += 1
+                job["done"] += 1
+                continue
+        except Exception as e:
+            print(f"[conv_import] {job_id} db: {e}")
+            job["errors"] += 1
+            job["done"] += 1
             continue
 
-        imported += 1
-        # LLM distillation into Palimpsest L1-L4
-        await _distill_and_store(agent_id, sid, msgs)
+        job["imported"] += 1
 
-    return {"imported": imported, "skipped": skipped}
+        # 2. LLM distillation → Palimpsest L1-L4 (best-effort, 120s cap)
+        try:
+            await asyncio.wait_for(_distill_and_store(agent_id, sid, msgs), timeout=120)
+            job["memories_created"] += 1
+        except asyncio.TimeoutError:
+            print(f"[conv_import] {job_id} distill timeout — skipping")
+        except Exception as e:
+            print(f"[conv_import] {job_id} distill: {e}")
+
+        # 3. Qdrant embedding (best-effort)
+        try:
+            await _ingest_conv_to_qdrant(agent_id, msgs, conversation_id=cid)
+            job["embedded"] += 1
+        except Exception as e:
+            print(f"[conv_import] {job_id} embed: {e}")
+
+        job["done"] += 1
+
+    job["status"] = "done"
+    print(f"[conv_import] {job_id} finished: "
+          f"imported={job['imported']} skipped={job['skipped']} "
+          f"memories={job['memories_created']} embedded={job['embedded']}")
+
+
+# ── Import conversations endpoint (async, job-based) ──────────────────────────
+@app.post("/admin/api/import/conversations")
+async def import_conversations(
+    agent_id: str = Form(...),
+    file: UploadFile = File(...),
+    _=Depends(_require_key),
+):
+    """Accept Claude.ai / TypingMind / gateway export JSON.
+
+    Returns immediately with a job_id. Poll
+    GET /admin/api/import/conversations/status/{job_id} for progress.
+    Processing: DB insert → LLM distillation (L1-L4) → Qdrant embedding.
+    """
+    raw = await file.read()
+    try:
+        data = json.loads(raw)
+    except Exception:
+        raise HTTPException(400, "Invalid JSON file")
+
+    fmt = _detect_import_format(data)
+    if fmt == "unknown":
+        raise HTTPException(
+            400,
+            "Unknown format. Supported: Claude.ai export (list with chat_messages), "
+            "TypingMind export (list with messages+role), "
+            "gateway export (dict with agents key).",
+        )
+
+    convs = _parse_import_conversations(data, fmt)
+    if not convs:
+        raise HTTPException(400, "No conversations found in file")
+
+    job_id = str(uuid.uuid4())[:8]
+    _conv_import_jobs[job_id] = {
+        "status":          "pending",
+        "format":          fmt,
+        "agent_id":        agent_id,
+        "total":           len(convs),
+        "done":            0,
+        "imported":        0,
+        "skipped":         0,
+        "errors":          0,
+        "memories_created": 0,
+        "embedded":        0,
+    }
+    asyncio.create_task(_run_conv_import_job(job_id, agent_id, convs))
+    return {"job_id": job_id, "total": len(convs), "format": fmt}
+
+
+@app.get("/admin/api/import/conversations/status/{job_id}")
+async def import_conv_status(job_id: str, _=Depends(_require_key)):
+    """Poll the progress of a conversation import job."""
+    job = _conv_import_jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return job
 
 
 @app.post("/api/activity/{agent_id}")
@@ -10195,6 +10755,28 @@ async def r2_verify(days: int = 7, _=Depends(_require_key)):
     """
     report = await _verify_r2_backups(days=days)
     return report
+
+
+@app.get("/admin/api/music/history")
+async def music_history_api(agent_id: str, limit: int = 20, _=Depends(_require_key)):
+    """Return recent music recommendation history for an agent."""
+    items = await _music_hist_list(agent_id=agent_id, limit=limit)
+    return {"items": items, "total": len(items)}
+
+
+@app.post("/admin/api/music/test")
+async def music_test_api(body: dict, _=Depends(_require_key)):
+    """Manually trigger a music recommendation for testing.
+    Body: {"agent_id": "chiaki", "trigger_mode": "scheduled", "force": true}
+    force=true bypasses quiet hours and daily push limit checks.
+    """
+    agent_id = body.get("agent_id", "")
+    trigger_mode = body.get("trigger_mode", "scheduled")
+    force = bool(body.get("force", False))
+    if not agent_id:
+        raise HTTPException(400, "agent_id required")
+    ok = await _music_pick_and_send(agent_id, trigger_mode=trigger_mode, force=force)
+    return {"ok": ok}
 
 
 @app.get("/admin/api/telegram/status")

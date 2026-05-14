@@ -167,7 +167,7 @@
         <option value="character">Character — Gateway proxies tools (roleplay)</option>
       </select>
     </div>
-    <div class="form-g" style="display:flex;gap:20px;align-items:center">
+    <div class="form-g" style="display:flex;gap:20px;align-items:center;flex-wrap:wrap">
       <label style="display:flex;align-items:center;gap:7px;cursor:pointer;font-size:11px">
         <input type="checkbox" id="sMcpEnabled" style="width:14px;height:14px">
         <span>MCP Enabled</span>
@@ -175,6 +175,10 @@
       <label style="display:flex;align-items:center;gap:7px;cursor:pointer;font-size:11px">
         <input type="checkbox" id="sAutoMemory" style="width:14px;height:14px">
         <span>Auto Memory <span style="opacity:.5;font-size:10px">(nightly extraction)</span></span>
+      </label>
+      <label style="display:flex;align-items:center;gap:7px;cursor:pointer;font-size:11px" title="Strip tools/function_call from request before sending to LLM (for models that don't support tool use)">
+        <input type="checkbox" id="sStubborn" style="width:14px;height:14px">
+        <span>死脑筋兼容 <span style="opacity:.5;font-size:10px">(剥离 tools)</span></span>
       </label>
     </div>
     <div class="form-g" id="sProxyCfgG" style="display:none">
@@ -269,7 +273,7 @@
 
     <div class="bk-section">
       <div class="bk-head">Import Conversations <span style="font-size:9px;opacity:.55;font-weight:400">AI extraction</span></div>
-      <div class="bk-desc">Import Claude.ai or gateway export JSON — LLM will extract memories from each conversation.</div>
+      <div class="bk-desc">Import Claude.ai / TypingMind / gateway export JSON — LLM distils memories, vectors go to Qdrant.</div>
       <div class="form-g" style="margin-bottom:10px">
         <label class="form-lbl">Target Agent</label>
         <select class="form-sel" id="histAgentSel"></select>
@@ -282,10 +286,20 @@
       <div id="histPreview" style="display:none;margin-top:8px">
         <div class="bk-stats">
           <div class="bk-stat"><div class="bk-stat-n" id="histConvCount">0</div><div class="bk-stat-l">Conversations</div></div>
+          <div class="bk-stat"><div class="bk-stat-n" id="histFmtBadge" style="font-size:11px">—</div><div class="bk-stat-l">Format</div></div>
         </div>
         <div style="display:flex;gap:10px;align-items:center;margin-top:8px">
           <button class="btn btn-p" id="histImportBtn" onclick="confirmHistImport()">Import &amp; Extract</button>
-          <span style="font-size:10px;color:var(--muted)">Each conversation analysed by LLM — may take a while</span>
+          <span style="font-size:10px;color:var(--muted)">Runs in background — DB + LLM distil + Qdrant embed</span>
+        </div>
+      </div>
+      <div id="histProgress" style="display:none;margin-top:10px">
+        <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+          <span id="histProgressLabel" style="font-size:11px;color:var(--muted)">Processing…</span>
+          <span id="histProgressPct" style="font-size:11px;color:var(--muted)">0%</span>
+        </div>
+        <div style="background:var(--ghost-bg);border-radius:4px;height:6px;overflow:hidden">
+          <div id="histProgressBar" style="background:var(--accent);height:100%;width:0%;transition:width .5s ease"></div>
         </div>
       </div>
       <div class="bk-result" id="histResult"></div>
@@ -419,8 +433,8 @@
 <div class="toasts" id="toastWrap"></div>
 
 <script src="/static/js/api.js?v=6"></script>
-<script src="/static/js/memory.js?v=14"></script>
-<script src="/static/js/backup.js?v=3"></script>
+<script src="/static/js/memory.js?v=15"></script>
+<script src="/static/js/backup.js?v=4"></script>
 <script src="/static/js/books.js?v=12"></script>
 <script src="/static/js/providers.js?v=3"></script>
 <script src="/static/js/mcp.js?v=4"></script>
@@ -428,6 +442,6 @@
 <script src="/static/js/worldbook.js?v=2"></script>
 <script src="/static/js/user.js?v=2"></script>
 <script src="/static/js/timeline.js?v=2"></script>
-<script src="/static/js/engine.js?v=4"></script>
+<script src="/static/js/engine.js?v=5"></script>
 </body>
 </html>

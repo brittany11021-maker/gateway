@@ -39,16 +39,23 @@ function _switchEngSub(tab) {
 async function _loadEngConfig() {
   const sub = document.getElementById('eng-sub');
   try {
-    const [routesResp, tzResp, morningResp, eveningResp, pushResp, newsResp, healthResp] = await Promise.all([
-      apiFetch('/admin/api/config/api-routes').catch(()   => ({})),
-      apiFetch('/admin/api/config/timezone').catch(()     => ({})),
-      apiFetch('/admin/api/config/morning-push').catch(() => ({})),
-      apiFetch('/admin/api/config/evening-push').catch(() => ({})),
-      apiFetch('/admin/api/config/push-control').catch(() => ({})),
-      apiFetch('/admin/api/config/news').catch(()         => ({})),
-      apiFetch('/admin/api/config/health').catch(()       => ({})),
+    const [routesResp, tzResp, morningResp, eveningResp, pushResp, newsResp, healthResp,
+           musicResp, accumResp, sysInfoResp] = await Promise.all([
+      apiFetch('/admin/api/config/api-routes').catch(()    => ({})),
+      apiFetch('/admin/api/config/timezone').catch(()      => ({})),
+      apiFetch('/admin/api/config/morning-push').catch(()  => ({})),
+      apiFetch('/admin/api/config/evening-push').catch(()  => ({})),
+      apiFetch('/admin/api/config/push-control').catch(()  => ({})),
+      apiFetch('/admin/api/config/news').catch(()          => ({})),
+      apiFetch('/admin/api/config/health').catch(()        => ({})),
+      apiFetch('/admin/api/config/music').catch(()         => ({})),
+      apiFetch('/admin/api/config/accumulator').catch(()   => ({})),
+      apiFetch('/admin/api/config/system-info').catch(()   => ({})),
     ]);
-    sub.innerHTML = _buildConfigPanel(routesResp, tzResp, morningResp, eveningResp, pushResp, newsResp, healthResp);
+    sub.innerHTML = _buildConfigPanel(
+      routesResp, tzResp, morningResp, eveningResp, pushResp, newsResp, healthResp,
+      musicResp, accumResp, sysInfoResp
+    );
   } catch(e) {
     sub.innerHTML = `<div class="page-loading" style="color:var(--danger)">Error: ${e}</div>`;
   }
@@ -67,7 +74,8 @@ function _tzOpts(selected) {
   ).join('');
 }
 
-function _buildConfigPanel(routesResp, tzResp, morningResp, eveningResp, pushResp, newsResp, healthResp) {
+function _buildConfigPanel(routesResp, tzResp, morningResp, eveningResp, pushResp, newsResp, healthResp,
+                           musicResp, accumResp, sysInfoResp) {
   // ── API Routes ───────────────────────────────────────────────────────────
   // GET /admin/api/config/api-routes → {routes: {proactive_push:{…}, analyzer:{…}}}
   const rMap = routesResp.routes || {};
@@ -275,6 +283,15 @@ function _buildConfigPanel(routesResp, tzResp, morningResp, eveningResp, pushRes
     <!-- ── Health Config ── -->
     ${_buildHealthPanel(healthResp)}
 
+    <!-- ── Music Config ── -->
+    ${_buildMusicPanel(musicResp)}
+
+    <!-- ── Accumulator Thresholds ── -->
+    ${_buildAccumulatorCfgPanel(accumResp)}
+
+    <!-- ── System Info ── -->
+    ${_buildSystemInfoPanel(sysInfoResp)}
+
   </div>`;
 }
 
@@ -359,7 +376,7 @@ function _buildNewsPanel(newsResp) {
   _newsFeeds = (cfg.feeds && cfg.feeds.length)
     ? cfg.feeds.map(f => ({ ...f }))
     : [
-        { name:'澎湃要闻',   url:'https://rsshub.app/thepaper/newsDetail/25',       category:'china',      enabled:true,  skip_first:1 },
+        { name:'虎嗅',       url:'https://rsshub.app/huxiu/article',               category:'china',      enabled:true  },
         { name:'联合早报',   url:'https://rsshub.app/zaobao/realtime/china',         category:'china',      enabled:true  },
         { name:'Dezeen',     url:'https://www.dezeen.com/feed/',                    category:'art_design', enabled:true  },
         { name:'Colossal',   url:'https://www.thisiscolossal.com/feed/',            category:'art_design', enabled:true  },
@@ -367,6 +384,9 @@ function _buildNewsPanel(newsResp) {
         { name:'少数派',     url:'https://sspai.com/feed',                          category:'tech',       enabled:false },
         { name:'小红书热门', url:'https://rsshub.app/xiaohongshu/explore',          category:'lifestyle',  enabled:false },
       ];
+
+  const blockKws = Array.isArray(cfg.hard_block_keywords) ? cfg.hard_block_keywords : [];
+  const blockText = blockKws.join('\n');
 
   return `
     <div class="eng-section">
@@ -396,6 +416,17 @@ function _buildNewsPanel(newsResp) {
         <span style="font-size:10px;color:var(--muted)">支持 RSS 2.0 / Atom / RSSHub</span>
       </div>
       <div id="news-feeds-list">${_renderNewsFeedRows()}</div>
+      <details style="margin-top:12px">
+        <summary style="font-size:11px;font-weight:600;cursor:pointer;user-select:none">
+          🚫 硬过滤关键词 <span style="font-weight:400;color:var(--muted)">(每行一个，命中则跳过该条新闻)</span>
+        </summary>
+        <textarea id="news-hard-block" class="form-ta"
+          style="margin-top:6px;min-height:100px;font-size:10px;font-family:monospace;width:100%;box-sizing:border-box"
+          placeholder="每行一个关键词，不区分大小写">${esc(blockText)}</textarea>
+        <div style="font-size:10px;color:var(--muted);margin-top:3px">
+          留空则使用系统默认过滤列表（政治/军事/党政类关键词）
+        </div>
+      </details>
       <button class="btn btn-p" style="margin-top:10px" onclick="_saveNewsCfg()">保存新闻配置</button>
     </div>`;
 }
@@ -439,7 +470,14 @@ async function _saveNewsCfg() {
   const maxItems   = parseInt(document.getElementById('news-max-items')?.value) || 10;
   const injectProb = parseFloat(document.getElementById('news-inject-prob')?.value) || 0.30;
   const validFeeds = _newsFeeds.filter(f => f.url && f.url.trim());
-  const cfg = { enabled, max_items: maxItems, morning_inject_prob: injectProb, feeds: validFeeds };
+  // Parse hard-block keywords: split by newlines, trim, drop empties
+  const blockRaw = document.getElementById('news-hard-block')?.value || '';
+  const blockKws = blockRaw.split('\n').map(s => s.trim()).filter(Boolean);
+  const cfg = {
+    enabled, max_items: maxItems, morning_inject_prob: injectProb,
+    feeds: validFeeds,
+    hard_block_keywords: blockKws.length ? blockKws : undefined,
+  };
   try {
     await apiFetch('/admin/api/config/news', { method:'POST', body: JSON.stringify({ config: cfg }) });
     toast('新闻配置已保存 ✓');
@@ -539,6 +577,148 @@ async function _saveHealthCfg() {
     await apiFetch('/admin/api/config/health', { method:'POST', body: JSON.stringify({ config: cfg }) });
     toast('健康配置已保存 ✓');
   } catch(e) { toast('保存失败: '+e); }
+}
+
+// ── Music config panel ─────────────────────────────────────────────────────
+function _buildMusicPanel(musicResp) {
+  const cfg     = (musicResp && musicResp.config) || {};
+  const enabled = cfg.enabled !== false;
+  const timeUtc = cfg.daily_time_utc   || '07:00';
+  const prob    = cfg.daily_probability ?? 0.35;
+  const cooldown= cfg.cooldown_hours    ?? 48;
+  const kws     = Array.isArray(cfg.mood_low_keywords)
+    ? cfg.mood_low_keywords.join(', ')
+    : '治愈, 温暖, 陪伴, 轻柔';
+
+  return `
+    <div class="eng-section">
+      <div class="eng-section-head">🎵 音乐推荐配置
+        <span style="font-size:10px;font-weight:400;color:var(--muted);margin-left:6px">每日定时 + 心情低落触发</span>
+      </div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">
+        <label style="display:flex;align-items:center;gap:7px;cursor:pointer;font-size:11px;align-self:flex-end;padding-bottom:2px">
+          <input type="checkbox" id="music-enabled" ${enabled?'checked':''}
+            style="accent-color:#8b5cf6;width:14px;height:14px">
+          <span>启用音乐推荐</span>
+        </label>
+        <div>
+          <label class="form-lbl">每日触发时间 <span style="opacity:.5">(UTC)</span></label>
+          <input class="form-in" id="music-time-utc" value="${esc(timeUtc)}"
+            style="width:80px" placeholder="07:00">
+        </div>
+        <div>
+          <label class="form-lbl">每日触发概率</label>
+          <input class="form-in" id="music-prob" type="number" min="0" max="1" step="0.05"
+            value="${+prob}" style="width:70px">
+        </div>
+        <div>
+          <label class="form-lbl">冷却时间 <span style="opacity:.5">(小时)</span></label>
+          <input class="form-in" id="music-cooldown" type="number" min="1" max="168"
+            value="${+cooldown}" style="width:70px">
+        </div>
+      </div>
+      <div style="margin-top:8px">
+        <label class="form-lbl">心情低落触发关键词 <span style="opacity:.5">(逗号分隔，出现在对话时触发推荐)</span></label>
+        <input class="form-in" id="music-mood-kws" value="${esc(kws)}"
+          style="width:100%;box-sizing:border-box" placeholder="治愈, 温暖, 陪伴, 轻柔">
+      </div>
+      <button class="btn btn-p" style="margin-top:10px" onclick="_saveMusicCfg()">保存音乐配置</button>
+    </div>`;
+}
+
+async function _saveMusicCfg() {
+  const enabled = document.getElementById('music-enabled')?.checked ?? true;
+  const timeUtc = document.getElementById('music-time-utc')?.value.trim() || '07:00';
+  const prob    = parseFloat(document.getElementById('music-prob')?.value) || 0.35;
+  const cooldown= parseInt(document.getElementById('music-cooldown')?.value) || 48;
+  const kwsRaw  = document.getElementById('music-mood-kws')?.value || '';
+  const kws     = kwsRaw.split(',').map(s => s.trim()).filter(Boolean);
+  const cfg = {
+    enabled, daily_time_utc: timeUtc,
+    daily_probability: prob, cooldown_hours: cooldown,
+    mood_low_keywords: kws,
+  };
+  try {
+    await apiFetch('/admin/api/config/music', { method:'POST', body: JSON.stringify({ config: cfg }) });
+    toast('音乐配置已保存 ✓');
+  } catch(e) { toast('保存失败: '+e); }
+}
+
+// ── Accumulator thresholds config panel ────────────────────────────────────
+const _ACC_CFG_META = [
+  { key:'miss_you', label:'💜 思念值', maxDef:10.0 },
+  { key:'low_mood', label:'💙 低落值', maxDef:8.0  },
+];
+
+function _buildAccumulatorCfgPanel(accumResp) {
+  const cfg = (accumResp && accumResp.config) || {};
+  const rows = _ACC_CFG_META.map(a => {
+    const c   = cfg[a.key] || {};
+    const thr = c.threshold ?? a.maxDef;
+    const rst = c.reset     ?? 0.0;
+    return `
+      <div style="border:1px solid var(--border);border-radius:8px;padding:10px 14px;min-width:180px;flex:1">
+        <div style="font-size:11px;font-weight:600;margin-bottom:8px">${a.label}</div>
+        <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+          <div>
+            <label class="form-lbl">触发阈值</label>
+            <input class="form-in" id="acc-thr-${a.key}" type="number" min="0" max="100" step="0.5"
+              value="${+thr}" style="width:80px">
+          </div>
+          <div>
+            <label class="form-lbl">触发后重置为</label>
+            <input class="form-in" id="acc-rst-${a.key}" type="number" min="0" max="100" step="0.5"
+              value="${+rst}" style="width:80px">
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="eng-section">
+      <div class="eng-section-head">💧 蓄水池阈值配置
+        <span style="font-size:10px;font-weight:400;color:var(--muted);margin-left:6px">达到阈值时发送主动消息，消息后重置为指定值</span>
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">${rows}</div>
+      <button class="btn btn-p" style="margin-top:10px" onclick="_saveAccumulatorCfg()">保存阈值配置</button>
+    </div>`;
+}
+
+async function _saveAccumulatorCfg() {
+  const cfg = {};
+  for (const a of _ACC_CFG_META) {
+    cfg[a.key] = {
+      threshold: parseFloat(document.getElementById(`acc-thr-${a.key}`)?.value) || a.maxDef,
+      reset:     parseFloat(document.getElementById(`acc-rst-${a.key}`)?.value) || 0.0,
+    };
+  }
+  try {
+    await apiFetch('/admin/api/config/accumulator', { method:'POST', body: JSON.stringify({ config: cfg }) });
+    toast('阈值配置已保存 ✓');
+  } catch(e) { toast('保存失败: '+e); }
+}
+
+// ── System info panel (read-only) ──────────────────────────────────────────
+function _buildSystemInfoPanel(sysInfoResp) {
+  const s = sysInfoResp || {};
+  const rows = [
+    { label:'蒸馏模型 (DISTILL_MODEL)',   val: s.distill_model  || '—' },
+    { label:'向量 Provider (EMBED_PROVIDER)', val: s.embed_provider || '—' },
+    { label:'RSSHub URL',                 val: s.rsshub_url     || '—' },
+    { label:'网关公网 URL',               val: s.gateway_url    || '—' },
+  ];
+  const rowsHtml = rows.map(r => `
+    <div style="display:flex;gap:8px;align-items:baseline;padding:4px 0;border-bottom:1px solid var(--ghost-bg)">
+      <span style="font-size:10px;color:var(--muted);white-space:nowrap;min-width:220px">${esc(r.label)}</span>
+      <code style="font-size:11px;color:var(--accent);word-break:break-all">${esc(r.val)}</code>
+    </div>`).join('');
+  return `
+    <div class="eng-section">
+      <div class="eng-section-head">ℹ️ 系统信息
+        <span style="font-size:10px;font-weight:400;color:var(--muted);margin-left:6px">环境变量（只读，需在 .env 中修改后重启）</span>
+      </div>
+      ${rowsHtml}
+    </div>`;
 }
 
 function _getChannels(tgId, bkId) {

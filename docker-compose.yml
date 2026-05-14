@@ -18,6 +18,16 @@ services:
       - postgres_data:/var/lib/postgresql/data
     # 不对外暴露
 
+  rsshub:
+    image: diygod/rsshub:latest
+    restart: unless-stopped
+    environment:
+      NODE_ENV:      production
+      CACHE_TYPE:    memory
+      CACHE_EXPIRE:  600          # 10 min cache per feed
+      DISALLOW_ROBOT: "1"         # 不收录搜索引擎
+    # 不对外暴露，只供 gateway 内网访问
+
   gateway:
     build: ./gateway
     restart: unless-stopped
@@ -27,9 +37,10 @@ services:
     env_file:
       - .env                    # 自动透传所有 PROVIDER_API_KEY / AGENT_* / API_CHAIN_* 变量
     environment:
-      POSTGRES_DSN: postgresql://memory_user:${POSTGRES_PASSWORD}@postgres:5432/memory_db
-      QDRANT_URL:   http://qdrant:6333
+      POSTGRES_DSN:  postgresql://memory_user:${POSTGRES_PASSWORD}@postgres:5432/memory_db
+      QDRANT_URL:    http://qdrant:6333
       HEALTH_MCP_URL: http://172.17.0.1:8100   # host systemd health-api service
+      RSSHUB_URL:    http://rsshub:1200         # 自建 RSSHub，替代 rsshub.app
     volumes:
       - ./backups:/app/backups
       - ./gateway/static:/app/static
@@ -37,6 +48,7 @@ services:
     depends_on:
       - qdrant
       - postgres
+      - rsshub
 
   sillytavern:
     image: ghcr.io/sillytavern/sillytavern:latest

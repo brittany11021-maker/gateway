@@ -582,6 +582,7 @@ function openSettingsByAid(aid, event) {
     document.getElementById('sAgentType').value = atype;
     document.getElementById('sMcpEnabled').checked = d.mcp_enabled !== false;
     document.getElementById('sAutoMemory').checked = !!d.auto_memory;
+    document.getElementById('sStubborn').checked   = !!d.mcp_stubborn_compat;
     const pcfg = d.mcp_proxy_config || {};
     document.getElementById('sProxyCfg').value = Object.keys(pcfg).length
       ? JSON.stringify(pcfg, null, 2) : '';
@@ -658,7 +659,8 @@ async function saveSettings() {
     avatar:           document.getElementById('sAvatar').value.trim(),
     agent_type:       document.getElementById('sAgentType').value,
     mcp_enabled:      document.getElementById('sMcpEnabled').checked,
-    auto_memory:      document.getElementById('sAutoMemory').checked,
+    auto_memory:          document.getElementById('sAutoMemory').checked,
+    mcp_stubborn_compat:  document.getElementById('sStubborn').checked,
     mcp_proxy_config,
     llm_chain_config,
     system_prompt:    document.getElementById('sSysPrompt').value,

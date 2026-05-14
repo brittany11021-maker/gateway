@@ -399,27 +399,28 @@ event_roll / event_list / event_add / event_delete
 - ✅ **P3 Timeline 可视化**：`/timeline/` 路由 + dashboard-data.json + timeline.js（main.py 行 10312-10696, static/js/timeline.js）
 - ✅ **P3 推送日志/可观测性**：`push_log` 表 + `push_log_write()` 记录所有推送决策 + `/api/push-log` 端点 + engine.js 前端展示（memory_db.py 行 1368-1595, engine.js 行 861+）
 - ✅ **R2 自动备份**：`_r2_upload()` 实现（main.py 行 10031-10063），nightly 任务上传 daily/ 对话+DB 到 R2（行 3771-3774），前端有 R2 开关（admin.html 行 329）
+- ✅ **音乐推荐系统**：`_music_pick_and_send()` + `_music_recommend_loop()` + `music_history` 表，三种触发模式，chiaki 语气渲染 + Telegram 推送。2026-05-14 验证通过。
 
 ### 记忆系统待完成
 
 - [x] **B4 Dedup cosine 阈值对齐**：`memory_write_smart()` cosine 路径已是 0.95/0.80/0.55（正确），0.85/0.55/0.25 是 Jaccard fallback 的阈值，两套算法各自独立，无需修改
 - [x] **B7 L5 完全废弃**：删除 `l5_write`/`l5_search`/`l5_list`/`l5_cleanup` 导入（main.py）、`_generate_l5_summary` no-op 函数、3条 `/api/admin/l5` 路由、timeline 结构里的 L5 条目；memory.js 里删除 TIER_CFG l5 条目、路由分支、`loadDetailL5` 和 `delL5Summary` 函数。2026-05-14 已部署。
-- [ ] **Hybrid 搜索**：Qdrant 同一 collection 内 dense + sparse vector（BM25），RRF 融合（向量搜索文档 §2.4）——低优先级，当前 dense-only 表现够用
-- [ ] **A4 历史对话 JSON 导入**：写清洗+分块+embedding 的 ingestion 脚本，支持 claude_ai / typingmind / gateway 三种格式适配（向量搜索文档 §5.1）
-- [ ] **daily_life Qdrant collection**：Phase B 选做，character 日常事件向量化（向量搜索文档 §1.2）
+- ~~[ ] **Hybrid 搜索**~~：**决定不做** — dense-only 在 0.40 阈值下表现够用，Qdrant sparse index 基础设施改动大，收益边际低。
+- [x] **A4 历史对话 JSON 导入**：`_detect_import_format()` + `_parse_import_conversations()` + `_run_conv_import_job()` 异步 job；支持 claude_ai / typingmind / gateway 三种格式；pipeline：DB INSERT → LLM distillation (120s cap) → Qdrant embed；`POST /admin/api/import/conversations`（multipart）返回 job_id，`GET /admin/api/import/conversations/status/{job_id}` 轮询进度；前端 backup.js 进度条 + 格式自动识别徽章。同步修复 `_call_llm_cheap` 新增 deepseek 官方 API fallback（NVIDIA 宕机时自动切换）。2026-05-14 完成。
+- ~~[ ] **daily_life Qdrant collection**~~：**决定不做** — daily_events 已全量注入 `_process_character_mcp()`，语义检索意义有限。
 - [x] **MCP tool 描述更新**：`palimpsest_search` 工具目录（行 9936）改为 "Semantic search (Qdrant vector, FTS5 fallback)"；HTTP endpoint docstring（行 9689）同步更新
 
-### 音乐系统待完成（P2）
+### 音乐系统（全部完成）
 
 - [x] **Cloud Music MCP 迁移到 Oracle VPS**：服务已从腾讯云迁移至 Oracle VPS（161.118.195.9），以 Docker 容器运行（端口 3011，内网绑定）。访问地址：`https://palimpsest.513129.xyz/cloud-music/mcp`。腾讯云已停止 cloud-music 容器并移除 nginx 块。2026-05-14 完成。
-- [ ] **音乐推荐集成到主动消息**：2-3次/周，定时/情绪关联/关键词三种触发模式，角色视角选歌 + curation prompt（执行文档 §14.2-14.3）。cloud-music-mcp 已作为独立 Docker 服务存在但未接入 main.py 的推送逻辑
-- [ ] **音乐记忆学习**：记录推荐历史避免重复，追踪用户反馈调整方向（执行文档 §14.4）
+- [x] **音乐推荐集成到主动消息**：三种触发（scheduled 35%/day、keyword、mood_low/high）+ `_music_pick_and_send()` + `_music_recommend_loop()`（07:00 UTC）。chiaki 语气渲染 + Telegram 推送 + 48h 冷却。2026-05-14 完成，端到端验证通过。
+- [x] **音乐记忆学习**：`music_history` 表（SQLite，含 song_id/agent_id/trigger_mode/reaction）+ `_music_hist_*` 函数 + 30天内推荐过的歌自动过滤去重。`/admin/api/music/history` 查询端点。2026-05-14 完成。
 
-### 其他待完成
+### 其他杂项
 
-- [ ] **死脑筋模型兼容模式**：对不擅长 tool use 的模型，网关预查询 MCP 结果写进 system prompt（执行文档 §12.4）——当前所有 character 都走 keyword/intent 代理触发，但结果注入格式可优化
-- [ ] **配置面板 UI 整合**：执行文档 §9 描述的完整 React/Vue 单页配置面板。当前有 engine.js 展示状态引擎 + user.js 用户配置 + admin.html 各 tab，但缺一个统一的「配置总控台」（API 线路/推送参数/冷却时间等集中编辑）
-- [ ] **RSSHub 自建实例**：VPS Docker 部署自建 RSSHub，避免公共实例限速不稳定（执行文档 §13.5）——当前直接用 rsshub.app 公共实例
+- [ ] **死脑筋模型兼容模式**（→ 见路线图 Phase A-2）
+- [ ] **配置面板 UI 整合**（→ 见路线图 Phase A-1）
+- [x] **RSSHub 自建实例**：`diygod/rsshub:latest` 加入 docker-compose.yml，内网访问（不暴露端口）；gateway 新增 `RSSHUB_URL: http://rsshub:1200`；`_RSSHUB_BASE` 读取 env，默认 fallback `rsshub.app`；澎湃路由在新版 RSSHub 已删除且 thepaper.com 对 VPS IP 返回 403，替换为虎嗅 `/huxiu/article`（200 ✅）；联合早报 `/zaobao/realtime/china` 同样 200 ✅。2026-05-14 完成。
 - [x] **GitHub 代码自动同步**：`/opt/scripts/git-sync.sh`，cron `0 3 * * *`（03:00 CST）。`git add -A`（遵守 .gitignore）→ 有变更则 commit `chore: auto-sync YYYY-MM-DD (N file(s) changed)` → push。无变更静默退出 0。日志 `/var/log/git-sync.log`（自动轮转保留 500 行）。2026-05-14 已部署，首次 push 同时整理了 .gitignore（排除 build artifacts 和旧位置副本）。
 - [x] **备份验证**：`_weekly_backup_verify_loop()` 每周一 01:00 UTC（09:00 CST）检查过去7天 R2 备份完整性，缺失或不完整时发 Telegram 告警。手动触发端点：`GET /admin/api/backup/r2/verify?days=7`。R2 未启用时自动跳过。2026-05-14 已部署。
 
@@ -489,3 +490,51 @@ curl http://43.159.56.67:6333/collections
 # 回填现有记忆到 Qdrant（仅首次）
 # 见 /tmp/backfill.py（已于2025-05执行过，73条）
 ```
+
+---
+
+## 十七、路线图（2026-05 起）
+
+> 顺序即优先级，每个阶段完成后再开始下一个。
+
+### Phase A — 功能收尾（当前 session）
+
+| # | 任务 | 状态 | 说明 |
+|---|------|------|------|
+| A-1 | **配置面板 UI 整合** | 🔧 进行中 | 把 API 线路、推送参数、冷却、新闻/音乐开关等散落配置收拢到一个 Settings tab。纯前端 + 现有 API，无需改后端逻辑。 |
+| A-2 | **死脑筋模型兼容** | ⏳ 待做 | 对不擅长 tool use 的模型，`MCP_STUBBORN_MODEL_COMPAT` 开关：预查询 MCP → 把结果作为文本写入 system prompt，绕开 tool call 流程（执行文档 §12.4）。 |
+
+### Phase B — 代码三端归档
+
+| # | 任务 | 状态 | 说明 |
+|---|------|------|------|
+| B-1 | **代码推 GitHub main** | ⏳ 待做 | Phase A 完成后手动 `git push`，确保 main 分支是最新稳定版本。 |
+| B-2 | **同步到 Oracle VPS** | ⏳ 待做 | Oracle VPS（161.118.195.9）：`git pull` 或 scp 关键文件，保持和腾讯云代码一致。考虑在 Oracle 也跑一份只读副本（不启动主服务，仅作冷备）。 |
+
+### Phase C — 新功能（需 Notion 文档先行）
+
+| # | 任务 | 状态 | 说明 |
+|---|------|------|------|
+| C-1 | **TTS / 缓存命中** | 📄 文档阶段 | 先在 Claude.ai chat 整理需求 → 输出 Notion 执行文档 → 再按文档实现。候选方案：OpenAI TTS API / 本地 Edge-TTS / 流式 KV 缓存命中减少首字延迟。 |
+
+### Phase D — 集成测试
+
+| # | 任务 | 状态 | 说明 |
+|---|------|------|------|
+| D-1 | **创建测试 agents/chars** | ⏳ 待做 | 在 admin 面板创建 `test_agent1` / `test_agent2`（agent 类型）、`test_char1` / `test_char2`（character 类型）。 |
+| D-2 | **功能完整性测试** | ⏳ 待做 | 对每个 test agent/char 跑若干轮对话，验证：记忆写入→蒸馏→Qdrant embed→RAG 注入、角色状态变化、日程捕获、MCP 工具调用、主动推送。 |
+| D-3 | **记忆池隔离验证** | ⏳ 待做 | 向 test_agent1 写入特定记忆，确认 test_agent2 / test_char1 读取不到；验证 `agent_id` 过滤在 SQLite + Qdrant 两侧都生效。 |
+
+### Phase E — 前端重建
+
+| # | 任务 | 状态 | 说明 |
+|---|------|------|------|
+| E-1 | **前端重建** | ⏳ 待做 | 当前 admin.html + 散落 JS 文件结构混乱（tab 耦合、全局变量、无组件复用）。重建目标：模块化 vanilla JS（或轻量框架如 Petite-Vue）、统一路由、清晰 tab 分区、响应式布局。**最后做，范围最大。** |
+
+### 搁置/不做
+
+| 任务 | 理由 |
+|------|------|
+| Hybrid 搜索（BM25 + RRF） | dense-only 表现够用，基础设施改动大，收益边际低 |
+| daily_life Qdrant collection | daily_events 已全量注入，语义检索价值有限 |
+| RPG 世界映射 | 不急，等前端重建后再考虑 |

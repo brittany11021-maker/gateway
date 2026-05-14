@@ -1457,8 +1457,129 @@ async def _ensure_p1_tables(db) -> None:
     except Exception:
         pass
 
+    # ── Music recommendation history (§14) ───────────────────────────────────
+    try:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS music_history (
+                id              TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+                agent_id        TEXT NOT NULL,
+                song_id         TEXT NOT NULL,
+                song_name       TEXT NOT NULL,
+                artist          TEXT NOT NULL DEFAULT '',
+                trigger_mode    TEXT NOT NULL DEFAULT 'scheduled',
+                mood_tag        TEXT NOT NULL DEFAULT '',
+                recommended_at  INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                reaction        TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_music_hist_agent
+                ON music_history(agent_id, recommended_at);
+        """)
+        await db.commit()
+    except Exception:
+        pass
+
     await db.commit()
     _p1_initialized = True
+
+
+# ── Music History ─────────────────────────────────────────────────────────────
+
+_music_hist_initialized = False
+
+async def _ensure_music_history(db) -> None:
+    """Create music_history table if it doesn't exist yet (idempotent migration)."""
+    global _music_hist_initialized
+    if _music_hist_initialized:
+        return
+    try:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS music_history (
+                id              TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+                agent_id        TEXT NOT NULL,
+                song_id         TEXT NOT NULL,
+                song_name       TEXT NOT NULL,
+                artist          TEXT NOT NULL DEFAULT '',
+                trigger_mode    TEXT NOT NULL DEFAULT 'scheduled',
+                mood_tag        TEXT NOT NULL DEFAULT '',
+                recommended_at  INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                reaction        TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_music_hist_agent "
+            "ON music_history(agent_id, recommended_at)"
+        )
+        await db.commit()
+    except Exception:
+        pass
+    _music_hist_initialized = True
+
+
+async def music_history_add(
+    agent_id: str,
+    song_id: str,
+    song_name: str,
+    artist: str = "",
+    trigger_mode: str = "scheduled",
+    mood_tag: str = "",
+) -> str:
+    """Record a music recommendation. Returns the new row id."""
+    import secrets as _sec
+    db = await get_db()
+    await _ensure_music_history(db)
+    row_id = _sec.token_hex(8)
+    await db.execute(
+        "INSERT INTO music_history (id, agent_id, song_id, song_name, artist, trigger_mode, mood_tag) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (row_id, agent_id, song_id, song_name, artist, trigger_mode, mood_tag),
+    )
+    await db.commit()
+    return row_id
+
+
+async def music_history_get_recent_ids(agent_id: str, days: int = 30) -> set:
+    """Return set of song_ids recommended in the past `days` days (to avoid repeats)."""
+    db = await get_db()
+    await _ensure_music_history(db)
+    cur = await db.execute(
+        "SELECT song_id FROM music_history "
+        "WHERE agent_id = ? AND recommended_at > strftime('%s','now',?)",
+        (agent_id, f"-{days} days"),
+    )
+    rows = await cur.fetchall()
+    return {r[0] for r in rows}
+
+
+async def music_history_set_reaction(agent_id: str, song_id: str, reaction: str) -> bool:
+    """Update user reaction ('liked'/'skipped'/'disliked') for the most recent recommendation."""
+    db = await get_db()
+    await _ensure_music_history(db)
+    cur = await db.execute(
+        "UPDATE music_history SET reaction = ? "
+        "WHERE agent_id = ? AND song_id = ? "
+        "AND id = (SELECT id FROM music_history WHERE agent_id = ? AND song_id = ? "
+        "          ORDER BY recommended_at DESC LIMIT 1)",
+        (reaction, agent_id, song_id, agent_id, song_id),
+    )
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def music_history_list(agent_id: str, limit: int = 20) -> list:
+    """Return recent music recommendation history as list of dicts."""
+    db = await get_db()
+    await _ensure_music_history(db)
+    cur = await db.execute(
+        "SELECT id, song_id, song_name, artist, trigger_mode, mood_tag, "
+        "       datetime(recommended_at,'unixepoch') as recommended_at, reaction "
+        "FROM music_history WHERE agent_id = ? "
+        "ORDER BY recommended_at DESC LIMIT ?",
+        (agent_id, limit),
+    )
+    rows = await cur.fetchall()
+    cols = ["id", "song_id", "song_name", "artist", "trigger_mode",
+            "mood_tag", "recommended_at", "reaction"]
+    return [dict(zip(cols, r)) for r in rows]
 
 
 # ── Character State ──────────────────────────────────────────────────────────
@@ -1688,6 +1809,7 @@ _COOLDOWN_DEFAULTS: dict[str, int] = {
     "miss_you_trigger":  7200,    # 2 hours
     "low_mood_trigger":  14400,   # 4 hours
     "reminder":          0,       # no cooldown for explicit reminders
+    "music_recommend":   172800,  # 48 hours — 2-3 times per week
 }
 
 

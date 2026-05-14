@@ -131,6 +131,18 @@ async function confirmImport() {
 }
 
 // ── History import ────────────────────────────────────────────────────────────
+let _histDetectedFmt = '';
+
+function _detectHistFormat(data) {
+  if (Array.isArray(data) && data.length) {
+    if (data[0].chat_messages !== undefined) return 'claude_ai';
+    const msgs = data[0].messages;
+    if (Array.isArray(msgs) && msgs.length && msgs[0].role !== undefined) return 'typingmind';
+  }
+  if (data && (data.agents || data.users)) return 'gateway';
+  return 'unknown';
+}
+
 function previewHistImport(input) {
   const file = input.files[0];
   if (!file) return;
@@ -138,21 +150,27 @@ function previewHistImport(input) {
   document.getElementById('histFileName').textContent = file.name;
   document.getElementById('histPreview').style.display = 'none';
   document.getElementById('histResult').style.display  = 'none';
+  document.getElementById('histProgress').style.display = 'none';
   const reader = new FileReader();
   reader.onload = e => {
     try {
       const data = JSON.parse(e.target.result);
+      _histDetectedFmt = _detectHistFormat(data);
       let count = 0;
-      if (Array.isArray(data) && data.length && data[0].chat_messages !== undefined) {
+      if (_histDetectedFmt === 'claude_ai') {
         count = data.length;
-      } else if (data.agents || data.users) {
+      } else if (_histDetectedFmt === 'typingmind') {
+        count = data.length;
+      } else if (_histDetectedFmt === 'gateway') {
         const agents = data.agents || data.users;
         for (const aid of Object.keys(agents))
           count += (agents[aid].conversations || []).length;
       } else {
-        toast('Unknown format — expected Claude.ai or gateway export'); return;
+        toast('Unknown format — expected Claude.ai, TypingMind, or gateway export'); return;
       }
       document.getElementById('histConvCount').textContent = count;
+      const fmtLabels = { claude_ai: 'Claude.ai', typingmind: 'TypingMind', gateway: 'Gateway' };
+      document.getElementById('histFmtBadge').textContent = fmtLabels[_histDetectedFmt] || _histDetectedFmt;
       document.getElementById('histPreview').style.display = '';
     } catch(err) { toast('Invalid JSON: ' + err.message); }
   };
@@ -164,11 +182,16 @@ async function confirmHistImport() {
   const agent_id = document.getElementById('histAgentSel').value;
   if (!agent_id) { toast('Select a target agent first'); return; }
   const btn = document.getElementById('histImportBtn');
-  const count = document.getElementById('histConvCount').textContent;
+  const total = parseInt(document.getElementById('histConvCount').textContent) || 0;
   btn.disabled = true;
-  btn.textContent = `Importing ${count} conversations…`;
+  btn.textContent = 'Starting…';
   const res = document.getElementById('histResult');
+  const prog = document.getElementById('histProgress');
   res.style.display = 'none';
+  prog.style.display = '';
+  document.getElementById('histProgressBar').style.width = '0%';
+  document.getElementById('histProgressLabel').textContent = 'Uploading…';
+  document.getElementById('histProgressPct').textContent = '0%';
   try {
     const fd = new FormData();
     fd.append('agent_id', agent_id);
@@ -179,13 +202,43 @@ async function confirmHistImport() {
       body: fd,
     });
     if (!resp.ok) { const t = await resp.text(); throw new Error(t); }
-    const d = await resp.json();
-    res.className = 'bk-result ok';
-    res.innerHTML = `✓ Done &nbsp;·&nbsp; Imported: <strong>${d.imported}</strong> &nbsp;·&nbsp; Memories extracted: <strong>${d.memories_created}</strong> &nbsp;·&nbsp; Skipped: ${d.skipped}`;
-    res.style.display = '';
-    toast('Import complete');
-    loadGlobalStats(); loadAgents();
+    const { job_id, total: srv_total } = await resp.json();
+    const jobTotal = srv_total || total;
+
+    // Poll for progress
+    btn.textContent = `Importing ${jobTotal} conversations…`;
+    await new Promise((resolve, reject) => {
+      const iv = setInterval(async () => {
+        try {
+          const s = await api(`/admin/api/import/conversations/status/${job_id}`);
+          const pct = jobTotal > 0 ? Math.round((s.done / jobTotal) * 100) : 0;
+          document.getElementById('histProgressBar').style.width = pct + '%';
+          document.getElementById('histProgressPct').textContent = pct + '%';
+          document.getElementById('histProgressLabel').textContent =
+            `${s.done}/${jobTotal} · memories: ${s.memories_created} · embedded: ${s.embedded}`;
+          if (s.status === 'done') {
+            clearInterval(iv);
+            resolve(s);
+          } else if (s.status === 'error') {
+            clearInterval(iv);
+            reject(new Error('Import job failed'));
+          }
+        } catch(e) { clearInterval(iv); reject(e); }
+      }, 2000);
+    }).then(s => {
+      prog.style.display = 'none';
+      res.className = 'bk-result ok';
+      res.innerHTML =
+        `✓ Done &nbsp;·&nbsp; Imported: <strong>${s.imported}</strong>` +
+        ` &nbsp;·&nbsp; Memories: <strong>${s.memories_created}</strong>` +
+        ` &nbsp;·&nbsp; Embedded: <strong>${s.embedded}</strong>` +
+        ` &nbsp;·&nbsp; Skipped: ${s.skipped}`;
+      res.style.display = '';
+      toast('Import complete ✓');
+      loadGlobalStats(); loadAgents();
+    });
   } catch(err) {
+    prog.style.display = 'none';
     res.className = 'bk-result err';
     res.textContent = '✕ ' + err.message;
     res.style.display = '';
