@@ -7151,6 +7151,60 @@ async def _auto_extract_character_memory(agent_id: str, messages: list) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Empathy State Tracking
+# User emotional keywords → small incremental character state deltas.
+# No LLM call — keyword-only, runs inline in _post_conversation_tasks.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EMPATHY_PATTERNS: list[dict] = [
+    {
+        "name":     "fatigue",
+        "keywords": ["好累", "撑不住", "累死了", "太累了", "疲惫", "赶项目", "加班好多", "睡眠不好", "睡不好"],
+        "delta":    {"fatigue": 1.0, "mood_valence": -0.05},
+    },
+    {
+        "name":     "sad",
+        "keywords": ["难过", "不开心", "很痛苦", "想哭", "心情很差", "情绪很差", "好难受", "很委屈", "心情不好"],
+        "delta":    {"mood_valence": -0.08, "mood_energy": -0.05},
+    },
+    {
+        "name":     "anxious",
+        "keywords": ["焦虑", "好担心", "好紧张", "压力很大", "快撑不住", "好焦虑", "很害怕", "担心"],
+        "delta":    {"mood_valence": -0.06, "mood_energy": -0.03},
+    },
+    {
+        "name":     "happy",
+        "keywords": ["很开心", "超级开心", "心情很好", "好棒", "太高兴了", "好幸福", "很快乐", "开心了"],
+        "delta":    {"mood_valence": 0.06, "mood_energy": 0.04},
+    },
+]
+
+
+async def _apply_empathy_state(agent_id: str, messages: list) -> None:
+    """Detect user emotional keywords → apply small empathy deltas on character state.
+
+    Lightweight keyword scan (no LLM). When the user expresses strong emotions
+    the character's valence / fatigue / energy shift slightly to reflect empathetic
+    resonance. Fatigue is clamped to (0, 5), mood_valence to (-1, 1).
+    """
+    user_text = " ".join(
+        m.get("content", "")
+        for m in messages
+        if m.get("role") == "user" and isinstance(m.get("content"), str)
+    )
+    if not user_text.strip():
+        return
+    acc: dict[str, float] = {}
+    for pat in _EMPATHY_PATTERNS:
+        if any(kw in user_text for kw in pat["keywords"]):
+            for k, v in pat["delta"].items():
+                acc[k] = acc.get(k, 0.0) + v
+    if acc:
+        await _accumulate_state(agent_id, acc)
+        print(f"[empathy] {agent_id}: {acc}", flush=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # P2.2  Reverse Identification (Notion spec §7)
 # Post-conversation: cheap model detects state changes the char announced
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7367,6 +7421,11 @@ async def _post_conversation_tasks(
             await _accumulate_state(agent_id, {"miss_you": -10.0, "low_mood": -3.0})
         except Exception:
             pass
+        # Empathy state: user emotions → small char state deltas (keyword, no LLM)
+        try:
+            await _apply_empathy_state(agent_id, full)
+        except Exception as _ee:
+            print(f"[post_conv] empathy_state err: {_ee}")
         # P2.2 Reverse identification: keyword pre-filter → analyzer LLM
         try:
             await _reverse_identify(agent_id, full)
@@ -8063,8 +8122,13 @@ async def classify_memory_tier(body: dict, _=Depends(_require_key)):
 def _pal_row(d: dict) -> dict:
     """Normalize a raw memory_db row for API output."""
     import json as _j
-    d["tags"]        = _j.loads(d.get("tags") or "[]")
-    d["related_ids"] = _j.loads(d.get("related_ids") or "[]")
+    def _jparse(v, fb="[]"):
+        # memory_db._row_to_dict already decodes `tags` — handle both str and list
+        if isinstance(v, (list, dict)):
+            return v
+        return _j.loads(v or fb)
+    d["tags"]        = _jparse(d.get("tags"))
+    d["related_ids"] = _jparse(d.get("related_ids"))
     d["read_by_user"]  = bool(d.get("read_by_user"))
     d["read_by_agent"] = bool(d.get("read_by_agent"))
     d["archived"]      = bool(d.get("archived"))
@@ -8379,10 +8443,15 @@ async def pal_rollback(memory_id: str, body: dict, _=Depends(_require_key)):
 
 @app.post("/api/admin/memories/{memory_id}/confirm-l1")
 async def pal_confirm_l1(memory_id: str, _=Depends(_require_key)):
-    """Confirm a pending L1 memory (set confirmed=1)."""
+    """Confirm a pending L1 memory (set confirmed=1).
+
+    Also updates the Qdrant payload so RAG queries can find the newly-confirmed memory.
+    """
     mem = await _mem_confirm_l1(memory_id)
     if not mem:
         raise HTTPException(404, "Memory not found or already confirmed")
+    # Sync confirmed=1 into Qdrant payload so _build_rag_context can find it
+    asyncio.create_task(_sync_memory_to_qdrant(mem))
     return _pal_row(mem)
 
 
