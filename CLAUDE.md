@@ -418,7 +418,7 @@ event_roll / event_list / event_add / event_delete
 
 ### 其他杂项
 
-- [ ] **死脑筋模型兼容模式**（→ 见路线图 Phase A-2）
+- [x] **死脑筋模型兼容模式**：`mcp_stubborn_compat` 布尔列已加入 `agent_settings`，admin UI 有 checkbox，chat_completions 时自动剥离 tool 相关键。
 - [ ] **配置面板 UI 整合**（→ 见路线图 Phase A-1）
 - [x] **RSSHub 自建实例**：`diygod/rsshub:latest` 加入 docker-compose.yml，内网访问（不暴露端口）；gateway 新增 `RSSHUB_URL: http://rsshub:1200`；`_RSSHUB_BASE` 读取 env，默认 fallback `rsshub.app`；澎湃路由在新版 RSSHub 已删除且 thepaper.com 对 VPS IP 返回 403，替换为虎嗅 `/huxiu/article`（200 ✅）；联合早报 `/zaobao/realtime/china` 同样 200 ✅。2026-05-14 完成。
 - [x] **GitHub 代码自动同步**：`/opt/scripts/git-sync.sh`，cron `0 3 * * *`（03:00 CST）。`git add -A`（遵守 .gitignore）→ 有变更则 commit `chore: auto-sync YYYY-MM-DD (N file(s) changed)` → push。无变更静默退出 0。日志 `/var/log/git-sync.log`（自动轮转保留 500 行）。2026-05-14 已部署，首次 push 同时整理了 .gitignore（排除 build artifacts 和旧位置副本）。
@@ -501,15 +501,15 @@ curl http://43.159.56.67:6333/collections
 
 | # | 任务 | 状态 | 说明 |
 |---|------|------|------|
-| A-1 | **配置面板 UI 整合** | 🔧 进行中 | 把 API 线路、推送参数、冷却、新闻/音乐开关等散落配置收拢到一个 Settings tab。纯前端 + 现有 API，无需改后端逻辑。 |
-| A-2 | **死脑筋模型兼容** | ⏳ 待做 | 对不擅长 tool use 的模型，`MCP_STUBBORN_MODEL_COMPAT` 开关：预查询 MCP → 把结果作为文本写入 system prompt，绕开 tool call 流程（执行文档 §12.4）。 |
+| A-1 | **配置面板 UI 整合** | ✅ 完成 | 新增音乐推荐、蓄水池阈值、系统信息三块面板；新闻面板加硬过滤关键词编辑器；runtime 函数已改为从 DB 读取配置。2026-05-15 完成。 |
+| A-2 | **死脑筋模型兼容** | ✅ 完成 | 每 agent 的 `mcp_stubborn_compat` 开关（DB 列 + admin UI checkbox）。开启时从发给 LLM 的 payload 中剥离 `tools/tool_choice/functions/function_call/tool_use` 键，防止不支持 tool use 的模型产生混乱输出。character agent 的 MCP proxy 本已走纯文本注入，agent 类型也因此受益。2026-05-15 完成。 |
 
 ### Phase B — 代码三端归档
 
 | # | 任务 | 状态 | 说明 |
 |---|------|------|------|
-| B-1 | **代码推 GitHub main** | ⏳ 待做 | Phase A 完成后手动 `git push`，确保 main 分支是最新稳定版本。 |
-| B-2 | **同步到 Oracle VPS** | ⏳ 待做 | Oracle VPS（161.118.195.9）：`git pull` 或 scp 关键文件，保持和腾讯云代码一致。考虑在 Oracle 也跑一份只读副本（不启动主服务，仅作冷备）。 |
+| B-1 | **代码推 GitHub main** | ✅ 完成 | Phase A 全部内容已推送 GitHub `main`，commit bbd7116。2026-05-15。 |
+| B-2 | **同步到 Oracle VPS** | ✅ 完成 | Oracle VPS（161.118.195.9）`~/memory-gateway` 已初始化 git，`git reset --hard origin/main` 同步到最新。SSH 跳板：腾讯云 `~/.ssh/oci_instance` → `ubuntu@161.118.195.9`。以后 `git pull` 即可更新冷备。2026-05-15。 |
 
 ### Phase C — 新功能（需 Notion 文档先行）
 
