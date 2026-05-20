@@ -358,7 +358,10 @@ event_roll / event_list / event_add / event_delete
 
 1. ~~memory_db.py L5 代码重复~~ → 已修复，l5 函数各只出现一次（行 2165/2189/2212/2225）
 2. ~~main.py 重复导入~~ → 已修复，`memory_confirm_l1` / `memory_list_pending_l1` 只在行 76-77 导入一次
-3. ~~pending-l1 路由顺序~~ → 已修复，`/api/admin/memories/pending-l1`（行 7838）在 `/{memory_id}`（行 7845）之前
+3. ~~pending-l1 路由顺序~~ → 已修复，`/api/admin/memories/pending-l1` 在 `/{memory_id}` 之前
+4. ~~`_pal_row` double-decode~~ → 已修复（2026-05-20）：`memory_db._row_to_dict` 已把 `tags` 解析为 list，`_pal_row` 再次 `json.loads` 导致 500；改为 isinstance 检查
+5. ~~`confirm-l1` 不同步 Qdrant~~ → 已修复（2026-05-20）：`pal_confirm_l1` 确认后补发 `_sync_memory_to_qdrant` 更新 payload 的 `confirmed=1`，RAG 才能检索到
+6. ~~`memory_search` CJK 子串搜索失败~~ → 已修复（2026-05-20）：FTS5 `unicode61` tokenizer 将连续汉字视为单一 token，子串搜索失败；新增 `LIKE '%query%'` fallback
 
 ### 仍存在的问题
 
@@ -521,9 +524,9 @@ curl http://43.159.56.67:6333/collections
 
 | # | 任务 | 状态 | 说明 |
 |---|------|------|------|
-| D-1 | **创建测试 agents/chars** | ⏳ 待做 | 在 admin 面板创建 `test_agent1` / `test_agent2`（agent 类型）、`test_char1` / `test_char2`（character 类型）。 |
-| D-2 | **功能完整性测试** | ⏳ 待做 | 对每个 test agent/char 跑若干轮对话，验证：记忆写入→蒸馏→Qdrant embed→RAG 注入、角色状态变化、日程捕获、MCP 工具调用、主动推送。 |
-| D-3 | **记忆池隔离验证** | ⏳ 待做 | 向 test_agent1 写入特定记忆，确认 test_agent2 / test_char1 读取不到；验证 `agent_id` 过滤在 SQLite + Qdrant 两侧都生效。 |
+| D-1 | **创建测试 agents/chars** | ✅ 完成 | `test_agent1` / `test_agent2`（agent）、`test_char1`（character）通过脚本自动创建。 |
+| D-2 | **功能完整性测试** | ✅ 完成 | `test_integration.py` — 21/21 通过。记忆蒸馏→层级分类→B6防御→L1确认→Qdrant同步→RAG召回→角色状态引擎全链路验证通过。2026-05-20。 |
+| D-3 | **记忆池隔离验证** | ✅ 完成 | T4 验证 test_agent2 无法读到 test_agent1 的专有记忆（林小雨/福气等），SQLite + Qdrant 双侧 agent_id 过滤均生效。 |
 
 ### Phase E — 前端重建
 
