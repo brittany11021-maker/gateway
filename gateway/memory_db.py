@@ -227,16 +227,41 @@ async def memory_list(
 async def memory_search(
     agent_id: str, query: str, limit: int = 10,
 ) -> list[dict]:
+    """Full-text search over memories.
+
+    Primary: FTS5 MATCH (fast, ranked). Works for space-separated text but
+    FTS5's unicode61 tokenizer treats consecutive CJK characters as one
+    token, so substrings like 「林小雨」 embedded in longer Chinese sentences
+    won't match.
+
+    Fallback: LIKE '%query%' — covers CJK substring search and any query
+    where FTS5 returns 0 results.
+    """
     db = await get_db()
     now = _now()
-    cursor = await db.execute(
-        "SELECT m.* FROM memories m JOIN memories_fts f ON m.id = f.id "
-        "WHERE f.memories_fts MATCH ? AND f.agent_id = ? AND m.archived = 0 "
-        "ORDER BY rank LIMIT ?",
-        (query, agent_id, limit),
-    )
-    rows = await cursor.fetchall()
-    results = [_row_to_dict(r) for r in rows]
+    results = []
+    # FTS5 primary path
+    try:
+        cursor = await db.execute(
+            "SELECT m.* FROM memories m JOIN memories_fts f ON m.id = f.id "
+            "WHERE f.memories_fts MATCH ? AND f.agent_id = ? AND m.archived = 0 "
+            "ORDER BY rank LIMIT ?",
+            (query, agent_id, limit),
+        )
+        rows = await cursor.fetchall()
+        results = [_row_to_dict(r) for r in rows]
+    except Exception:
+        pass  # FTS5 may throw on special query chars — fall through
+
+    if not results:
+        # LIKE fallback — required for CJK substring matching
+        cursor = await db.execute(
+            "SELECT * FROM memories WHERE agent_id=? AND archived=0 "
+            "AND content LIKE ? ORDER BY importance DESC, updated_at DESC LIMIT ?",
+            (agent_id, f"%{query}%", limit),
+        )
+        results = [_row_to_dict(r) for r in await cursor.fetchall()]
+
     if results:
         ids = [r["id"] for r in results]
         ph = ",".join("?" * len(ids))

@@ -7408,8 +7408,7 @@ async def _post_conversation_tasks(
     """Run all post-conversation storage tasks in a single background coroutine."""
     await _store_conversation(cid, agent_id, session_id, full)
     if agent_type == "character":
-        if auto_memory:
-            await _auto_extract_character_memory(agent_id, full)
+        # ── Fast state ops first (no LLM) ────────────────────────────────────
         # Track last user message time for silence detection
         try:
             import datetime as _dtpc
@@ -7422,10 +7421,15 @@ async def _post_conversation_tasks(
         except Exception:
             pass
         # Empathy state: user emotions → small char state deltas (keyword, no LLM)
+        # Must run BEFORE auto_extract (which blocks on LLM) so state updates
+        # are visible quickly (within seconds, not 60-120s after the chat).
         try:
             await _apply_empathy_state(agent_id, full)
         except Exception as _ee:
             print(f"[post_conv] empathy_state err: {_ee}")
+        # ── Slow LLM-backed ops after fast state ─────────────────────────────
+        if auto_memory:
+            await _auto_extract_character_memory(agent_id, full)
         # P2.2 Reverse identification: keyword pre-filter → analyzer LLM
         try:
             await _reverse_identify(agent_id, full)
@@ -8351,6 +8355,62 @@ async def trash_empty(agent_id: str, _=Depends(_require_key)):
         except Exception as _qe:
             print(f"[trash_empty_qdrant] {_qe}")
     return {"ok": True, "deleted": len(ids)}
+
+
+# ── Semantic search (Qdrant vector, FTS fallback) ─────────────────────────────
+
+@app.post("/api/admin/memories/search")
+async def pal_search(body: dict, _=Depends(_require_key)):
+    """Semantic search over an agent's memories.
+
+    Body: {agent_id, query, limit=10}
+    Tries Qdrant vector search first; falls back to SQLite FTS5 if unavailable.
+    Returns {items: [...], total: N, source: "qdrant" | "fts"}.
+    """
+    agent_id = body.get("agent_id", "default")
+    query    = body.get("query", "")
+    limit    = int(body.get("limit", 10))
+    if not query:
+        return {"items": [], "total": 0, "source": "none"}
+
+    # Try Qdrant first
+    if _qdrant:
+        try:
+            vec = await _embed_mem(query)
+            if vec:
+                hits = _qdrant.search(
+                    collection_name=QDRANT_MEM_COLLECTION,
+                    query_vector=vec,
+                    query_filter=Filter(must=[
+                        FieldCondition("agent_id", MatchValue(value=agent_id)),
+                        FieldCondition("archived",  MatchValue(value=0)),
+                    ]),
+                    limit=limit,
+                    score_threshold=0.40,
+                )
+                if hits:
+                    items = []
+                    for h in hits:
+                        pl = h.payload
+                        items.append({
+                            "id":         pl.get("mem_id", ""),
+                            "content":    pl.get("original_text", ""),
+                            "layer":      pl.get("layer", "?"),
+                            "importance": pl.get("importance", 0),
+                            "confirmed":  pl.get("confirmed", 1),
+                            "score":      round(h.score, 4),
+                        })
+                    return {"items": items, "total": len(items), "source": "qdrant"}
+        except Exception as _se:
+            print(f"[mem_search] qdrant err: {_se}")
+
+    # FTS fallback
+    results = await _mem_search(agent_id=agent_id, query=query, limit=limit)
+    return {
+        "items": [_pal_row(m) for m in results],
+        "total": len(results),
+        "source": "fts",
+    }
 
 
 # ── L1 pending confirmation (must be BEFORE {memory_id} catchall) ────────────
